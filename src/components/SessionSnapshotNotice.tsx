@@ -1,9 +1,16 @@
+import type { AnsiLine } from '../types/terminal';
+import type { SessionNode } from '../types/sessionTree';
+import { spanStyle } from '../core/spanStyle';
+
 interface SessionSnapshotNoticeProps {
   title: string;
   cwd: string;
   /** True while the daemon has not yet been asked what it holds. */
   pending: boolean;
   onStart: () => void;
+  lines?: readonly AnsiLine[];
+  snapshotOf?: SessionNode['snapshotOf'];
+  truncated?: boolean;
 }
 
 /**
@@ -20,12 +27,12 @@ interface SessionSnapshotNoticeProps {
  * session was, not permission to execute it again.
  */
 export function SessionSnapshotNotice({
-  title, cwd, pending, onStart,
+  title, cwd, pending, onStart, lines = [], snapshotOf, truncated,
 }: SessionSnapshotNoticeProps) {
   return (
     <div
       data-testid="session-snapshot-notice"
-      className="flex flex-1 flex-col items-center justify-center gap-2 p-4 font-mono"
+      className="flex min-h-0 flex-1 flex-col items-center gap-2 p-4 font-mono"
       style={{ background: 'var(--ground)' }}
     >
       <div className="text-[12px] font-bold tracking-wider" style={{ color: 'var(--ink)' }}>
@@ -36,10 +43,21 @@ export function SessionSnapshotNotice({
           <>ASKING THE DAEMON WHAT IT STILL HOLDS.</>
         ) : (
           <>
-            NO PROCESS IS RUNNING FOR THIS SESSION.
+            CACHED VIEW · NOT ATTACHED TO A VERIFIED PROCESS.
             <div className="mt-1">STORED LINES ONLY · {cwd}</div>
           </>
         )}
+      </div>
+      {snapshotOf && <div className="text-[11px]" style={{ color: 'var(--ink-dim)' }}>
+        SOURCE {snapshotOf.sessionId} · INCARNATION {snapshotOf.incarnation ?? '--'}
+      </div>}
+      {truncated && <div className="text-[11px]" style={{ color: 'var(--ink-wait)' }}>CACHE TRUNCATED · OLDER LINES MAY BE MISSING</div>}
+      <div role="region" aria-label="Cached terminal lines" tabIndex={0}
+        className="recess min-h-0 w-full flex-1 overflow-auto whitespace-pre p-2 text-[12px] select-text"
+        style={{ color: 'var(--ink)' }}>
+        {lines.length ? lines.map((line, index) => <div key={index}>
+          {line.spans.map((span, i) => <span key={i} style={spanStyle(span, line.isError)}>{span.text}</span>)}{'\n'}
+        </div>) : 'No cached lines available.'}
       </div>
       {!pending && (
         <button

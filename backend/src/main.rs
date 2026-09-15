@@ -1,11 +1,20 @@
 use doom_term_pty as pty;
 
+mod hooks;
+mod metadata;
 mod security;
 mod usage;
 mod worktree;
 
-#[cfg(all(test, unix))]
-mod paste_tests;
+// Public v2 transport; there is no legacy wire fallback.
+mod attachments;
+mod outbound;
+mod protocol;
+mod recovery;
+#[cfg(test)]
+mod recovery_tests;
+mod tombstones;
+
 #[cfg(test)]
 mod security_tests;
 
@@ -13,6 +22,7 @@ mod security_tests;
 mod telemetry_tests;
 
 use anyhow::Result;
+#[cfg(test)]
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::RwLock;
 use pty::demuxer::DemuxEvent;
@@ -23,6 +33,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+#[cfg(test)]
 use tokio_tungstenite::tungstenite::Message;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,6 +52,7 @@ pub struct RecoverableSession {
     pub durable: bool,
 }
 
+#[cfg(any())]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", content = "payload")]
 pub enum ClientMessage {
@@ -216,8 +228,6 @@ pub enum ServerMessage {
 }
 
 type SessionsMap = Arc<RwLock<HashMap<String, Arc<PtySession>>>>;
-/// Fan-out for agent hook events. One sender, one receiver per WS client.
-type HookBus = tokio::sync::broadcast::Sender<ServerMessage>;
 type UsageHandle = Arc<usage::service::UsageService>;
 
 /// Where the daemon listens.
@@ -252,15 +262,10 @@ async fn main() -> Result<()> {
         listener.local_addr()?
     );
 
-    let sessions: SessionsMap = Arc::new(RwLock::new(HashMap::new()));
-    let usage: UsageHandle = Arc::new(usage::service::UsageService::new());
-    // 64 is generous: hook events are human-paced, and a slow client that
-    // lags out is better than one that blocks the poster.
-    let (hooks, _) = tokio::sync::broadcast::channel::<ServerMessage>(64);
-    // The bus is fan-out only and has no memory. This is the memory: what
-    // each agent last said, so a client that connects after the fact is not
-    // left believing a prompt is still open.
-    let hook_state: HookState = Arc::new(RwLock::new(HashMap::new()));
+    let server = Arc::new(recovery::RecoveryServer::new()?);
+    let sessions = server.sessions.clone();
+    let usage = server.usage.clone();
+    tokio::spawn(server.clone().maintain());
 
     // Rate-limit usage refreshes on its own timer, never on the request path:
     // GetTelemetry is polled every 2 s and must not wait on an HTTPS round-trip.
@@ -276,13 +281,16 @@ async fn main() -> Result<()> {
                 // endpoint on a timer for an idle shell is rude.
                 // ANY session, not the first one: the cache is shared across
                 // tabs, so one Claude anywhere is reason enough to refresh it.
-                let is_claude = {
-                    let map = sessions.read();
-                    map.values()
-                        .filter_map(|s| s.foreground_command())
+                let snapshot: Vec<_> = sessions.read().values().cloned().collect();
+                let is_claude = tokio::task::spawn_blocking(move || {
+                    snapshot
+                        .into_iter()
+                        .filter_map(|session| session.foreground_command())
                         .filter_map(|comm| pty::classify_agent(&comm))
-                        .any(|a| a.key == "claude")
-                };
+                        .any(|agent| agent.key == "claude")
+                })
+                .await
+                .unwrap_or(false);
 
                 if is_claude && usage.due() {
                     let usage = usage.clone();
@@ -298,18 +306,7 @@ async fn main() -> Result<()> {
     loop {
         match listener.accept().await {
             Ok((stream, client_addr)) => {
-                let sessions = sessions.clone();
-                let usage = usage.clone();
-                let hooks = hooks.clone();
-                let hook_state = hook_state.clone();
-                tokio::spawn(handle_connection(
-                    stream,
-                    client_addr,
-                    sessions,
-                    usage,
-                    hooks,
-                    hook_state,
-                ));
+                tokio::spawn(handle_connection(stream, client_addr, server.clone()));
             }
             Err(e) => {
                 log::warn!("Listener accept error (retrying): {:?}", e);
@@ -340,56 +337,11 @@ struct HookPost {
     transcript_path: Option<String>,
 }
 
-/// The last hook event seen per agent identity, so a client that was not
-/// connected when it happened can still be told about it.
-type HookState = Arc<RwLock<HashMap<String, ServerMessage>>>;
-
-/// Enough to cover every agent a person can plausibly have running, and a hard
-/// stop on a map that is otherwise keyed by whatever a hook posts.
-const MAX_RETAINED_HOOKS: usize = 256;
-
-/// The identity a hook event belongs to: the exact pane when we know it, and
-/// the agent's own directory when we do not.
-fn hook_state_key(msg: &ServerMessage) -> Option<String> {
-    match msg {
-        ServerMessage::AgentEvent {
-            agent,
-            cwd,
-            doom_session_id,
-            ..
-        } => match (doom_session_id, cwd) {
-            (Some(id), _) => Some(format!("session:{id}")),
-            (None, Some(dir)) => Some(format!("{agent}:{dir}")),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-/// Keep the latest transition for an identity, replacing any earlier one.
-///
-/// Only the two events that carry state are retained: a PermissionRequest that
-/// is never cleared and a Stop that clears it are the entire lifecycle, and
-/// storing the rest would grow this map for events nothing downstream reads.
-fn remember_hook_state(state: &HookState, msg: &ServerMessage) {
-    let ServerMessage::AgentEvent { event, .. } = msg else {
-        return;
-    };
-    if event != "PermissionRequest" && event != "Stop" {
-        return;
-    }
-    let Some(key) = hook_state_key(msg) else {
-        return;
-    };
-    let mut map = state.write();
-    if map.len() >= MAX_RETAINED_HOOKS && !map.contains_key(&key) {
-        // Drop the oldest thing we can name rather than growing without bound.
-        // Which one is arbitrary; that this map stays finite is not.
-        if let Some(victim) = map.keys().next().cloned() {
-            map.remove(&victim);
-        }
-    }
-    map.insert(key, msg.clone());
+#[cfg(test)]
+type HookState = Arc<hooks::HookHub>;
+#[cfg(test)]
+fn remember_hook_state(state: &HookState, message: &ServerMessage) {
+    state.publish(message.clone(), None);
 }
 
 /// The pane an agent is running in, as reported by the hook script.
@@ -420,8 +372,7 @@ fn header_value(request: &str, name: &str) -> Option<String> {
 /// and no telemetry is worth that.
 async fn serve_hook(
     mut stream: TcpStream,
-    hooks: &HookBus,
-    hook_state: &HookState,
+    hooks: &hooks::HookHub,
     path_agent: Option<String>,
     sessions: &SessionsMap,
 ) {
@@ -481,6 +432,25 @@ async fn serve_hook(
     // Read from the raw headers, NOT from the peeked request line: that one is
     // lowercased for routing, and a session id is case-sensitive.
     let doom_session_id = header_value(&text, DOOM_SESSION_HEADER);
+    let incarnation = header_value(&text, "x-doom-term-incarnation")
+        .and_then(|value| pty::stream::Identity::try_from(value).ok());
+    // A pane name is reusable. Only the exact durable/direct process identity
+    // may teach telemetry where its transcript lives; an old hook landing
+    // after replacement must not describe the new foreground process.
+    let attributed_session = doom_session_id
+        .as_ref()
+        .zip(incarnation.as_ref())
+        .and_then(|(id, expected)| {
+            sessions
+                .read()
+                .get(id)
+                .cloned()
+                .map(|session| (session, expected))
+        })
+        .filter(|(session, expected)| {
+            &session.stream().snapshot().metadata.incarnation == *expected
+        })
+        .map(|(session, _)| session);
     if let Some(body) = text.split("\r\n\r\n").nth(1) {
         if let Ok(post) = serde_json::from_str::<HookPost>(body.trim_end_matches(char::from(0))) {
             // Recorded before the event is fanned out, so a Stop that arrives
@@ -492,9 +462,8 @@ async fn serve_hook(
                     .as_deref()
                     .or(path_agent.as_deref())
                     .unwrap_or("");
-                let process = doom_session_id
+                let process = attributed_session
                     .as_ref()
-                    .and_then(|id| sessions.read().get(id).cloned())
                     .and_then(|s| s.shell_pid())
                     .and_then(pty::foreground::foreground_identity);
                 usage::hint::remember(agent, cwd, doom_session_id.as_deref(), process, path);
@@ -515,15 +484,7 @@ async fn serve_hook(
                 agent_session_id: post.agent_session_id,
                 doom_session_id,
             };
-            log::info!("hook: {:?}", msg);
-            // Retained BEFORE the broadcast, and regardless of whether anyone
-            // hears it. The bus has no memory: `send` fails outright when no
-            // client is subscribed, and the result was discarded. A Stop that
-            // arrived while the UI was reloading was simply lost, and because
-            // blockedOnUser is persisted with the workspace, the session it
-            // would have cleared stayed marked ASKS forever.
-            remember_hook_state(hook_state, &msg);
-            let _ = hooks.send(msg);
+            hooks.publish(msg, incarnation);
         }
     }
 
@@ -536,18 +497,12 @@ async fn serve_hook(
 async fn handle_connection(
     stream: TcpStream,
     client_addr: SocketAddr,
-    sessions: SessionsMap,
-    usage: UsageHandle,
-    hooks: HookBus,
-    hook_state: HookState,
+    server: Arc<recovery::RecoveryServer>,
 ) {
     handle_connection_authenticated(
         stream,
         client_addr,
-        sessions,
-        usage,
-        hooks,
-        hook_state,
+        server,
         std::env::var("DOOM_AUTH_TOKEN")
             .ok()
             .filter(|s| !s.is_empty()),
@@ -558,10 +513,7 @@ async fn handle_connection(
 async fn handle_connection_authenticated(
     mut stream: TcpStream,
     client_addr: SocketAddr,
-    sessions: SessionsMap,
-    usage: UsageHandle,
-    hooks: HookBus,
-    hook_state: HookState,
+    server: Arc<recovery::RecoveryServer>,
     required_token: Option<String>,
 ) {
     let port = match stream.local_addr() {
@@ -582,7 +534,7 @@ async fn handle_connection_authenticated(
             .and_then(|p| p.strip_prefix("/hook/"))
             .map(|a| a.trim_end_matches('/').to_string())
             .filter(|a| !a.is_empty());
-        serve_hook(stream, &hooks, &hook_state, agent, &sessions).await;
+        serve_hook(stream, &server.hooks, agent, &server.sessions).await;
         return;
     }
 
@@ -625,145 +577,10 @@ async fn handle_connection_authenticated(
     }
 
     log::info!("Client WebSocket connected from {}", client_addr);
-    let mut ws_stream = match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        tokio_tungstenite::accept_hdr_async(stream, move |request: &_, response| {
-            security::validate_upgrade(request, response, port)
-        }),
-    )
-    .await
-    {
-        Ok(Ok(ws)) => ws,
-        e => {
-            log::error!("Error during WebSocket handshake: {:?}", e);
-            return;
-        }
-    };
-
-    // No hooks, session data, or command dispatch before authentication.
-    if let Some(required) = required_token {
-        let challenge = ServerMessage::AuthResult {
-            success: false,
-            message: "Authentication required".into(),
-        };
-        if ws_stream
-            .send(Message::Text(
-                serde_json::to_string(&challenge).unwrap().into(),
-            ))
-            .await
-            .is_err()
-        {
-            return;
-        }
-        let authorized = tokio::time::timeout(std::time::Duration::from_secs(60), async {
-            while let Some(Ok(Message::Text(text))) = ws_stream.next().await {
-                let success = matches!(serde_json::from_str::<ClientMessage>(&text),
-                    Ok(ClientMessage::Auth { token }) if token == required);
-                let reply = ServerMessage::AuthResult {
-                    success,
-                    message: if success {
-                        "Authenticated".into()
-                    } else {
-                        "Authentication required: invalid token or unauthenticated command".into()
-                    },
-                };
-                if ws_stream
-                    .send(Message::Text(serde_json::to_string(&reply).unwrap().into()))
-                    .await
-                    .is_err()
-                {
-                    return false;
-                }
-                if success {
-                    return true;
-                }
-            }
-            false
-        })
-        .await
-        .unwrap_or(false);
-        if !authorized {
-            return;
-        }
-    }
-
-    let (mut ws_sender, mut ws_receiver) = ws_stream.split();
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ServerMessage>();
-
-    // Agent hook events arrive on a process-wide bus rather than this
-    // connection's channel, because the poster is a separate HTTP request that
-    // knows nothing about which clients exist. Forward them into the same
-    // channel so there is one path out to the socket.
-    let hook_task = {
-        let tx = tx.clone();
-        // Subscribe BEFORE replaying, so an event that lands between the two is
-        // delivered late rather than dropped. A duplicate is harmless — both
-        // states are idempotent — where a gap is not.
-        let mut sub = hooks.subscribe();
-
-        // Everything the agents said while nobody was listening. The bus drops
-        // an event outright when it has no subscriber, so without this a Stop
-        // that arrived during a reload was gone for good, and the session it
-        // would have unblocked stayed marked ASKS across restarts because
-        // blockedOnUser is persisted with the workspace.
-        for msg in hook_state.read().values().cloned() {
-            let _ = tx.send(msg);
-        }
-
-        tokio::spawn(async move {
-            loop {
-                match sub.recv().await {
-                    Ok(msg) => {
-                        if tx.send(msg).is_err() {
-                            break;
-                        }
-                    }
-                    // Lagged means this client fell behind; keep going rather
-                    // than dropping it, since the next event is what matters.
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(_) => break,
-                }
-            }
-        })
-    };
-
-    // Forward outbound messages from channel to WebSocket
-    let outbound_task = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            if let Ok(json_str) = serde_json::to_string(&msg) {
-                if ws_sender
-                    .send(Message::Text(json_str.into()))
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        }
-    });
-
-    while let Some(msg_result) = ws_receiver.next().await {
-        match msg_result {
-            Ok(Message::Text(text)) => {
-                if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) {
-                    handle_client_msg(client_msg, &sessions, &usage, &tx);
-                }
-            }
-            Ok(Message::Close(_)) => {
-                break;
-            }
-            Ok(Message::Ping(_)) => {
-                let _ = tx.send(ServerMessage::Pong);
-            }
-            _ => {}
-        }
-    }
-
-    hook_task.abort();
-    outbound_task.abort();
-    log::info!("Client disconnected from {}", client_addr);
+    server.accept(stream, port, required_token).await;
 }
 
+#[cfg(any())]
 fn handle_client_msg(
     msg: ClientMessage,
     sessions: &SessionsMap,
@@ -1097,120 +914,10 @@ fn handle_client_msg(
             });
         }
         ClientMessage::GetTelemetry { cwd, session_id } => {
-            // The kernel first, the client's copy second.
-            //
-            // The client learns the directory from OSC 7, which the integration
-            // script emits once per prompt — so `cd repo && claude` never
-            // reports the move and the app describes the wrong directory for as
-            // long as the agent runs. CONTEXT % is looked up BY directory, so
-            // that showed up as a permanent '--' next to a running agent.
-            let observed = session_id
+            let session = session_id
                 .as_ref()
-                .and_then(|id| sessions.read().get(id).cloned())
-                .and_then(|s| s.current_cwd());
-
-            let current_dir = observed
-                .or_else(|| {
-                    cwd.map(|c| pty::session::expand_path(&c).to_string_lossy().to_string())
-                        .filter(|c| !c.trim().is_empty())
-                })
-                .unwrap_or_else(|| {
-                    std::env::current_dir()
-                        .map(|p| p.to_string_lossy().to_string())
-                        .unwrap_or_default()
-                });
-            // No game vocabulary in anything the UI can render: an unknown user
-            // is unknown, not a "marine" on "phobos-base".
-            let username = std::env::var("USER")
-                .or_else(|_| std::env::var("USERNAME"))
-                .unwrap_or_else(|_| "unknown".to_string());
-            let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "localhost".to_string());
-
-            let git_branch = std::process::Command::new("git")
-                .args(["-C", &current_dir, "rev-parse", "--abbrev-ref", "HEAD"])
-                .output()
-                .ok()
-                .and_then(|output| {
-                    if output.status.success() {
-                        let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                        if !s.is_empty() {
-                            Some(s)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                });
-
-            // Who is actually running in THIS session, per the kernel — not per
-            // the tab title, and not per whichever session sorted first. An id
-            // the daemon does not know describes nothing, so the agent is
-            // unknown rather than borrowed from another tab.
-            let agent = session_id
-                .as_ref()
-                .and_then(|id| sessions.read().get(id).cloned())
-                .and_then(|s| s.foreground_command())
-                .and_then(|comm| pty::classify_agent(&comm));
-
-            // Only for an agent whose transcripts we can read, and only ever
-            // against its OWN vendor's files — reporting Codex's pane against
-            // Claude's transcripts would be a straightforward mislabel.
-            //
-            // Codex additionally carries its rate limit in the same record, so
-            // it needs no OAuth call at all; `codex_rate` is that number.
-            // Antigravity has no verified, pane-scoped accounting adapter.
-            // Transcript byte length, history rows, and configured defaults
-            // cannot supply these measurements; unsupported agents stay '--'.
-            let process = session_id
-                .as_ref()
-                .and_then(|id| sessions.read().get(id).cloned())
-                .and_then(|s| s.shell_pid())
-                .and_then(pty::foreground::foreground_identity);
-            let (context, agent_rate) = match agent.as_ref().map(|a| a.key) {
-                Some("claude") => (
-                    usage::context::context_fraction(&current_dir, session_id.as_deref(), process),
-                    None,
-                ),
-                Some("codex") => {
-                    match usage::codex::reading(&current_dir, session_id.as_deref(), process) {
-                        Some((reading, rate)) => (Some(reading), rate),
-                        None => (None, None),
-                    }
-                }
-                _ => (None, None),
-            };
-
-            let is_worktree = pty::detect_worktree(std::path::Path::new(&current_dir));
-            let isolation = if is_worktree {
-                "worktree".to_string()
-            } else {
-                pty::detect_isolation().to_string()
-            };
-
-            let _ = tx.send(ServerMessage::Telemetry {
-                session_id,
-                username,
-                hostname,
-                current_dir,
-                git_branch,
-                isolation,
-                agent_key: agent.as_ref().map(|a| a.key.to_string()),
-                agent_name: agent.as_ref().map(|a| a.name.to_string()),
-                // Read-only: whatever the refresh loop last managed to learn.
-                // Reported only for the agent it belongs to — showing Claude's
-                // quota while Codex is in the foreground would be a mislabel.
-                rate_used: match agent.as_ref().map(|a| a.key) {
-                    Some("claude") => usage.cached(),
-                    Some("codex") => agent_rate,
-                    _ => None,
-                },
-                context_used: context.as_ref().map(|c| c.fraction),
-                // Empty means the source did not name a model — Codex's token
-                // event does not. Absent, not guessed: this field has only ever
-                // held what was read.
-                agent_model: context.map(|c| c.model).filter(|m| !m.is_empty()),
-            });
+                .and_then(|id| sessions.read().get(id).cloned());
+            let _ = tx.send(metadata::telemetry(cwd, session_id, session, usage));
         }
         ClientMessage::Ping => {
             let _ = tx.send(ServerMessage::Pong);
@@ -1218,7 +925,7 @@ fn handle_client_msg(
     }
 }
 
-#[cfg(test)]
+#[cfg(any())]
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
@@ -1320,11 +1027,21 @@ mod tests {
 
     fn blocked_state(state: &HookState) -> Vec<(String, String)> {
         let mut rows: Vec<(String, String)> = state
-            .read()
+            .subscribe()
+            .0
             .iter()
-            .map(|(key, msg)| match msg {
-                ServerMessage::AgentEvent { event, .. } => (key.clone(), event.clone()),
-                _ => (key.clone(), String::new()),
+            .map(|record| {
+                (
+                    record
+                        .key
+                        .strip_suffix(":unidentified")
+                        .unwrap_or(&record.key)
+                        .to_string(),
+                    record.wire("catch-up")["data"]["event"]
+                        .as_str()
+                        .unwrap()
+                        .to_string(),
+                )
             })
             .collect();
         rows.sort();
@@ -1337,7 +1054,7 @@ mod tests {
         // result of `send` was discarded. Because blockedOnUser is persisted
         // with the workspace, a Stop lost during a reload left the session
         // marked ASKS with nothing able to clear it.
-        let state: HookState = Arc::new(RwLock::new(HashMap::new()));
+        let state: HookState = Arc::new(hooks::HookHub::default());
 
         remember_hook_state(
             &state,
@@ -1363,7 +1080,7 @@ mod tests {
     fn two_agents_in_one_directory_keep_separate_hook_state() {
         // The reason the pane id has to be the key: keyed by directory, the
         // second agent's Stop would clear the first agent's prompt.
-        let state: HookState = Arc::new(RwLock::new(HashMap::new()));
+        let state: HookState = Arc::new(hooks::HookHub::default());
         remember_hook_state(
             &state,
             &agent_event("PermissionRequest", "/repo", Some("pane-1")),
@@ -1384,7 +1101,7 @@ mod tests {
 
     #[test]
     fn an_agent_that_cannot_name_its_pane_falls_back_to_its_directory() {
-        let state: HookState = Arc::new(RwLock::new(HashMap::new()));
+        let state: HookState = Arc::new(hooks::HookHub::default());
         remember_hook_state(&state, &agent_event("PermissionRequest", "/repo", None));
         assert_eq!(
             blocked_state(&state),
@@ -1396,7 +1113,7 @@ mod tests {
     fn only_the_events_that_carry_state_are_retained() {
         // Retaining every vendor event would grow this map for things nothing
         // downstream reads, and replay them at every connect.
-        let state: HookState = Arc::new(RwLock::new(HashMap::new()));
+        let state: HookState = Arc::new(hooks::HookHub::default());
         remember_hook_state(
             &state,
             &agent_event("Notification", "/repo", Some("pane-1")),

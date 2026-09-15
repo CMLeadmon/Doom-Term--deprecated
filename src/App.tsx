@@ -249,8 +249,13 @@ export const App: React.FC = () => {
 
   usePtyEvents(setEventWorkspace, setTelemetry);
 
-  // Bind whichever session is on screen to a daemon session. A restored or
-  // default workspace never did this, so its terminal was connected to nothing.
+  useEffect(() => ptyClient.registerHandler({
+    onOutput: () => undefined,
+    onInputRefused: (_id, reason) => setToastMessage(reason),
+  }), []);
+
+  // Focus is not attachment. useWorkspaceSet binds all workspaces and parked
+  // nodes; selecting a pane must not create, reset or replay its process.
   useEffect(() => {
     if (!activeNode) return;
     if (activeNode.kind === 'scratchpad') return;
@@ -258,13 +263,8 @@ export const App: React.FC = () => {
     // the picker would leave a shell running in a folder no one chose, and the
     // chosen folder would then be the second session rather than the first.
     if (needsWorkspaceChoice) return;
-    // Spawn is attach-or-create, so a restored id must not reach it until the
-    // daemon has said whether it still holds that session. It did before, and
-    // a cold start against an empty daemon created a fresh shell under the
-    // stored id — cached scrollback with a brand new process behind it.
-    if (bindingFor(activeNode.id) !== 'ready') return;
-    ptyClient.ensureSession(activeNode.id, activeNode.cwd);
-  }, [activeNode?.id, activeNode?.kind, activeNode?.cwd, bindingFor, needsWorkspaceChoice]);
+    ptyClient.setActiveSession(activeNode.id);
+  }, [activeNode?.id, activeNode?.kind, needsWorkspaceChoice]);
 
   // The foreground process changes without any PTY event, so ask the daemon.
   useEffect(() => {
@@ -490,6 +490,9 @@ export const App: React.FC = () => {
           title={node.title}
           cwd={node.cwd}
           pending={binding === 'waiting'}
+          lines={node.tuiLines}
+          truncated={node.cacheTruncated}
+          snapshotOf={node.snapshotOf ?? { sessionId: node.id, incarnation: node.incarnation }}
           onStart={() => handleReviveNode(node.id)}
         />
       );
@@ -504,8 +507,12 @@ export const App: React.FC = () => {
         cursor={node.cursor ?? null}
         viewActionRequest={isActive ? viewActionRequest : null}
         onViewActionHandled={handleViewActionHandled}
+        recoveredHistory={node.recoveredHistory}
+        recoveryCacheLines={node.recoveryCacheLines}
+        recoveryCacheTruncated={node.recoveryCacheTruncated}
         onWrite={(data: string) => ptyClient.writeToSession(node.id, data)}
-        onPasteText={(text: string) => ptyClient.pasteToSession(node.id, text)}
+        captureInputIdentity={() => ptyClient.captureInputIdentity(node.id)}
+        onPasteText={(text, expected) => ptyClient.pasteToSession(node.id, text, expected)}
         onSendSignal={(sig: 'ctrl+c' | 'ctrl+d' | 'ctrl+z') => ptyClient.sendSignalToSession(node.id, sig)}
       />
     );

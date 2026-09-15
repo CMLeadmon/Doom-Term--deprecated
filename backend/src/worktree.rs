@@ -1,14 +1,20 @@
 use anyhow::{Context, Result};
+use doom_term_pty::process_io::{run_bounded, HelperLimits};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::time::{Duration, Instant};
 
 pub fn create(cwd: &Path, branch: &str) -> Result<PathBuf> {
+    let deadline = Instant::now() + Duration::from_secs(20);
     anyhow::ensure!(
         !branch.is_empty() && !branch.starts_with('-') && !branch.contains("@{"),
         "Invalid branch name"
     );
-    git(cwd, &["check-ref-format", &format!("refs/heads/{branch}")])?;
-    let root = PathBuf::from(git(cwd, &["rev-parse", "--show-toplevel"])?);
+    git(
+        cwd,
+        &["check-ref-format", &format!("refs/heads/{branch}")],
+        deadline,
+    )?;
+    let root = PathBuf::from(git(cwd, &["rev-parse", "--show-toplevel"], deadline)?);
     let parent = root
         .parent()
         .context("Repository has no parent directory")?;
@@ -19,35 +25,47 @@ pub fn create(cwd: &Path, branch: &str) -> Result<PathBuf> {
     // A sibling keeps the new checkout out of the source repository's status.
     // Git refuses existing destinations and branches; never force or remove.
     let path = parent.join(format!("{name}-worktree-{}", branch.replace('/', "-")));
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(&root)
-        .args(["worktree", "add", "-b", branch, "--"])
-        .arg(&path)
-        .arg("HEAD")
-        .output()
-        .context("Could not run git worktree add")?;
-    anyhow::ensure!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
+    run_bounded(
+        Path::new("git"),
+        &[
+            "-C".into(),
+            root.to_string_lossy().into_owned(),
+            "worktree".into(),
+            "add".into(),
+            "-b".into(),
+            branch.into(),
+            "--".into(),
+            path.to_string_lossy().into_owned(),
+            "HEAD".into(),
+        ],
+        &[],
+        HelperLimits {
+            timeout: deadline.saturating_duration_since(Instant::now()),
+            input_bytes: 0,
+            output_bytes: 65536,
+        },
+    )
+    .context("Worktree not confirmed; inspect partial work before retrying")?;
     Ok(path)
 }
 
-fn git(cwd: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .output()
-        .context("Could not run git")?;
-    anyhow::ensure!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    Ok(String::from_utf8(output.stdout)?
+fn git(cwd: &Path, args: &[&str], deadline: Instant) -> Result<String> {
+    let mut command = vec!["-C".into(), cwd.to_string_lossy().into_owned()];
+    command.extend(args.iter().map(|arg| (*arg).to_string()));
+    let output = run_bounded(
+        Path::new("git"),
+        &command,
+        &[],
+        HelperLimits {
+            timeout: deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_secs(2)),
+            input_bytes: 0,
+            output_bytes: 4096,
+        },
+    )
+    .context("Could not query git")?;
+    Ok(String::from_utf8(output)?
         .trim_end_matches('\n')
         .to_string())
 }
@@ -149,6 +167,31 @@ mod tests {
                 .matches("worktree ")
                 .count(),
             1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stalled_checkout_hook_is_bounded_and_partial_work_is_not_removed() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = Fixture::new();
+        let source = fixture.0.join("source repo");
+        let hook = source.join(".git/hooks/post-checkout");
+        std::fs::write(&hook, "#!/bin/sh\nsleep 26\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let started = std::time::Instant::now();
+        let result = create(&source, "slow-checkout");
+        assert!(
+            result.is_err(),
+            "a checkout beyond the helper deadline cannot claim confirmed success"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(26));
+        assert!(
+            fixture
+                .0
+                .join("source repo-worktree-slow-checkout/.git")
+                .is_file(),
+            "unknown partial work must not be automatically rolled back"
         );
     }
 }

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 
 // The plate is a canvas the reference renderer draws into, and the terminal
 // view measures a real font grid; neither exists under jsdom and neither is
@@ -62,9 +62,9 @@ const storedSet = () => JSON.stringify({
 });
 
 describe('startup', () => {
-  it('asks where to open, and starts nothing, when there is nothing to restore', () => {
+  it('asks where to open, and starts nothing, when there is nothing to restore', async () => {
     const ensure = vi.spyOn(ptyClient, 'ensureSession').mockImplementation(() => {});
-    render(<App />);
+    await act(async () => { render(<App />); });
 
     expect(screen.getByText(/OPEN WORKSPACE/i)).toBeDefined();
     // The whole point of the gate: a shell in HOME, which nobody chose, must
@@ -85,7 +85,7 @@ describe('startup', () => {
     render(<App />);
 
     const picker = screen.getByRole('combobox', { name: /workspace path or folder filter/i });
-    await new Promise((resolve) => window.setTimeout(resolve, 40));
+    await act(async () => { await new Promise((resolve) => window.setTimeout(resolve, 40)); });
     expect(document.activeElement).toBe(picker);
   });
 
@@ -93,6 +93,7 @@ describe('startup', () => {
     vi.spyOn(ptyClient, 'getIsConnected').mockReturnValue(true);
     vi.spyOn(ptyClient, 'listSessions').mockResolvedValue({ request_id: 'test', sessions: [] });
     vi.spyOn(ptyClient, 'ensureSession').mockImplementation(() => {});
+    vi.spyOn(ptyClient, 'createSession').mockResolvedValue('a'.repeat(32));
     store.set('DOOM_TERM_WORKSPACES_V2', storedSet());
     render(<App />);
 

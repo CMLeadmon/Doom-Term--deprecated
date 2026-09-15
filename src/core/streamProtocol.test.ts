@@ -8,6 +8,10 @@ const record = (sequence: unknown = '1', payload: unknown = { type: 'Event', pay
 });
 
 describe('v2 stream validation', () => {
+  it('recognizes display-adapter loss as a rendering fault, not a process exit', () => {
+    const fault = record('1', { type: 'Fault', payload: { reason: 'AdapterLost' } });
+    expect(parseStreamRecord(fault)).toEqual(fault);
+  });
   it('preserves exact u64 cursors beyond JavaScript number precision', () => {
     expect(parseSequence('9007199254740993')).toBe(9007199254740993n);
     expect(parseSequence('18446744073709551615')).toBe(18446744073709551615n);
@@ -39,5 +43,13 @@ describe('v2 stream validation', () => {
     expect(parseStreamRecord(atLimit)).toEqual(atLimit);
     const overLimit = record('1', { type: 'Event', payload: { type: 'Output', payload: { data: 'x'.repeat(65537 - overhead) } } });
     expect(() => parseStreamRecord(overLimit)).toThrow();
+  });
+
+  it('bounds total screen allocation as well as each individual dimension', () => {
+    const descriptor = { session_id: 'pane', incarnation: identity, stream_epoch: identity,
+      clock_epoch: identity, initial_cols: 1025, initial_rows: 1025, durable: true };
+    expect(() => parseStreamDescriptor(descriptor)).toThrow();
+    expect(() => parseStreamRecord(record('1', { type: 'Resize', payload: { cols: 1025, rows: 1025 } }))).toThrow();
+    expect(parseStreamDescriptor({ ...descriptor, initial_cols: 1024, initial_rows: 1024 }).initial_rows).toBe(1024);
   });
 });

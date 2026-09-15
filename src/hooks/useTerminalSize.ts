@@ -1,6 +1,5 @@
 import { useEffect, useRef } from 'react';
 import { gridSize, measureCell, type GridSize } from '../core/cellMetrics';
-import { resizeEmulator } from '../core/emulatorRegistry';
 import { ptyClient } from '../core/ptyClient';
 
 /**
@@ -56,7 +55,8 @@ export function useTerminalSize(
         return;
       }
       last.current = next;
-      resizeEmulator(sessionId, next.cols, next.rows);
+      // Desired geometry is coalesced while offline/catching up. Only an
+      // ordered Resize record may reflow the live parser.
       ptyClient.resizeSession(sessionId, next.cols, next.rows);
     };
 

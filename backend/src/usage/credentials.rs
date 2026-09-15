@@ -10,7 +10,11 @@ use std::path::PathBuf;
 /// `~/.claude/.credentials.json`, or None when `$HOME` is unset.
 pub fn credentials_path() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok().filter(|h| !h.is_empty())?;
-    Some(PathBuf::from(home).join(".claude").join(".credentials.json"))
+    Some(
+        PathBuf::from(home)
+            .join(".claude")
+            .join(".credentials.json"),
+    )
 }
 
 /// Pull the subscription access token out of a credentials file's contents.

@@ -1,5 +1,6 @@
 import type { TerminalScreen } from './terminalScreen';
 import { XtermScreen } from './xtermScreen';
+import { parseGrid } from './terminalGeometry';
 
 /**
  * One long-lived screen per PTY session.
@@ -45,9 +46,7 @@ export function getEmulator(sessionId: string): TerminalScreen {
 
 /** Explicit cold reconstruction only. Warm attachment retains getEmulator(). */
 export function replaceEmulator(sessionId: string, cols: number, rows: number): TerminalScreen {
-  if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols <= 0 || rows <= 0 || cols > 65535 || rows > 65535) {
-    throw new Error('Invalid terminal reconstruction dimensions');
-  }
+  parseGrid(cols, rows);
   const emu = new XtermScreen(cols, rows);
   emu.onParsed(() => {
     if (emulators.get(sessionId) !== emu) return;

@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 
 mod durable;
-pub use durable::{AttachError, CapturedArchive};
+pub use durable::{discover_owned, AttachError, CapturedArchive, DiscoveredPane};
 
 /// Child-checked paste needs `bracket_paste_flag`, introduced in tmux 3.7.
 /// Older servers silently expand the unknown format to an empty string, so
@@ -19,11 +19,6 @@ pub use durable::{AttachError, CapturedArchive};
 /// paste even when the child has enabled it. Passthrough also requires >=3.3.
 pub const MIN_MAJOR: u32 = 3;
 pub const MIN_MINOR: u32 = 7;
-
-/// How much scrollback to replay on reattach. Bounded because it arrives as one
-/// event: `history-limit` is 5000, and replaying all of it stalls the first
-/// frame after a reconnect for no benefit anyone can read.
-pub const REPLAY_LINES: u32 = 2000;
 
 /// How often to ask tmux whether the pane went full-screen. A render decision
 /// that used to be per-frame becomes per-tick, so the switch can be this late.
@@ -73,9 +68,8 @@ pub fn version_supported(version_output: &str) -> bool {
 
 /// The tmux session backing a Doom Term pane.
 ///
-/// Namespaced deliberately: `new-session -A` attaches to whatever already
-/// carries the name, so an un-prefixed id could adopt a session the user made
-/// by hand and hand them a shell they did not open.
+/// Namespaced deliberately so Doom-owned sessions cannot collide with a
+/// session the user made by hand on another socket.
 pub fn session_name(session_id: &str) -> String {
     format!("doom-{}", session_id)
 }
@@ -207,17 +201,14 @@ pub fn write_config() -> Option<PathBuf> {
 /// user made themselves, and `tmux ls` stays theirs.
 pub const SOCKET: &str = "doom-term";
 
-/// argv for attach-or-create, at an explicit size, running our shell.
-///
-/// `-A` is what makes reattach free: identical on first spawn and on every
-/// reconnect, so no caller has to know which case it is in. `-x`/`-y` apply
-/// only at creation, which is fine — an existing session is resized by the
-/// client's own PTY instead.
-pub fn new_session_args(
+/// argv for create-only detached pane startup. Attachment is a separate,
+/// identity-checked operation; this command must fail when the name exists.
+pub fn create_session_args(
     conf: &Path,
     name: &str,
     cols: u16,
     rows: u16,
+    cwd: &Path,
     env: &[(String, String)],
     shell: &str,
     shell_args: &[String],
@@ -228,7 +219,9 @@ pub fn new_session_args(
         "-f".into(),
         conf.to_string_lossy().to_string(),
         "new-session".into(),
-        "-A".into(),
+        "-d".into(),
+        "-c".into(),
+        cwd.to_string_lossy().to_string(),
         "-s".into(),
         name.into(),
         "-x".into(),
@@ -330,7 +323,15 @@ impl TmuxHandle {
     /// Resolve one exact pane, then evaluate admission and deliver in tmux's
     /// synchronous command queue. Never trust the outer client's mode 2004.
     pub fn paste(&self, text: &str) -> anyhow::Result<()> {
+        self.paste_checked(text, || Ok(()))
+    }
+    pub(crate) fn paste_checked(
+        &self,
+        text: &str,
+        mut authorize: impl FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
         let clean = crate::paste::prepare_paste(text)?;
+        authorize()?;
         if clean.is_empty() {
             return Ok(());
         }
@@ -365,6 +366,9 @@ impl TmuxHandle {
         );
         let result = (|| -> anyhow::Result<()> {
             run(&["load-buffer", "-b", &buffer, "-"], clean.as_bytes())?;
+            // Loading a private buffer is not delivery. A socket can lose its
+            // lease while that bounded helper runs; never paste on that lease.
+            authorize()?;
             let condition = if clean.contains('\n') {
                 "#{==:#{bracket_paste_flag},1}".to_string()
             } else {
@@ -464,51 +468,6 @@ impl TmuxHandle {
             ]);
         }
         self.on_socket(&["kill-session", "-t", &format!("={}", self.name)])
-    }
-
-    pub fn capture_args(&self, lines: u32) -> Vec<String> {
-        let start = format!("-{}", lines);
-        self.on_socket(&[
-            "capture-pane",
-            "-p",
-            // Keep the colours. Without -e the replay comes back grey and looks
-            // like a different session than the one being resumed.
-            "-e",
-            "-t",
-            &format!("={}:", self.name),
-            "-S",
-            &start,
-            // Line 0 is the top of the visible pane, so -1 is the last line of
-            // history. The attach repaint draws the visible screen itself.
-            "-E",
-            "-1",
-        ])
-    }
-
-    /// Scrollback above the fold, or None when there is none to recover.
-    pub fn capture_history(&self, lines: u32) -> Option<String> {
-        // Identified adapters expose only the typed, identity-fenced archive.
-        // The name-based legacy replay API must not bypass that boundary.
-        if self.target.is_some() {
-            return None;
-        }
-        let out = crate::process_io::run_bounded(
-            &self.exe,
-            &self.capture_args(lines.min(5000)),
-            &[],
-            crate::process_io::HelperLimits {
-                timeout: std::time::Duration::from_secs(2),
-                input_bytes: 0,
-                output_bytes: 8 * 1024 * 1024,
-            },
-        )
-        .ok()?;
-        let text = String::from_utf8_lossy(&out).to_string();
-        if text.trim().is_empty() {
-            None
-        } else {
-            Some(text)
-        }
     }
 
     /// Read one tmux format string. None when tmux is gone or the session is.
@@ -664,17 +623,16 @@ mod tests {
     }
 
     #[test]
-    fn a_new_session_is_attach_or_create_at_an_explicit_size() {
-        // -A is what makes reattach free: the same call creates the first time
-        // and attaches every time after, so the client's reconnect path needs no
-        // knowledge of which case it is in. -x/-y matter because a session
+    fn a_new_session_is_create_only_at_an_explicit_size() {
+        // -x/-y matter because a session
         // created at tmux's 80x24 default and resized afterwards makes every
         // program in it redraw at the wrong width first.
-        let args = new_session_args(
+        let args = create_session_args(
             Path::new("/run/doom.conf"),
             "doom-n1",
             100,
             30,
+            Path::new("/work"),
             &[],
             "/bin/bash",
             &[],
@@ -686,7 +644,8 @@ mod tests {
         // without a word and every guarantee below it quietly disappears.
         assert!(joined.starts_with("-L doom-term "), "{joined}");
         assert!(joined.contains("-f /run/doom.conf"), "{joined}");
-        assert!(joined.contains("new-session -A"), "{joined}");
+        assert!(joined.contains("new-session -d -c /work"), "{joined}");
+        assert!(!joined.contains(" -A"), "{joined}");
         assert!(joined.contains("-s doom-n1"), "{joined}");
         assert!(joined.contains("-x 100"), "{joined}");
         assert!(joined.contains("-y 30"), "{joined}");
@@ -696,11 +655,12 @@ mod tests {
     fn the_shell_and_its_integration_args_go_after_the_terminator() {
         // Without `--`, tmux joins the remaining words into one shell command
         // string, and `--rcfile` would be parsed by tmux rather than bash.
-        let args = new_session_args(
+        let args = create_session_args(
             Path::new("/c"),
             "doom-n1",
             80,
             24,
+            Path::new("/work"),
             &[],
             "/bin/bash",
             &["--rcfile".into(), "/run/i.sh".into(), "-i".into()],
@@ -717,11 +677,12 @@ mod tests {
         // The client process's environment is not the pane's: the pane is a
         // child of the tmux server, which may long predate this client. -e is
         // the only thing that puts ZDOTDIR where the shell will read it.
-        let args = new_session_args(
+        let args = create_session_args(
             Path::new("/c"),
             "doom-n1",
             80,
             24,
+            Path::new("/work"),
             &[("ZDOTDIR".into(), "/run/doom-term".into())],
             "/bin/zsh",
             &[],
@@ -768,36 +729,6 @@ mod tests {
         assert_eq!(
             h.kill_args(),
             vec!["-N", "-L", "doom-term", "kill-session", "-t", "=doom-n1"]
-        );
-    }
-
-    #[test]
-    fn history_capture_stops_where_the_visible_screen_starts() {
-        // -E -1 is the whole trick: line 0 is the top of the visible pane, so
-        // ending at -1 takes the history and nothing else. Without it the
-        // replay repeats every visible line, and the attach repaint then draws
-        // them a second time.
-        let h = TmuxHandle {
-            exe: PathBuf::from("/usr/bin/tmux"),
-            name: "doom-n1".into(),
-            target: None,
-        };
-        assert_eq!(
-            h.capture_args(2000),
-            vec![
-                "-N",
-                "-L",
-                "doom-term",
-                "capture-pane",
-                "-p",
-                "-e",
-                "-t",
-                "=doom-n1:",
-                "-S",
-                "-2000",
-                "-E",
-                "-1"
-            ]
         );
     }
 

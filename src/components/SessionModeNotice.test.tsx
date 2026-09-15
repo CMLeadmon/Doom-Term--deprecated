@@ -1,17 +1,19 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import { render, cleanup } from '@testing-library/react';
 import { SessionModeNotice } from './SessionModeNotice';
 import { ptyClient } from '../core/ptyClient';
 
-afterEach(cleanup);
+const modes = new Map<string, { durable: boolean; detail: string | null }>();
+beforeEach(() => {
+  modes.clear();
+  vi.spyOn(ptyClient, 'getSessionMode').mockImplementation(id => modes.get(id) ?? null);
+});
+afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
 function report(id: string, durable: boolean, detail: string | null) {
-  (ptyClient as unknown as {
-    handleServerMessage: (m: { event: string; data: unknown }) => void;
-  }).handleServerMessage({
-    event: 'SessionMode',
-    data: { session_id: id, durable, detail },
-  });
+  // This suite verifies presentation of an observed mode. The v2 attachment
+  // tests cover how descriptors populate the public client's mode state.
+  modes.set(id, { durable, detail });
 }
 
 describe('SessionModeNotice', () => {

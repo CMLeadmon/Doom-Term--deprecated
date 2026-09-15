@@ -18,11 +18,15 @@ import { getEmulator } from '../core/emulatorRegistry';
 import { findQuickTargets, labelTargets } from '../core/quickSelect';
 import { isModalKeyboardOwned } from '../core/modalKeyboard';
 import { QuickSelectOverlay } from './QuickSelectOverlay';
+import type { MutationIdentity } from '../core/sessionAttachment';
+import type { RecoveredHistoryPresentation } from '../types/sessionTree';
+import { RecoveredHistory } from './RecoveredHistory';
 
 interface RawTerminalViewProps {
   lines: AnsiLine[];
   onWrite: (data: string) => void;
-  onPasteText: (text: string) => Promise<void>;
+  onPasteText: (text: string, expected?: Readonly<MutationIdentity> | null) => Promise<void>;
+  captureInputIdentity?: () => Readonly<MutationIdentity> | null;
   onSendSignal: (sig: 'ctrl+c' | 'ctrl+d' | 'ctrl+z') => void;
   /** Only the focused pane grabs the keyboard; the others must not steal it. */
   isActive?: boolean;
@@ -39,6 +43,9 @@ interface RawTerminalViewProps {
   viewActionRequest?: ViewActionRequest | null;
   /** Clear a request after this pane accepts it, before a later remount. */
   onViewActionHandled?: (requestId: number) => void;
+  recoveredHistory?: RecoveredHistoryPresentation;
+  recoveryCacheLines?: readonly AnsiLine[];
+  recoveryCacheTruncated?: boolean;
 }
 
 /** Gutter width. Reserved from the grid so the shell never wraps early. */
@@ -117,6 +124,7 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
   lines,
   onWrite,
   onPasteText,
+  captureInputIdentity,
   onSendSignal,
   isActive = true,
   sessionId = null,
@@ -124,11 +132,15 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
   cursor = null,
   viewActionRequest = null,
   onViewActionHandled,
+  recoveredHistory,
+  recoveryCacheLines = [],
+  recoveryCacheTruncated,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const [hasFocus, setHasFocus] = useState(false);
   const detachedRef = useRef(false);
+  const userScrollIntentRef = useRef(false);
   /**
    * Search entry is a keyboard MODE, not a text box.
    *
@@ -211,6 +223,15 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
     const el = scrollRef.current;
     if (!el || !sessionId) return;
     const atBottom = el.scrollHeight - (el.scrollTop + el.clientHeight) < 24;
+    // Resize/reconstruction can clamp scrollTop and emit a native scroll event
+    // even though the reader never left follow mode. Treat detachment as user
+    // intent, not as an incidental layout coordinate.
+    if (!atBottom && !detachedRef.current && !userScrollIntentRef.current) {
+      el.scrollTop = el.scrollHeight;
+      reattach(sessionId);
+      return;
+    }
+    userScrollIntentRef.current = false;
     detachedRef.current = !atBottom;
     if (atBottom) reattach(sessionId);
     else detach(sessionId, Math.round((el.scrollTop / Math.max(1, el.scrollHeight)) * lines.length));
@@ -225,17 +246,19 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
     }
   }, []);
 
-  const pasteText = React.useCallback(async (text: string) => {
+  const pasteText = React.useCallback(async (text: string, expected?: Readonly<MutationIdentity> | null) => {
     if (!isActive || isModalKeyboardOwned() || searching || quickSelecting) return;
     const epoch = ++pasteResultEpoch.current;
     try {
+      if (expected === null) throw new Error('Session not ready; paste was not sent.');
       const mode = sessionId ? getEmulator(sessionId).getPasteState().bracketed : false;
       const clean = prepareClipboardText(text, mode);
       if (clean === null) {
         setClipboardNotice('Multiline paste blocked: bracketed-paste mode is not currently observed.');
       } else if (clean) {
         setClipboardNotice(null);
-        await onPasteText(clean);
+        if (expected === undefined) await onPasteText(clean);
+        else await onPasteText(clean, expected);
       }
     } catch (error) {
       if (epoch === pasteResultEpoch.current) {
@@ -248,19 +271,31 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
     const epoch = ++clipboardEpoch.current;
     const emu = sessionId ? getEmulator(sessionId) : null;
     const revision = emu?.getPasteState().revision;
+    const captured = captureInputIdentity?.();
+    const permit = captured ? { ...captured } : captured;
+    if (permit === null) {
+      setClipboardNotice('Session not ready; clipboard was not read.');
+      return;
+    }
     try {
       if (!navigator.clipboard?.readText) throw new Error('unavailable');
       const text = await navigator.clipboard.readText();
       if (epoch !== clipboardEpoch.current) return;
+      const current = captureInputIdentity?.();
+      if (permit && (!current || permit.id !== current.id || permit.incarnation !== current.incarnation
+          || permit.attachment_id !== current.attachment_id)) {
+        setClipboardNotice('Terminal ownership changed while reading the clipboard. Paste canceled.');
+        return;
+      }
       if (emu && (getEmulator(sessionId!) !== emu || emu.getPasteState().revision !== revision)) {
         setClipboardNotice('Terminal changed while reading the clipboard. Paste canceled; try again.');
         return;
       }
-      void pasteText(text);
+      void pasteText(text, permit);
     } catch {
       if (epoch === clipboardEpoch.current) setClipboardNotice('Clipboard read unavailable or denied.');
     }
-  }, [pasteText, sessionId]);
+  }, [pasteText, sessionId, captureInputIdentity]);
 
   const runViewAction = React.useCallback((viewAction: ViewAction) => {
     if (viewAction === 'copySelection') {
@@ -453,7 +488,7 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
     e.preventDefault();
     e.stopPropagation();
     clipboardEpoch.current++;
-    void pasteText(text);
+    void pasteText(text, captureInputIdentity?.());
   };
 
   const handleMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
@@ -502,10 +537,17 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
       <div
         ref={scrollRef}
         onScroll={handleScroll}
+        onWheel={() => { userScrollIntentRef.current = true; }}
+        onTouchStart={() => { userScrollIntentRef.current = true; }}
+        onPointerDown={(event) => {
+          if (event.target === event.currentTarget) userScrollIntentRef.current = true;
+        }}
         // The PTY uses whole-pixel rows. A fractional 17.875px line box
         // accumulated 37px of overflow and scrolled an editor's first row away.
         className="flex-1 p-3 overflow-y-auto font-mono text-[13px] leading-[17px] select-text"
       >
+        {recoveredHistory && <RecoveredHistory cache={recoveryCacheLines}
+          cacheTruncated={recoveryCacheTruncated} history={recoveredHistory} />}
         {lines.map((line, i) => (
           // No break-all: a TUI's box drawing must not be split mid-frame.
           <div

@@ -133,6 +133,19 @@ pub enum StreamFault {
     SequenceExhausted,
     ControlTooLong,
     AdapterRetired,
+    AdapterLost,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessExit {
+    pub exit_code: Option<i32>,
+}
+
+/// Terminal state survives payload eviction; a rendering fault is not an exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamEnd {
+    Closed { exit_code: Option<i32> },
+    Fault { reason: StreamFault },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,6 +168,9 @@ pub struct StreamSnapshot {
     pub retained_records: usize,
     pub retained_bytes: usize,
     pub ended: bool,
+    pub termination: Option<StreamEnd>,
+    /// Lifecycle observation may arrive after the rendering stream faulted.
+    pub process_exit: Option<ProcessExit>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,6 +236,8 @@ struct JournalState {
     high_water: Sequence,
     bytes: usize,
     ended: bool,
+    termination: Option<StreamEnd>,
+    process_exit: Option<ProcessExit>,
 }
 
 #[derive(Default)]
@@ -301,6 +319,8 @@ impl JournalHub {
                 high_water: Sequence::default(),
                 bytes: 0,
                 ended: false,
+                termination: None,
+                process_exit: None,
             },
         );
         Ok(StreamJournal(Arc::new(JournalLease {
@@ -345,7 +365,20 @@ impl StreamJournal {
             retained_records: stream.records.len(),
             retained_bytes: stream.bytes,
             ended: stream.ended,
+            termination: stream.termination,
+            process_exit: stream.process_exit,
         }
+    }
+
+    /// Preserve an observed root-process exit even if rendering already ended.
+    /// This never reopens the stream or appends behind a terminal fault.
+    pub fn observe_process_exit(&self, exit_code: Option<i32>) {
+        {
+            let mut state = self.0.hub.state.lock();
+            let stream = state.streams.get_mut(&self.0.epoch).expect("live journal");
+            stream.process_exit.get_or_insert(ProcessExit { exit_code });
+        }
+        let _ = self.append(StreamPayload::Closed { exit_code });
     }
 
     pub fn append(&self, mut payload: StreamPayload) -> Result<Sequence, StreamError> {
@@ -380,7 +413,7 @@ impl StreamJournal {
                 };
                 fault = Some(StreamError::SequenceExhausted);
             }
-            let record = StreamRecord {
+            let mut record = StreamRecord {
                 session_id: stream.metadata.session_id.clone(),
                 incarnation: stream.metadata.incarnation.clone(),
                 stream_epoch: stream.metadata.stream_epoch.clone(),
@@ -390,11 +423,28 @@ impl StreamJournal {
             };
             // Charge complete serialized records, including identity/sequence
             // overhead, so tiny semantic events cannot evade the byte budget.
-            let bytes = encoded_size(&record, usize::MAX).expect("stream record is serializable");
-            stream.ended = matches!(
-                record.payload,
-                StreamPayload::Closed { .. } | StreamPayload::Fault { .. }
-            );
+            let bytes = match encoded_size(&record, MAX_RECORD_BYTES) {
+                Some(bytes) => bytes,
+                None => {
+                    record.payload = StreamPayload::Fault {
+                        reason: StreamFault::RecordTooLarge,
+                    };
+                    fault = Some(StreamError::RecordTooLarge);
+                    encoded_size(&record, MAX_RECORD_BYTES)
+                        .expect("bounded metadata and a fault fit in a record")
+                }
+            };
+            stream.termination = match &record.payload {
+                StreamPayload::Closed { exit_code } => Some(StreamEnd::Closed {
+                    exit_code: *exit_code,
+                }),
+                StreamPayload::Fault { reason } => Some(StreamEnd::Fault { reason: *reason }),
+                _ => None,
+            };
+            stream.ended = stream.termination.is_some();
+            if let Some(StreamEnd::Closed { exit_code }) = stream.termination {
+                stream.process_exit.get_or_insert(ProcessExit { exit_code });
+            }
             stream.high_water = sequence;
             stream.bytes += bytes;
             stream.records.push_back(StoredRecord {

@@ -439,6 +439,99 @@ WebSocket disconnect/daemon-restart certification. The live legacy protocol,
 ownership/readiness gates, no-input-replay cutover and archive UI still require
 Tasks 4+6; the recovery contract is not yet implemented end to end.
 
+### Negotiated recovery service (2026-09-12; staged, not public cutover)
+
+The v2 service now has real authenticated socket tests for negotiation, exact
+ownership, parser-applied cut acknowledgements, correlated paste, ordered resize,
+disconnect cleanup, heartbeat expiry, bounded frame reception and closed-process
+retention. A full outbound queue originally allowed an early cut acknowledgement;
+queue commit and cut publication are now atomic. A blocked PTY write originally
+prevented lease release; socket reads now stay active independently of ordered
+command execution, with bounded inbound admission and discarded pending commands
+on disconnect.
+
+Cold attachment discovers an existing pane's identity without inventing a daemon
+checkpoint. A bounded rebuild preserves its PID and observed dimensions, retires
+the previous display client, starts a fresh stream epoch and transfers history
+as separate capture-id/ordinal chunks with explicit completion and provenance.
+Real tests preserve shell and editor state; archive bytes do not enter the live
+journal. A killed display client produces an adapter fault, not a fabricated
+process exit. A later actual exit still becomes a bounded tombstone after a
+rendering fault, and explicit KILL remains possible for an owned process that
+has closed its terminal descriptors.
+
+Adversarial fixtures also reproduced stale input, resize and paste delivery.
+Identified tmux input now uses literal hex bytes in an identity-checked command
+queue, preserving NUL/control/Unicode/escape bytes without clipboard framing.
+Identified windows use explicit, identity-fenced resizing; late display sizing
+cannot independently resize a replacement pane. Paste rechecks its socket lease
+after loading its private buffer and cleans up on refusal. Direct kill no longer
+trusts a cached numeric PID after its Child has been reaped.
+
+Fresh verification passes: 103 PTY tests, 107 backend tests (three live-account
+tests ignored), 503 Vitest / 102 Node tests, typecheck, production build,
+15,360-pixel zero-mismatch HUD and native all-target compilation in `doom-tauri`.
+The existing bundle-size and JSDOM fixture diagnostics remain. These checks do
+not certify end-to-end recovery: the public listener/frontend still use the
+legacy protocol pending their coordinated replacement. Remaining work includes
+metadata/hooks and explicit legacy recovery, all-workspace identity persistence,
+removal of input replay, archive presentation, live stress tests and all eleven
+real-browser contract gates. Beta readiness remains unproven.
+
+### Frontend recovery cutover (2026-09-13; local work in progress)
+
+The public frontend client now uses negotiated connection and per-session
+attachment modules. It no longer has a reconnect typing queue, echo-held input,
+or legacy Spawn wire command. Focus is separate from attachment; exact restored
+identities in background and parked workspaces attach with concurrency four.
+Catch-up projection uses source-derived timing and suppresses completion
+notification replay. Desired geometry no longer reflows the parser before an
+ordered confirmation. Targeted suites pass, including real xterm continuation,
+stale-socket rejection, create/paste uncertainty and identity-only reconciliation.
+
+**This working tree is mid-cutover, not deployable yet.** The public backend
+listener still needs its matching v2 integration. Migrating the legacy frontend
+fixtures exposed and fixed close-before-Kill-result handling; all 565 Vitest
+tests now pass, as does typecheck. This is not a browser/daemon pass. Archive/cache
+presentation and storage bounds, lifecycle UI outcomes, explicit legacy recovery,
+metadata/hooks, stress coverage and real-browser gates remain open. Earlier
+green full-suite/build results above describe the pre-cutover state, not these
+unfinished local changes.
+
+### Public recovery integration (2026-09-15; not release-certified)
+
+The public listener and frontend now both speak protocol v2. The old WebSocket
+dispatcher and its unbounded delivery queue are removed; legacy daemon commands
+remain test-only while their historical PTY tests are migrated. Real recovery
+socket fixtures now enter through the public HTTP/WebSocket router. Authentication
+and negotiation gate discovery, metadata and retained hook state.
+
+Directory listings have count/serialized-byte bounds and a visible partial-listing
+notice. Metadata workers have bounded admission, retain their permits through
+uncancellable filesystem work, and do not stall ordinary socket dispatch. Git
+queries are bounded; worktree creation has a 20-second helper deadline and leaves
+unconfirmed partial work intact. Telemetry replies carry the expected incarnation
+and cannot describe a replacement process under a reused pane id.
+
+Hook state has stable source ids, an atomic retained/live handoff and bounded
+retention. New direct and durable roots pass their incarnation to the hook script.
+The frontend buffers early hook state until exact-identity binding, suppresses
+duplicate/restored asks and refuses stale-process clearing. Explicit revival now
+creates a fresh logical id and replaces its original cached pane only after Create
+confirmation, preserving cache and focus on failed/unknown results.
+
+Fresh checks: 104 PTY tests, 112 backend tests (three live-account tests ignored),
+578 Vitest tests, 102 Node tests, typecheck and native all-target compilation pass.
+The latest pre-revival production build and 15,360-pixel zero-mismatch HUD check
+also pass; bundle-size and test-environment diagnostics remain. A fresh browser
+smoke is in progress. No full recovery-browser gate pass is claimed.
+
+Still open: explicit legacy/replacement recovery choices, cache/archive presentation
+and combined storage bounds, removal of legacy PTY Spawn/rebind APIs, durable pane
+exit observation, live overflow/gap and concurrent/lost-create stress tests, and
+all eleven real-browser contract gates. This is not yet a deployable completion
+of the written recovery plan or a beta-readiness certification.
+
 ## Trust boundary references
 
 WebSocket origin checking follows [RFC 6455](https://www.rfc-editor.org/rfc/rfc6455):

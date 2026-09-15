@@ -2,7 +2,7 @@ import { AnsiLine } from './terminal';
 
 export type SessionKind = 'terminal' | 'agent' | 'tui' | 'scratchpad';
 
-export type AgentLifecycleState = 'idle' | 'running' | 'waiting_input' | 'verifying' | 'errored';
+export type AgentLifecycleState = 'unknown' | 'idle' | 'running' | 'waiting_input' | 'verifying' | 'errored';
 
 export type SplitLayoutMode = 'single' | 'split-h' | 'split-v' | 'grid-2x2';
 export type PaneDirection = 'row' | 'column';
@@ -18,8 +18,28 @@ export type PaneTree =
       second: PaneTree;
     };
 
+export interface RecoveredHistoryPresentation {
+  status: 'unavailable' | 'receiving' | 'complete' | 'incomplete';
+  data: string | null;
+  reason: string | null;
+  captureId?: string;
+  historyAtLimit?: boolean;
+  potentiallyOverlapping: true;
+  potentiallyIncomplete: true;
+}
+
 export interface SessionNode {
   id: string;
+  /** Exact process identity, never a socket lease or parser checkpoint. */
+  incarnation?: string;
+  /** Local-only presentation of a displaced cache. Never a process binding. */
+  snapshotOf?: { sessionId: string; incarnation?: string };
+  /** Retained whole-line cache is only a bounded suffix, never a checkpoint. */
+  cacheTruncated?: boolean;
+  /** Saved cache and tmux capture remain outside the new live parser. */
+  recoveryCacheLines?: AnsiLine[];
+  recoveryCacheTruncated?: boolean;
+  recoveredHistory?: RecoveredHistoryPresentation;
   groupId: string;
   title: string;
   /**
@@ -70,14 +90,20 @@ export interface SessionNode {
   commandHistory: string[];
   /** The last exit code seen for this session, if any. */
   lastExitCode?: number | null;
-  /** Monotonic counter for completed commands; notification deduplication key. */
+  /** Complete observed command count, absent after a discontinuous rebuild. */
   executionSerial?: number;
-  /** Wall-clock duration of the last OSC-133 delimited command. */
+  /** V2 source-based projection; cached counters cannot trigger notifications. */
+  streamObserved?: boolean;
+  lastLiveExecutionEventId?: string;
+  /** Duration between command endpoints on the same daemon monotonic clock. */
   lastExecutionDurationMs?: number;
   /** Timestamp captured at ExecutionStart; absent outside a measured command. */
   lastExecutionStartedAt?: number;
   /** Monotonic counter for vendor permission requests. */
   attentionSerial?: number;
+  /** Source identity makes restored hook state idempotent, without new asks. */
+  lastHookEventId?: string;
+  lastLiveAskEventId?: string;
   /** Last time the operator deliberately focused this session. */
   lastUsedAt?: number;
   /** True only after the shell reports PromptStart. Used by safe close. */

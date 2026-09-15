@@ -8,23 +8,15 @@ async fn server() -> (SocketAddr, HookState, tokio::task::JoinHandle<()>) {
 async fn server_with_token(
     token: Option<String>,
 ) -> (SocketAddr, HookState, tokio::task::JoinHandle<()>) {
+    // These security tests never enumerate the user's private tmux server.
+    std::env::set_var("DOOM_TERM_NO_TMUX", "1");
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let state: HookState = Arc::new(RwLock::new(HashMap::new()));
-    let retained = state.clone();
+    let server = Arc::new(recovery::RecoveryServer::new().unwrap());
+    let retained = server.hooks.clone();
     let task = tokio::spawn(async move {
         let (stream, peer) = listener.accept().await.unwrap();
-        let (hooks, _) = tokio::sync::broadcast::channel(4);
-        handle_connection_authenticated(
-            stream,
-            peer,
-            Arc::new(RwLock::new(HashMap::new())),
-            Arc::new(usage::service::UsageService::new()),
-            hooks,
-            state,
-            token,
-        )
-        .await;
+        handle_connection_authenticated(stream, peer, server, token).await;
     });
     (addr, retained, task)
 }
@@ -76,7 +68,28 @@ async fn security_gates_commands_and_retained_hooks_on_authentication() {
         .unwrap()
         .into_text()
         .unwrap()
-        .contains("AgentEvent"));
+        .contains("Protocol"));
+    ws.send(Message::Text(
+        r#"{"action":"Negotiate","payload":{"version":2}}"#.into(),
+    ))
+    .await
+    .unwrap();
+    assert!(ws
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .into_text()
+        .unwrap()
+        .contains("Negotiated"));
+    let restored: serde_json::Value =
+        serde_json::from_str(&ws.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+    assert_eq!(restored["event"], "AgentEvent");
+    assert_eq!(restored["data"]["phase"], "catch-up");
+    assert!(
+        serde_json::from_value::<pty::stream::Identity>(restored["data"]["event_id"].clone())
+            .is_ok()
+    );
     ws.send(Message::Text(
         r#"{"action":"ListSessions","payload":{"request_id":"yes"}}"#.into(),
     ))
@@ -104,7 +117,7 @@ async fn security_accepts_native_hooks() {
     stream.read_to_end(&mut response).await.unwrap();
     task.await.unwrap();
     assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 204"));
-    assert_eq!(state.read().len(), 1);
+    assert_eq!(state.subscribe().0.len(), 1);
 }
 
 #[tokio::test]
@@ -141,7 +154,7 @@ async fn security_rejects_browser_hook_without_changing_retained_state() {
     stream.read_to_end(&mut response).await.unwrap();
     task.await.unwrap();
     assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 403"));
-    assert!(state.read().is_empty());
+    assert!(state.subscribe().0.is_empty());
 }
 
 #[tokio::test]

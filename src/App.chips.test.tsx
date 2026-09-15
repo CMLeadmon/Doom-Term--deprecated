@@ -32,7 +32,7 @@ vi.mock('./components/RawTerminalView', () => ({
 }));
 
 import { App } from './App';
-import { ptyClient } from './core/ptyClient';
+import { ptyClient, type DemuxEventHandler } from './core/ptyClient';
 import { audioEngine } from './core/audioEngine';
 
 /** See core/sessionStore.test.ts: window.localStorage is undefined by default here. */
@@ -58,6 +58,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  ptyClient.forgetSession('n1');
+  ptyClient.forgetSession('n2');
   if (original) Object.defineProperty(window, 'localStorage', original);
   else delete (window as unknown as Record<string, unknown>).localStorage;
   vi.restoreAllMocks();
@@ -112,11 +114,15 @@ const renderApp = (node: Record<string, unknown> = healthyNode) => {
 
 describe('status chips', () => {
   it('does not show the previous pane\'s telemetry while waiting for the selected pane', () => {
+    ptyClient.bindExisting('n1', '1'.repeat(32));
+    ptyClient.bindExisting('n2', '2'.repeat(32));
     renderApp();
     ptyClient.setActiveSession('n1');
-    const receive = (data: unknown) => (ptyClient as unknown as { handleServerMessage: (m: unknown) => void }).handleServerMessage(data);
+    const receive = (message: { event: string; data: unknown }) => (ptyClient as unknown as {
+      handleServerMessage: (event: string, data: unknown) => void;
+    }).handleServerMessage(message.event, message.data);
     act(() => receive({ event: 'Telemetry', data: {
-      session_id: 'n1', current_dir: '/home/u/proj', git_branch: 'main', isolation: 'host',
+      session_id: 'n1', incarnation: '1'.repeat(32), current_dir: '/home/u/proj', git_branch: 'main', isolation: 'host',
       agent_key: 'claude', agent_name: 'CLAUDE CODE', agent_model: 'fixture-model', context_used: 0.42, rate_used: 0.3,
     } }));
     expect(JSON.parse(screen.getByTestId('settings-state').textContent!).contextUsed).toBe(0.42);
@@ -128,7 +134,7 @@ describe('status chips', () => {
     expect(selected.model).toBeUndefined();
     expect(selected.isolation).toBeUndefined();
     act(() => receive({ event: 'Telemetry', data: {
-      session_id: 'n2', current_dir: '/home/u/proj', isolation: 'host', agent_key: 'codex', context_used: 0.05,
+      session_id: 'n2', incarnation: '2'.repeat(32), current_dir: '/home/u/proj', isolation: 'host', agent_key: 'codex', context_used: 0.05,
     } }));
     expect(JSON.parse(screen.getByTestId('settings-state').textContent!).contextUsed).toBe(0.05);
   });
@@ -152,16 +158,17 @@ describe('status chips', () => {
   });
   it('offers transient authentication without persisting the token', () => {
     const authenticate = vi.spyOn(ptyClient, 'authenticate').mockImplementation(() => {});
+    let authChanged: (message: string | null) => void = () => undefined;
+    vi.spyOn(ptyClient, 'onAuthChange').mockImplementation(handler => { authChanged = handler; return () => undefined; });
     renderApp();
-    const receive = (data: unknown) => (ptyClient as unknown as { handleServerMessage: (m: unknown) => void }).handleServerMessage(data);
-    act(() => receive({ event: 'AuthResult', data: { success: false, message: 'Authentication required' } }));
+    act(() => authChanged('Authentication required'));
     const token = screen.getByLabelText('Daemon access token');
     expect(token.getAttribute('type')).toBe('password');
     fireEvent.change(token, { target: { value: 'fixture-token' } });
     fireEvent.click(screen.getByRole('button', { name: 'CONNECT' }));
     expect(authenticate).toHaveBeenCalledWith('fixture-token');
     expect([...store.values()].some((value) => value.includes('fixture-token'))).toBe(false);
-    act(() => receive({ event: 'AuthResult', data: { success: true, message: 'Authenticated' } }));
+    act(() => authChanged(null));
     expect(screen.queryByLabelText('Daemon access token')).toBeNull();
   });
   it('updates the chip and settings when sound is toggled from the palette', () => {
@@ -185,7 +192,7 @@ describe('status chips', () => {
 
   it('never restores automatic Enter injection from a saved YOLO preference', async () => {
     store.set('doom-term-permission-mode', 'yolo');
-    const write = vi.spyOn(ptyClient, 'writeToSession').mockImplementation(() => {});
+    const write = vi.spyOn(ptyClient, 'writeToSession').mockReturnValue(false);
     renderApp({ ...healthyNode, blockedOnUser: true, attentionSerial: 1 });
     expect(JSON.parse(screen.getByTestId('settings-state').textContent!).permissionMode).toBe('manual');
     await act(async () => { await new Promise((resolve) => setTimeout(resolve, 1700)); });
@@ -244,7 +251,22 @@ describe('status chips', () => {
   });
 
   it('jumps to a failed session on the red chip', () => {
+    let handler: DemuxEventHandler | undefined;
+    const register = ptyClient.registerHandler.bind(ptyClient);
+    vi.spyOn(ptyClient, 'registerHandler').mockImplementation(value => {
+      if (value.onStreamRecord) handler = value;
+      return register(value);
+    });
     renderApp(failedNode);
+    // Saved state is presentation-only. Supply a verified catch-up observation
+    // to restore this failure without treating it as a new notification.
+    act(() => handler!.onStreamRecord?.({ session_id: 'n2', incarnation: '2'.repeat(32),
+      stream_epoch: '3'.repeat(32), sequence: '1', observed_micros: 1,
+      payload: { type: 'Event', payload: { type: 'ExecutionEnd', payload: { exit_code: 127 } } } }, {
+      phase: 'catch-up', eventId: 'observed-failure', clockEpoch: '4'.repeat(32), observedMicros: 1,
+      state: { completedCommands: 1, lastExitCode: 127, lastExecutionDurationMs: null, closed: false,
+        atPrompt: null, cwd: null, agentState: 'errored', isTuiActive: false },
+    }));
 
     fireEvent.click(screen.getByTestId('chip-2'));
 

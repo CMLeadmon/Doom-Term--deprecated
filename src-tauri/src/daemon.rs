@@ -43,7 +43,10 @@ fn is_listening() -> bool {
 /// attach to the existing one instead.
 pub fn start(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     if is_listening() {
-        log::info!("PTY daemon already listening on {}; attaching to it", address());
+        log::info!(
+            "PTY daemon already listening on {}; attaching to it",
+            address()
+        );
         app.manage(Daemon(Mutex::new(None)));
         return Ok(());
     }

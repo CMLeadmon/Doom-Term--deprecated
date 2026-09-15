@@ -109,4 +109,10 @@ describe('emulator registry', () => {
     expect(() => replaceEmulator('cold', 0, 3)).toThrow();
     expect(getEmulator('cold')).toBe(fresh);
   });
+
+  it('refuses an over-budget grid before replacing the cached screen', () => {
+    const cached = getEmulator('bounded');
+    expect(() => replaceEmulator('bounded', 1025, 1025)).toThrow();
+    expect(getEmulator('bounded')).toBe(cached);
+  });
 });

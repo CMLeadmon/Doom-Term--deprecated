@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { applyScreenToNode } from './usePtyEvents';
+import { applyScreenToNode, advanceReportedTuiState } from './usePtyEvents';
+import type { StreamRecord } from '../core/streamProtocol';
 import type { SessionNode } from '../types/sessionTree';
 import type { AnsiLine } from '../types/terminal';
 
@@ -49,5 +50,22 @@ describe('applyScreenToNode', () => {
     applyScreenToNode(original, LINES, true);
     expect(original.tuiLines).toEqual([]);
     expect(original.isTuiActive).toBe(false);
+  });
+});
+
+describe('daemon TUI state lifetime', () => {
+  const record = (streamEpoch: string, active?: boolean): StreamRecord => ({
+    session_id: 'n', incarnation: '1'.repeat(32), stream_epoch: streamEpoch,
+    sequence: '1', observed_micros: 1,
+    payload: active === undefined
+      ? { type: 'Event', payload: { type: 'PromptStart' } }
+      : { type: 'Event', payload: { type: 'TuiMode', payload: { active } } },
+  });
+
+  it('does not carry a TUI observation across a reconstructed stream', () => {
+    const old = advanceReportedTuiState(undefined, record('2'.repeat(32), true));
+    expect(old.active).toBe(true);
+    const rebuilt = advanceReportedTuiState(old, record('3'.repeat(32)));
+    expect(rebuilt).toEqual({ stream: '1'.repeat(32) + '/' + '3'.repeat(32) });
   });
 });

@@ -1,104 +1,76 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { PtyClient } from './ptyClient';
+import { recoveryFixture, TEST_INCARNATION } from '../test/recoveryFixture';
+import { resetAllEmulators } from './emulatorRegistry';
 
-type Wire = { action: string; payload: { request_id: string; id: string; text: string } };
-let sockets: FakeSocket[];
-class FakeSocket {
-  static OPEN = 1;
-  static CONNECTING = 0;
-  readyState = 0;
-  onopen = () => {};
-  onclose = () => {};
-  onerror = () => {};
-  onmessage = (_event: { data: string }) => {};
-  sent: Wire[] = [];
-  constructor() { sockets.push(this); }
-  send(raw: string) { this.sent.push(JSON.parse(raw)); }
-  receive(event: string, data: unknown) { this.onmessage({ data: JSON.stringify({ event, data }) }); }
-  open() { this.readyState = 1; this.onopen(); }
-  authorize() { this.receive('AuthResult', { success: true, message: 'Authenticated' }); }
-  reply(request: Wire, error: string | null = null, session = request.payload.id) {
-    this.receive('PasteResult', { request_id: request.payload.request_id, session_id: session, error });
-  }
+let fixture: ReturnType<typeof recoveryFixture>;
+beforeEach(() => { fixture = recoveryFixture(); fixture.client.bindExisting('pane', TEST_INCARNATION); });
+afterEach(() => { fixture.client.dispose(); resetAllEmulators(); vi.useRealTimers(); });
+async function connect() {
+  fixture.sockets[0].open(); await fixture.sockets[0].ready('pane');
+  fixture.sockets[0].sent = []; return fixture.sockets[0];
 }
-let client: PtyClient;
-beforeEach(() => {
-  vi.useFakeTimers();
-  sockets = [];
-  vi.stubGlobal('WebSocket', FakeSocket);
-  client = new (PtyClient as unknown as { new(): PtyClient })();
-  client.ensureSession('pane', '/tmp/paste-fixture');
-});
-afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); vi.unstubAllGlobals(); });
-function connect() { sockets[0].open(); sockets[0].authorize(); sockets[0].sent = []; return sockets[0]; }
-
 it('refuses paste while offline or awaiting authentication without queueing it', async () => {
-  await expect(client.pasteToSession('pane', 'offline')).rejects.toThrow(/connect|auth/i);
-  sockets[0].open();
-  await expect(client.pasteToSession('pane', 'unauthorized')).rejects.toThrow(/connect|auth/i);
-  sockets[0].authorize();
-  expect(sockets[0].sent.some(m => m.action === 'Paste' || m.action === 'Write')).toBe(false);
+  await expect(fixture.client.pasteToSession('pane', 'offline')).rejects.toThrow(/connect|auth/i);
+  fixture.sockets[0].openSocket();
+  fixture.sockets[0].receive('AuthResult', { success: false });
+  await expect(fixture.client.pasteToSession('pane', 'unauthorized')).rejects.toThrow(/connect|auth/i);
+  fixture.sockets[0].receive('AuthResult', { success: true }); fixture.sockets[0].negotiate();
+  expect(fixture.sockets[0].sent.some(request => request.action === 'Paste' || request.action === 'Write')).toBe(false);
 });
-
-it('sends plain clipboard text and resolves only the matching request AND session', async () => {
-  const socket = connect();
-  const promise = client.pasteToSession('pane', "'三\rnext");
-  const seen = vi.fn();
-  void promise.then(seen, () => {});
-  const request = socket.sent[0];
-  expect(request).toEqual({ action: 'Paste', payload: { request_id: expect.any(String), id: 'pane', text: "'三\rnext" } });
-  socket.reply(request, null, 'other-pane');
+it('sends plain clipboard text and resolves only matching request and session ids', async () => {
+  const socket = await connect();
+  const promise = fixture.client.pasteToSession('pane', "'三\rnext"); const seen = vi.fn(); void promise.then(seen, () => undefined);
+  const request = socket.actions('Paste')[0];
+  expect(request).toMatchObject({ action: 'Paste', payload: { request_id: expect.any(String), id: 'pane', text: "'三\rnext",
+    incarnation: TEST_INCARNATION, attachment_id: socket.bound.get('pane')!.attachment_id } });
+  socket.receive('PasteResult', { request_id: request.payload.request_id, session_id: 'other', error: null });
   socket.receive('PasteResult', { request_id: 'unknown', session_id: 'pane', error: null });
-  await Promise.resolve();
-  expect(seen).not.toHaveBeenCalled();
-  socket.reply(request);
+  await Promise.resolve(); expect(seen).not.toHaveBeenCalled();
+  socket.receive('PasteResult', { request_id: request.payload.request_id, session_id: 'pane', error: null });
   await expect(promise).resolves.toBeUndefined();
 });
-
-it('reports daemon refusal without a fallback Write', async () => {
-  const socket = connect();
-  const promise = client.pasteToSession('pane', 'one\ntwo');
-  const check = expect(promise).rejects.toThrow(/Multiline paste blocked/);
-  socket.reply(socket.sent[0], 'Multiline paste blocked: child mode disabled');
-  await check;
-  expect(socket.sent.map(m => m.action)).toEqual(['Paste']);
+it('reports child-side refusal without falling back to raw Write', async () => {
+  const socket = await connect();
+  const promise = fixture.client.pasteToSession('pane', 'one\ntwo');
+  socket.receive('PasteResult', { request_id: socket.actions('Paste')[0].payload.request_id, session_id: 'pane',
+    error: 'Multiline paste blocked: child mode disabled' });
+  await expect(promise).rejects.toThrow(/Multiline paste blocked/);
+  expect(socket.sent.map(request => request.action)).toEqual(['Paste']);
 });
-
-it('expires an unsupported/old-daemon request as unknown delivery and never retries', async () => {
-  const socket = connect();
-  const promise = client.pasteToSession('pane', 'text');
-  const check = expect(promise).rejects.toThrow(/timed out.*(unknown|uncertain)/i);
+it('expires a lost result as unknown delivery and never retries', async () => {
+  const socket = await connect(); vi.useFakeTimers();
+  const promise = fixture.client.pasteToSession('pane', 'text');
+  const result = promise.then(() => '', error => (error as Error).message);
   await vi.advanceTimersByTimeAsync(10000);
-  await check;
-  socket.reply(socket.sent[0]); // A late response cannot cause another delivery.
-  expect(socket.sent.map(m => m.action)).toEqual(['Paste']);
+  expect(await result).toMatch(/timed out.*unknown/i);
+  socket.receive('PasteResult', { request_id: socket.actions('Paste')[0].payload.request_id, session_id: 'pane', error: null });
+  expect(socket.sent.map(request => request.action)).toEqual(['Paste']);
 });
-
-it.each(['onclose', 'onerror'] as const)('rejects pending paste on %s and does not replay after reconnect', async event => {
-  const socket = connect();
-  const promise = client.pasteToSession('pane', 'text');
-  const check = expect(promise).rejects.toThrow(/disconnect|connection/i);
-  socket.readyState = 3;
-  socket[event]();
-  await check;
-  await vi.advanceTimersByTimeAsync(2000);
-  sockets[1].open(); sockets[1].authorize();
-  expect(sockets[1].sent.some(m => m.action === 'Paste' || m.action === 'Write')).toBe(false);
+it.each(['onclose', 'onerror'] as const)('rejects pending paste on %s and never replays it after reconnect', async event => {
+  const socket = await connect(); vi.useFakeTimers();
+  const promise = fixture.client.pasteToSession('pane', 'text');
+  const result = promise.then(() => '', error => (error as Error).message);
+  socket.readyState = 3; socket[event]?.();
+  expect(await result).toMatch(/disconnect.*unknown/i);
+  await vi.advanceTimersByTimeAsync(2000); fixture.sockets[1].open();
+  expect(fixture.sockets[1].sent.some(request => request.action === 'Paste' || request.action === 'Write')).toBe(false);
 });
-
-it.each(['daemon', 'local'])('rejects pending paste when the %s closes its session', async owner => {
-  const socket = connect();
-  const promise = client.pasteToSession('pane', 'text');
-  const check = expect(promise).rejects.toThrow(/closed/i);
-  if (owner === 'daemon') socket.receive('SessionClosed', { session_id: 'pane' });
-  else client.killSession('pane');
-  await check;
-  await expect(client.pasteToSession('pane', 'again')).rejects.toThrow(/closed|bound/i);
-  expect(socket.sent.filter(m => m.action === 'Paste')).toHaveLength(1);
+it.each(['daemon', 'local'])('rejects pending paste when the %s confirms session closure', async owner => {
+  const socket = await connect();
+  const paste = fixture.client.pasteToSession('pane', 'text');
+  const outcome = paste.then(() => '', error => (error as Error).message);
+  const killing = owner === 'local' ? fixture.client.killSession('pane') : null;
+  socket.record('pane', { type: 'Closed', payload: { exit_code: null } });
+  expect(await outcome).toMatch(/closed.*unknown/i);
+  if (killing) {
+    socket.receive('KillResult', { request_id: socket.actions('Kill')[0].payload.request_id, session_id: 'pane', error: null });
+    await expect(killing).resolves.toBe(true);
+  }
+  await expect(fixture.client.pasteToSession('pane', 'again')).rejects.toThrow(/closed|ready/i);
+  expect(socket.actions('Paste')).toHaveLength(1);
 });
-
-it('rejects input exceeding 1 MiB in UTF-8 before sending', async () => {
-  const socket = connect();
-  await expect(client.pasteToSession('pane', '三'.repeat(350000))).rejects.toThrow(/1 MiB/);
+it('rejects original UTF-8 input over 1 MiB before sending', async () => {
+  const socket = await connect();
+  await expect(fixture.client.pasteToSession('pane', '三'.repeat(350000))).rejects.toThrow(/1 MiB/);
   expect(socket.sent).toEqual([]);
 });

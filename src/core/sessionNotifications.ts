@@ -36,20 +36,23 @@ export function notificationTransition(
   const prefix = `[${next.number ?? '-'}] ${next.title}`;
 
   if (!previous.blockedOnUser && next.blockedOnUser) {
+    if (next.lastHookEventId && (!next.lastLiveAskEventId || next.lastLiveAskEventId === previous.lastLiveAskEventId)) return null;
     return {
-      key: `ask:${next.id}:${next.attentionSerial ?? 0}`,
+      key: `ask:${next.id}:${next.lastHookEventId ? next.lastLiveAskEventId : next.attentionSerial ?? 0}`,
       sessionId: next.id,
       title: `${prefix} asks`,
       body: tail(next),
     };
   }
 
-  if ((next.executionSerial ?? 0) === (previous.executionSerial ?? 0)) return null;
+  if (next.streamObserved) {
+    if (!next.lastLiveExecutionEventId || next.lastLiveExecutionEventId === previous.lastLiveExecutionEventId) return null;
+  } else if ((next.executionSerial ?? 0) === (previous.executionSerial ?? 0)) return null;
   const failed = typeof next.lastExitCode === 'number' && next.lastExitCode !== 0;
   const longSuccess = next.lastExitCode === 0 && (next.lastExecutionDurationMs ?? 0) >= 10_000;
   if (!failed && !longSuccess) return null;
   return {
-    key: `exit:${next.id}:${next.executionSerial ?? 0}`,
+    key: `exit:${next.id}:${next.streamObserved ? next.lastLiveExecutionEventId : next.executionSerial ?? 0}`,
     sessionId: next.id,
     title: `${prefix} ${failed ? 'failed' : 'complete'}`,
     body: tail(next),

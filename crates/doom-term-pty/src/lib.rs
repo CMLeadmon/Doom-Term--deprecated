@@ -2,13 +2,13 @@
 //!
 //! The standalone WebSocket daemon (`backend/`) and the Tauri desktop app
 //! (`src-tauri/`) both consume this crate. They differ only in transport, so
-//! `PtySession::spawn` takes callbacks rather than knowing about either one.
-//! Nothing here may be forked back into a consumer.
+//! Both consume the same bounded journal and exact attachment primitives;
+//! transport callbacks do not live in this crate.
 
 pub mod demuxer;
 pub mod foreground;
 pub mod paste;
-mod process_io;
+pub mod process_io;
 mod runtime_files;
 pub mod session;
 pub mod shell_integration;

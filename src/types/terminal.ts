@@ -98,6 +98,8 @@ export interface SystemTelemetryData {
    * not the one now on screen.
    */
   session_id?: string | null;
+  /** Exact process identity; delayed replies cannot describe its replacement. */
+  incarnation?: string | null;
   username: string;
   hostname: string;
   current_dir: string;

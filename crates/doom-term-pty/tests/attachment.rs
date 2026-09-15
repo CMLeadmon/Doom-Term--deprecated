@@ -35,6 +35,62 @@ fn isolated(test: &str) -> bool {
 }
 
 #[test]
+fn created_roots_inherit_their_exact_incarnation_for_hook_attribution() {
+    if isolated("created_roots_inherit_their_exact_incarnation_for_hook_attribution") {
+        return;
+    }
+    std::env::set_var("DOOM_TERM_INCARNATION", "00000000000000000000000000000000");
+    std::env::set_var("DOOM_TERM_NO_SHELL_INTEGRATION", "1");
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("identity.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nprintf '%s' \"${DOOM_TERM_INCARNATION:-unknown}\" > identity.txt\nexec cat\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    for durable in [false, true] {
+        if durable {
+            std::env::remove_var("DOOM_TERM_NO_TMUX");
+        } else {
+            std::env::set_var("DOOM_TERM_NO_TMUX", "1");
+        }
+        let cwd = dir.path().join(if durable { "durable" } else { "direct" });
+        std::fs::create_dir(&cwd).unwrap();
+        let session = PtySession::create(
+            if durable {
+                "durable-hook"
+            } else {
+                "direct-hook"
+            }
+            .into(),
+            80,
+            24,
+            Some(cwd.display().to_string()),
+            Some(script.display().to_string()),
+        )
+        .unwrap();
+        let expected = session.stream().snapshot().metadata.incarnation;
+        let actual_durable = session.is_durable();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let observed = loop {
+            let observed = std::fs::read_to_string(cwd.join("identity.txt")).unwrap_or_default();
+            if !observed.is_empty() || Instant::now() >= deadline {
+                break observed;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        session.kill().unwrap();
+        assert_eq!(actual_durable, durable);
+        assert_eq!(
+            observed,
+            expected.as_str(),
+            "hook identity must name the child, not the daemon's parent"
+        );
+    }
+}
+
+#[test]
 fn missing_prefix_targets_never_query_capture_or_kill_a_neighbor() {
     if isolated("missing_prefix_targets_never_query_capture_or_kill_a_neighbor") {
         return;
@@ -43,49 +99,40 @@ fn missing_prefix_targets_never_query_capture_or_kill_a_neighbor() {
     let script = dir.path().join("history-child.sh");
     std::fs::write(&script, "#!/bin/sh\ni=0; while [ $i -lt 100 ]; do printf 'ARCHIVE_%s\\n' \"$i\"; i=$((i+1)); done\nprintf 'READY_EXACT\\n'\nexec cat\n").unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let (tx, rx) = std::sync::mpsc::channel();
-    let session = PtySession::spawn(
+    let session = PtySession::create(
         "target-long".into(),
         80,
         24,
         Some(dir.path().display().to_string()),
         Some(script.display().to_string()),
-        move |event| {
-            let _ = tx.send(event);
-        },
-        || {},
     )
     .unwrap();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         assert!(session.is_durable(), "real supported tmux is required");
         let deadline = Instant::now() + Duration::from_secs(4);
-        let mut output = String::new();
-        while Instant::now() < deadline && !output.contains("READY_EXACT") {
-            if let Ok(DemuxEvent::Output { data }) = rx.recv_timeout(Duration::from_millis(50)) {
-                output.push_str(&data);
-            }
-        }
+        wait_for_output(&session, "READY_EXACT");
+        assert!(Instant::now() < deadline, "fixture did not become ready");
+        let full = TmuxHandle::resolve_owned(
+            tmux::resolve_tmux(None).unwrap(),
+            "target-long",
+            &session.stream().snapshot().metadata.incarnation,
+        )
+        .unwrap();
         assert!(
-            output.contains("READY_EXACT"),
-            "fixture did not become ready"
-        );
-        let full = TmuxHandle::named(tmux::resolve_tmux(None).unwrap(), "doom-target-long".into());
-        assert!(
-            full.capture_history(100).is_some(),
+            full.capture_archive().is_ok(),
             "fixture must have history to protect"
         );
         let short = TmuxHandle::named(full.exe.clone(), "doom-target".into());
         // Collect every observation before asserting: the broken implementation
         // also kills this test-owned neighbor, demonstrating the harmful branch.
         let pid = short.pane_pid();
-        let history = short.capture_history(100);
+        let history = short.capture_archive().ok();
         let found = short.has_session();
         let killed = short.kill_session();
         let survivor = full.has_session();
-        assert_eq!(
-            (pid, history, found, killed, survivor),
-            (None, None, false, false, true)
-        );
+        assert_eq!(pid, None);
+        assert!(history.is_none());
+        assert_eq!((found, killed, survivor), (false, false, true));
     }));
     session.kill().unwrap();
     if let Err(panic) = result {
@@ -158,6 +205,116 @@ fn durable_create_conflicts_and_attach_reuses_only_the_original_pane() {
     replacement.kill().unwrap();
 }
 
+#[test]
+fn rebuild_preserves_observed_geometry_and_keeps_archive_outside_the_live_stream() {
+    if isolated("rebuild_preserves_observed_geometry_and_keeps_archive_outside_the_live_stream") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("archive.sh");
+    std::fs::write(&script, "#!/bin/sh\ni=0; while [ $i -lt 100 ]; do printf 'ARCHIVE_%s\\n' \"$i\"; i=$((i+1)); done\nprintf 'READY_ARCHIVE\\n'\nexec cat\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let first = PtySession::create(
+        "rebuild".into(),
+        80,
+        24,
+        None,
+        Some(script.display().to_string()),
+    )
+    .unwrap();
+    wait_for_output(&first, "READY_ARCHIVE");
+    let snapshot = first.stream().snapshot();
+    let pid = first.shell_pid().unwrap();
+    first.resize(99, 31).unwrap();
+    let handle = TmuxHandle::resolve_owned(
+        tmux::resolve_tmux(None).unwrap(),
+        "rebuild",
+        &snapshot.metadata.incarnation,
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while handle.query("#{pane_width} #{pane_height}").as_deref() != Some("99 31") {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let rebuilt = PtySession::rebuild_durable(
+        "rebuild".into(),
+        &snapshot.metadata.incarnation,
+        Some(&first),
+    )
+    .unwrap();
+    let next = rebuilt.session;
+    let archive = rebuilt.archive.unwrap();
+    assert!(!first.is_alive());
+    assert_eq!(display_clients(), 1);
+    assert_eq!(next.shell_pid(), Some(pid));
+    let current = next.stream().snapshot();
+    assert_eq!(current.metadata.incarnation, snapshot.metadata.incarnation);
+    assert_ne!(
+        current.metadata.stream_epoch,
+        snapshot.metadata.stream_epoch
+    );
+    assert_eq!(
+        (current.metadata.initial_cols, current.metadata.initial_rows),
+        (99, 31)
+    );
+    assert_eq!((archive.cols, archive.rows), (99, 31));
+    assert!(archive.data.contains("ARCHIVE_0"));
+    assert!(archive.potentially_overlapping && archive.potentially_incomplete);
+    wait_for_output(&next, "READY_ARCHIVE");
+    let mut cursor = doom_term_pty::stream::Sequence::default();
+    while let Some(record) = next.stream().read_after(cursor).unwrap() {
+        cursor = record.sequence;
+        assert!(
+            !matches!(record.payload, doom_term_pty::stream::StreamPayload::Event(DemuxEvent::Output { data }) if data.contains("ARCHIVE_0")),
+            "archive leaked into the live repaint journal"
+        );
+    }
+    next.write(b"AFTER_REBUILD\n").unwrap();
+    wait_for_output(&next, "AFTER_REBUILD");
+    next.retire_adapter().unwrap();
+    let fresh = PtySession::rebuild_durable("rebuild".into(), &snapshot.metadata.incarnation, None)
+        .unwrap();
+    assert_eq!(fresh.session.shell_pid(), Some(pid));
+    assert_eq!(display_clients(), 1);
+    fresh.session.kill().unwrap();
+}
+
+#[test]
+fn identified_input_preserves_raw_control_unicode_and_escape_bytes_without_paste_framing() {
+    if isolated(
+        "identified_input_preserves_raw_control_unicode_and_escape_bytes_without_paste_framing",
+    ) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("raw.sh");
+    let received = dir.path().join("received");
+    let bytes = b"\x00\x03\x1a\x04\r\n\x1b[31m\xe4\xb8\x89";
+    std::fs::write(&script, format!("#!/bin/sh\nstty raw -echo\nprintf 'RAW_READY'\ndd bs=1 count={} of='{}' 2>/dev/null\nsleep 30\n", bytes.len(), received.display())).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let session = PtySession::create(
+        "raw-input".into(),
+        80,
+        24,
+        None,
+        Some(script.display().to_string()),
+    )
+    .unwrap();
+    wait_for_output(&session, "RAW_READY");
+    session.write(bytes).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while std::fs::read(&received).ok().as_deref() != Some(bytes) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let actual = std::fs::read(&received).unwrap_or_default();
+    session.kill().unwrap();
+    assert_eq!(
+        actual, bytes,
+        "ordinary input must not be sanitized, reframed, recoded, or newline-normalized"
+    );
+}
+
 fn display_clients() -> usize {
     let output = std::process::Command::new("tmux")
         .args([
@@ -196,6 +353,21 @@ fn wait_for_output(session: &PtySession, marker: &str) {
     panic!("No {marker:?} in {text:?}");
 }
 
+fn stream_contains(session: &PtySession, marker: &str) -> bool {
+    let journal = session.stream();
+    let mut cursor = doom_term_pty::stream::Sequence::default();
+    while let Some(record) = journal.read_after(cursor).unwrap() {
+        cursor = record.sequence;
+        if matches!(record.payload,
+            doom_term_pty::stream::StreamPayload::Event(DemuxEvent::Output { ref data })
+                if data.contains(marker))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 #[test]
 fn archive_stays_separate_while_an_editor_survives_adapter_replacement() {
     if isolated("archive_stays_separate_while_an_editor_survives_adapter_replacement") {
@@ -231,8 +403,7 @@ fn archive_stays_separate_while_an_editor_survives_adapter_replacement() {
     assert_eq!(next.shell_pid(), Some(pid));
     wait_for_output(&next, "EDIT_BEFORE_GAP");
     assert!(
-        !next.get_replay_events().iter().any(|event| matches!(event,
-        DemuxEvent::Output { data } if data.contains("ARCHIVE_0"))),
+        !stream_contains(&next, "ARCHIVE_0"),
         "archive must not enter the fresh live stream"
     );
     next.write(b"_AFTER\x1b:w!\r").unwrap();
@@ -286,6 +457,24 @@ fn old_identity_refuses_respawned_pane_and_restarted_server_even_if_numeric_id_i
         "a respawn is a different root process even with unchanged pane metadata"
     );
     assert!(TmuxHandle::resolve_owned(exe.clone(), "replaced", &incarnation).is_err());
+    assert!(
+        first.write(b"MUST_NOT_REACH_REPLACEMENT\n").is_err(),
+        "ordinary keystrokes must check the exact root at execution too"
+    );
+    assert!(
+        first.send_signal("SIGINT").is_err(),
+        "control bytes cannot cross a replaced root"
+    );
+    assert!(
+        first.resize(120, 40).is_err(),
+        "a stale adapter must not resize its replacement"
+    );
+    assert_eq!(
+        TmuxHandle::named(exe.clone(), "doom-replaced".into())
+            .query("#{pane_width} #{pane_height}"),
+        Some("80 24".into()),
+        "a refusal cannot come after resizing the replacement root"
+    );
     assert!(old
         .paste("must-not-reach-new-root")
         .unwrap_err()
@@ -324,17 +513,23 @@ fn legacy_pane_requires_explicit_identity_assignment_and_can_only_be_adopted_onc
     if isolated("legacy_pane_requires_explicit_identity_assignment_and_can_only_be_adopted_once") {
         return;
     }
-    let first = PtySession::spawn(
-        "legacy".into(),
+    let exe = tmux::resolve_tmux(None).unwrap();
+    let conf = tmux::write_config().unwrap();
+    let args = tmux::create_session_args(
+        &conf,
+        "doom-legacy",
         80,
         24,
-        None,
-        Some("/bin/cat".into()),
-        |_| {},
-        || {},
-    )
-    .unwrap();
-    let exe = tmux::resolve_tmux(None).unwrap();
+        std::path::Path::new("/tmp"),
+        &[],
+        "/bin/cat",
+        &[],
+    );
+    assert!(std::process::Command::new(&exe)
+        .args(args)
+        .status()
+        .unwrap()
+        .success());
     let legacy = TmuxHandle::named(exe.clone(), "doom-legacy".into());
     let deadline = Instant::now() + Duration::from_secs(2);
     while legacy.pane_pid().is_none() && Instant::now() < deadline {
@@ -347,7 +542,6 @@ fn legacy_pane_requires_explicit_identity_assignment_and_can_only_be_adopted_onc
         TmuxHandle::resolve_owned(exe.clone(), "legacy", &invented).unwrap_err(),
         tmux::AttachError::Unidentified
     );
-    first.retire_adapter().unwrap();
     assert!(TmuxHandle::recover_legacy(exe.clone(), "legacy", &pane, pid + 1).is_err());
     let owned = TmuxHandle::recover_legacy(exe.clone(), "legacy", &pane, pid).unwrap();
     assert_eq!(owned.pane_pid(), Some(pid));

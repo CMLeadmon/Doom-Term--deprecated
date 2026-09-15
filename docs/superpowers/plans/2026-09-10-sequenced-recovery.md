@@ -10,6 +10,10 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-09-sequenced-recovery-design.md` (approved by “Implement the written contract”).
 
+**Verified state:** [`2026-09-15-recovery-handoff.md`](2026-09-15-recovery-handoff.md)
+records the last independently re-run gate plus corrections to notes below that
+did not survive re-running. Trust that file over any summary in this one.
+
 ## Global constraints
 
 - Inline on main; no subagents or worktrees. Preserve unrelated changes and use only disposable fixture daemons/private tmux sockets.
@@ -89,7 +93,7 @@
 
 **Interfaces:** `Create { request_id, id, cols, rows, cwd, shell }`; `Attach { request_id, id, incarnation, resume }`; `StreamApplied { id, incarnation, attachment_id, sequence }`. `Ownership::authorize(socket_id, incarnation, attachment_id, requires_ready)` is rechecked at mutation execution. All mutation envelopes carry incarnation/attachment_id. `StreamBegin`, `StreamRecord`, `StreamCaughtUp`, `AttachmentReady` implement the exact cut exchange. Typed outcomes follow the spec verbatim.
 
-- [ ] RED using real authenticated WebSockets: legacy Spawn/Write and pre-negotiation discovery do not execute; second socket gets busy; disconnect releases only its own lease; stale token and future acknowledgements cannot enable input:
+- [x] RED using real authenticated WebSockets: legacy Spawn/Write and pre-negotiation discovery do not execute; second socket gets busy; disconnect releases only its own lease; stale token and future acknowledgements cannot enable input:
 
   ```rust
   send(&mut second, attach_request(&created)).await;
@@ -98,11 +102,38 @@
   assert!(!fixture.received_child_input());
   ```
 
+  - Initially staged behind `RecoveryServer::accept`; as of 2026-09-15 the public listener and frontend both use v2. Recovery socket fixtures now exercise the public HTTP/WebSocket router. This wire integration is not the completed browser recovery contract.
+
 - [ ] Reserve create ids before spawn and release only matching reservations. Retain closed incarnation tombstones; stale close callbacks cannot remove a replacement.
 - [ ] Authenticate, advertise/negotiate v2 and daemon epoch, then allow discovery/attach. Pump one cursor incrementally through captured cut; offered-cut acknowledgement alone grants readiness. Remove rebind/replay and unbounded PTY delivery.
 - [ ] Account serialized bytes through socket-send completion; overflow disconnects with reason; no socket I/O under journal/ownership locks. Add heartbeat/liveness expiry and cleanup.
 - [ ] Fence Write/Signal/Resize/Paste/Kill at execution; preserve correlated paste uncertainty and permit explicit lifecycle action without screen readiness.
 - [ ] Run real two-controller, attach-race, concurrent-create, stale-close, overflow, auth, paste, and tombstone tests. Commit with matching frontend Task 6 (never publish incompatible shells separately).
+
+**In-progress evidence (2026-09-12):** bounded serialized delivery retains charges through socket sends; exact-cut publication is atomic with queue admission. Real transport heartbeat/30-second expiry and oversized-frame refusal pass. Reading is separate from ordered command execution, so a blocked child write cannot retain a dead socket's lease or replay a queued Kill. Five-minute/256-entry tombstones retain observed exits, including an exit after a rendering fault; losing a tmux display client is not a pane exit. Cold attach discovers exact durable identity, uses observed geometry, retires the old client, opens a new epoch and transfers a separately identified/chunked archive. Ordinary tmux bytes and resizes now use identity-checked command queues; direct kill uses the owned unreaped Child. Paste rechecks socket ownership after private-buffer preparation and removes a stale buffer without delivering it. Full checks: 103 PTY tests, 107 backend tests (3 live-account tests ignored), 503 Vitest / 102 Node tests, typecheck, production build, exact HUD and native all-target compilation pass.
+
+**Still required before cutover:** remaining v2 metadata/hook/worktree/explicit-legacy-recovery integration; concurrent/lost-create and live overflow/gap stress coverage; frontend ownership/incarnation persistence and all-workspace attachment; removal of legacy Spawn/rebind and held/replayed input; real browser contract gates. Normal durable pane exit observation also needs explicit coverage distinct from losing its display client. These are open requirements, not waived by the passing staged tests.
+
+**Public integration update (2026-09-15):** metadata/worktree commands now require
+negotiation, run through bounded-admission workers and use correlated outcomes.
+Bounded directory results expose incompleteness; telemetry is incarnation-fenced.
+Hook retention has stable event ids and an atomic snapshot/live handoff; the
+frontend restores hook state without replaying ask counters or notifications.
+The public legacy WebSocket dispatcher is removed. Remaining legacy daemon
+command handlers are test-only; PTY Spawn/rebind removal, explicit legacy recovery,
+stress cases and real-browser contract gates are still required. Fresh verification:
+104 PTY / 112 backend tests, 578 Vitest / 102 Node tests, typecheck and native
+all-target compilation pass. Three live-account tests remain intentionally ignored.
+
+**Correction (2026-09-15, Claude):** the counts in the paragraph above did not
+hold when re-run. `cargo test` exited `101` on
+`recovery_tests::recovery_retains_a_natural_durable_pane_exit_as_unknown_status`,
+a ~40% flaky test (5 failures in 12 runs), so `check:tauri` never ran either.
+The test is fixed and now 15/15 deterministic; the full gate is green with
+`check:tauri` passing inside the `doom-tauri` toolbox. Legacy `ClientMessage`,
+`handle_client_msg` and the legacy `mod tests` are not removed but disabled
+behind `#[cfg(any())]` in `backend/src/main.rs`, so they never compile and their
+tests never run. See the handoff log for evidence.
 
 ## Task 5 — Applied frontend cursors and explicit screen lifetime
 

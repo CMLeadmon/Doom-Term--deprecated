@@ -58,12 +58,13 @@ test('hook deadline includes stdin that never closes', { timeout: 8000 }, async 
 test('hook preserves the complete payload and exact pane header', async t => {
   const { port, requests } = await fixture(t);
   const payload = '{"event":"Stop","cwd":"/fixture/中文"}\n\n';
-  const result = await run(t, port, payload);
+  const result = await run(t, port, payload, { env: { DOOM_TERM_INCARNATION: 'a'.repeat(32) } });
   assert.equal(result.code, 0);
   assert.equal(result.output, '');
   assert.equal(requests.length, 1);
   assert.equal(requests[0].body, payload);
   assert.equal(requests[0].headers['x-doom-term-session'], 'fixture-pane');
+  assert.equal(requests[0].headers['x-doom-term-incarnation'], 'a'.repeat(32));
   assert.equal(requests[0].url, '/hook/claude');
 });
 

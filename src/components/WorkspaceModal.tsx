@@ -307,7 +307,10 @@ export const WorkspaceModal: React.FC<WorkspaceModalProps> = ({
               })
             )}
           </div>
-          <div role="status" aria-live="polite" className="sr-only">
+          <div role="status" aria-live="polite"
+            className={listing?.truncated ? 'px-2 py-1 text-[11px] font-mono' : 'sr-only'}
+            style={listing?.truncated ? { color: 'var(--st-wait)' } : undefined}>
+            {listing?.truncated && 'Partial listing — enter a full path to reach folders not shown. '}
             {items.length} {items.length === 1 ? 'workspace location' : 'workspace locations'}
           </div>
         </div>

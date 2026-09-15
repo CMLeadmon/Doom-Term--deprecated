@@ -1,5 +1,6 @@
 /** Negotiated v2 stream shapes. Numeric cursors are never JavaScript numbers. */
-export type StreamFault = 'RecordTooLarge' | 'SequenceExhausted' | 'ControlTooLong' | 'AdapterRetired';
+import { parseGrid } from './terminalGeometry';
+export type StreamFault = 'RecordTooLarge' | 'SequenceExhausted' | 'ControlTooLong' | 'AdapterRetired' | 'AdapterLost';
 export type StreamEvent =
   | { type: 'Output'; payload: { data: string } }
   | { type: 'PromptStart' | 'CommandStart' | 'ExecutionStart' }
@@ -56,7 +57,7 @@ function exitCode(value: unknown): number | null {
 }
 function fault(value: unknown): StreamFault {
   switch (value) {
-    case 'RecordTooLarge': case 'SequenceExhausted': case 'ControlTooLong': case 'AdapterRetired': return value;
+    case 'RecordTooLarge': case 'SequenceExhausted': case 'ControlTooLong': case 'AdapterRetired': case 'AdapterLost': return value;
     default: return invalid();
   }
 }
@@ -67,9 +68,10 @@ export function parseSequence(value: unknown): bigint {
 }
 export function parseStreamDescriptor(value: unknown): StreamDescriptor {
   const input = object(value);
+  const grid = parseGrid(input.initial_cols, input.initial_rows);
   return Object.freeze({ session_id: sessionId(input.session_id), incarnation: identity(input.incarnation),
     stream_epoch: identity(input.stream_epoch), clock_epoch: identity(input.clock_epoch),
-    initial_cols: integer(input.initial_cols, 1, 65535), initial_rows: integer(input.initial_rows, 1, 65535),
+    initial_cols: grid.cols, initial_rows: grid.rows,
     durable: boolean(input.durable) });
 }
 function parseEvent(value: unknown): StreamEvent {
@@ -90,9 +92,7 @@ function parsePayload(value: unknown): StreamPayload {
   const input = object(value);
   switch (input.type) {
     case 'Event': return { type: input.type, payload: parseEvent(input.payload) };
-    case 'Resize': return { type: input.type, payload: {
-      cols: integer(object(input.payload).cols, 1, 65535), rows: integer(object(input.payload).rows, 1, 65535),
-    } };
+    case 'Resize': return { type: input.type, payload: parseGrid(object(input.payload).cols, object(input.payload).rows) };
     case 'Closed': return { type: input.type, payload: { exit_code: exitCode(object(input.payload).exit_code) } };
     case 'Fault': return { type: input.type, payload: { reason: fault(object(input.payload).reason) } };
     default: return invalid();

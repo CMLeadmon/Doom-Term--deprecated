@@ -48,6 +48,69 @@ pub struct CapturedArchive {
     pub data: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct DiscoveredPane {
+    pub id: String,
+    pub pane: String,
+    pub root_pid: u32,
+    pub incarnation: Option<Identity>,
+    pub identity_status: &'static str,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+/// Identity-only enumeration uses fields with bounded, unambiguous syntax.
+/// Paths/command strings are obtained separately for a verified attachment;
+/// tabs/newlines in a working directory cannot inject a discovery record.
+pub fn discover_owned(exe: &Path) -> Result<Vec<DiscoveredPane>> {
+    let handle = TmuxHandle::named(exe.to_path_buf(), String::new());
+    let output = run_bounded(exe, &handle.on_socket(&[
+        "list-panes", "-a", "-F",
+        "#{session_name}\t#{pane_id}\t#{pane_pid}\t#{@doom-incarnation}\t#{@doom-root-pid}\t#{pane_dead}\t#{pane_width}\t#{pane_height}",
+    ]), &[], HelperLimits { timeout: Duration::from_secs(2), input_bytes: 0, output_bytes: 8 * 1024 * 1024 })?;
+    parse_discovery(std::str::from_utf8(&output)?)
+}
+
+fn parse_discovery(text: &str) -> Result<Vec<DiscoveredPane>> {
+    let mut panes = Vec::new();
+    for line in text.lines() {
+        let fields: Vec<_> = line.split('\t').collect();
+        let Some(id) = fields[0].strip_prefix("doom-").filter(|id| valid_id(id)) else {
+            continue;
+        };
+        anyhow::ensure!(
+            fields.len() == 8 && valid_pane(fields[1]),
+            "Invalid durable discovery record"
+        );
+        let root_pid: u32 = fields[2].parse()?;
+        anyhow::ensure!(root_pid > 0, "Invalid durable root pid");
+        if fields[5] == "1" {
+            continue;
+        }
+        anyhow::ensure!(fields[5] == "0", "Unknown durable lifecycle state");
+        let (cols, rows): (u16, u16) = (fields[6].parse()?, fields[7].parse()?);
+        anyhow::ensure!(cols > 0 && rows > 0, "Invalid durable dimensions");
+        let observed = Identity::try_from(fields[3].to_string()).ok();
+        let (incarnation, identity_status) = if observed.is_some() && fields[2] == fields[4] {
+            (observed, "owned")
+        } else if fields[3].is_empty() && fields[4].is_empty() {
+            (None, "unidentified")
+        } else {
+            (None, "replaced")
+        };
+        panes.push(DiscoveredPane {
+            id: id.into(),
+            pane: fields[1].into(),
+            root_pid,
+            incarnation,
+            identity_status,
+            cols,
+            rows,
+        });
+    }
+    Ok(panes)
+}
+
 fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 256
@@ -70,7 +133,7 @@ impl TmuxHandle {
         );
         let handle = Self::named(exe, session_name(id));
         let incarnation = Identity::random()?;
-        let condition = format!("#{{&&:#{{==:#{{session_name}},{}}},#{{&&:#{{==:#{{pane_pid}},{root_pid}}},#{{==:#{{{INCARNATION}}},}}}}}}", handle.name);
+        let condition = format!("#{{&&:#{{==:#{{session_name}},{}}},#{{&&:#{{==:#{{pane_pid}},{root_pid}}},#{{&&:#{{==:#{{pane_dead}},0}},#{{&&:#{{==:#{{{INCARNATION}}},}},#{{==:#{{{ROOT_PID}}},}}}}}}}}}}", handle.name);
         let yes = format!("set-option -p -t {pane} {INCARNATION} {} ; set-option -p -t {pane} {ROOT_PID} {root_pid} ; display-message -p DOOM_IDENTIFIED", incarnation.as_str());
         let result = handle.run_query(&handle.on_socket(&[
             "if-shell",
@@ -107,15 +170,12 @@ impl TmuxHandle {
         let incarnation = Identity::random()?;
         let conf = write_config().context("Cannot write private tmux configuration")?;
         let name = session_name(id);
-        // This is the create-only API. The legacy builder is removed at the
-        // coordinated v2 transport cutover; it is never used to attach here.
-        let mut args = new_session_args(&conf, &name, cols, rows, env, shell, shell_args);
-        let flag = args.iter().position(|a| a == "-A").unwrap();
-        args[flag] = "-d".into();
-        args.splice(
-            flag + 1..flag + 1,
-            ["-c".into(), cwd.to_string_lossy().into_owned()],
-        );
+        let mut env = env.to_vec();
+        env.push((
+            crate::session::SESSION_INCARNATION_ENV.into(),
+            incarnation.as_str().into(),
+        ));
+        let mut args = create_session_args(&conf, &name, cols, rows, cwd, &env, shell, shell_args);
         args.extend([
             ";".into(),
             "set-option".into(),
@@ -231,6 +291,50 @@ impl TmuxHandle {
         self.target.as_ref().map(|target| &target.incarnation)
     }
 
+    /// Ordinary input is bytes, not clipboard text: no sanitation, newline
+    /// conversion or bracketed-paste framing. Hex literals cannot become tmux
+    /// commands, and the exact root is checked in the same execution queue.
+    pub(crate) fn write_checked(
+        &self,
+        bytes: &[u8],
+        mut authorize: impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        use std::fmt::Write;
+        let target = self.target.as_ref().context("Unidentified input target")?;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        for chunk in bytes.chunks(8192) {
+            let mut command = format!("send-keys -H -t {}", target.pane);
+            for byte in chunk {
+                write!(&mut command, " {byte:02x}").unwrap();
+            }
+            command.push_str(" ; display-message -p DOOM_INPUT_OK");
+            authorize()?;
+            let reply = run_bounded(
+                &self.exe,
+                &self.on_socket(&[
+                    "if-shell",
+                    "-F",
+                    "-t",
+                    &target.pane,
+                    &self.identity_condition().unwrap(),
+                    &command,
+                    "display-message -p DOOM_REPLACED",
+                ]),
+                &[],
+                HelperLimits {
+                    timeout: helper_timeout(deadline)?,
+                    input_bytes: 0,
+                    output_bytes: 128,
+                },
+            )?;
+            anyhow::ensure!(
+                reply == b"DOOM_INPUT_OK\n",
+                "Input target changed; delivery may be incomplete"
+            );
+        }
+        Ok(())
+    }
+
     pub(super) fn identity_condition(&self) -> Option<String> {
         let target = self.target.as_ref()?;
         Some(format!("#{{&&:#{{==:#{{{ROOT_PID}}},#{{pane_pid}}}},#{{&&:#{{==:#{{{INCARNATION}}},{}}},#{{==:#{{session_name}},{}}}}}}}",
@@ -250,9 +354,35 @@ impl TmuxHandle {
             "-t",
             &target.pane,
             &self.identity_condition().unwrap(),
-            &format!("attach-session -E -t {}", target.pane),
+            &format!(
+                "set-option -w -t {} window-size manual ; attach-session -E -t {}",
+                target.pane, target.pane
+            ),
             "display-message -p DOOM_REPLACED",
         ]))
+    }
+
+    pub(crate) fn resize_owned(&self, cols: u16, rows: u16) -> Result<()> {
+        let target = self.target.as_ref().context("Unidentified resize target")?;
+        // resize-window pins this window to manual sizing. A later SIGWINCH
+        // from our display PTY must not independently resize a respawned root.
+        let reply = self.run_query(&self.on_socket(&[
+            "if-shell",
+            "-F",
+            "-t",
+            &target.pane,
+            &self.identity_condition().unwrap(),
+            &format!(
+                "resize-window -t {} -x {cols} -y {rows} ; display-message -p DOOM_RESIZED",
+                target.pane
+            ),
+            "display-message -p DOOM_REPLACED",
+        ]))?;
+        anyhow::ensure!(
+            reply == b"DOOM_RESIZED\n",
+            "Resize target was replaced; resize refused"
+        );
+        Ok(())
     }
 
     pub(crate) fn has_display_client(&self, pid: u32, deadline: Instant) -> Result<bool> {
@@ -283,6 +413,32 @@ impl TmuxHandle {
     /// history is an error, not an empty successful archive. At-limit history
     /// may have older omissions; capture/repaint may overlap and are not atomic.
     pub fn capture_archive(&self) -> Result<CapturedArchive> {
+        self.capture_archive_before(Instant::now() + Duration::from_secs(2))
+    }
+    pub(crate) fn geometry_before(&self, deadline: Instant) -> Result<(u16, u16)> {
+        anyhow::ensure!(self.target.is_some(), "Unidentified geometry target");
+        let output = run_bounded(
+            &self.exe,
+            &self.query_args("#{pane_width} #{pane_height}"),
+            &[],
+            HelperLimits {
+                timeout: helper_timeout(deadline)?,
+                input_bytes: 0,
+                output_bytes: 128,
+            },
+        )?;
+        let text = std::str::from_utf8(&output)?.trim();
+        let (cols, rows) = text
+            .split_once(' ')
+            .context("Durable geometry unavailable")?;
+        let (cols, rows): (u16, u16) = (cols.parse()?, rows.parse()?);
+        anyhow::ensure!(
+            cols > 0 && rows > 0 && u32::from(cols) * u32::from(rows) <= 1_048_576,
+            "Durable geometry exceeds the live-screen allocation limit"
+        );
+        Ok((cols, rows))
+    }
+    pub(crate) fn capture_archive_before(&self, deadline: Instant) -> Result<CapturedArchive> {
         let target = self
             .target
             .as_ref()
@@ -303,7 +459,7 @@ impl TmuxHandle {
             ]),
             &[],
             HelperLimits {
-                timeout: Duration::from_secs(2),
+                timeout: helper_timeout(deadline)?,
                 input_bytes: 0,
                 output_bytes: 8 * 1024 * 1024,
             },

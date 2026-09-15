@@ -12,6 +12,13 @@ const node = (over: Partial<SessionNode> = {}): SessionNode => ({
 const background = { activeSessionId: 'other', documentFocused: true };
 
 describe('notificationTransition', () => {
+  it('restores an ask without a new notification, then uses the live source identity', () => {
+    const before = node({ blockedOnUser: false });
+    const restored = node({ blockedOnUser: true, lastHookEventId: 'restored', attentionSerial: 4 });
+    expect(notificationTransition(before, restored, background)).toBeNull();
+    const live = node({ blockedOnUser: true, lastHookEventId: 'live', lastLiveAskEventId: 'live', attentionSerial: 5 });
+    expect(notificationTransition(before, live, background)).toMatchObject({ key: 'ask:n1:live' });
+  });
   it('routes a new background question to the exact session', () => {
     const notice = notificationTransition(
       node({ blockedOnUser: false, attentionSerial: 0 }),

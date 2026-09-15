@@ -107,39 +107,78 @@ fn releasing_the_last_stream_handle_releases_its_retention_budget() {
 }
 
 #[test]
+fn process_exit_is_not_a_fabricated_semantic_command_completion() {
+    if isolated("process_exit_is_not_a_fabricated_semantic_command_completion") {
+        return;
+    }
+    let session = doom_term_pty::PtySession::create(
+        "exit-only".into(),
+        80,
+        24,
+        None,
+        Some("/bin/false".into()),
+    )
+    .unwrap();
+    let journal = session.stream();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while !journal.snapshot().ended && std::time::Instant::now() < deadline {
+        journal.wait_for_change(
+            journal.snapshot().high_water,
+            std::time::Duration::from_millis(20),
+        );
+    }
+    assert!(journal.snapshot().ended);
+    let mut cursor = Sequence::new(0);
+    let mut commands = 0;
+    let mut closed = None;
+    while let Some(record) = journal.read_after(cursor).unwrap() {
+        cursor = record.sequence;
+        match record.payload {
+            StreamPayload::Event(DemuxEvent::ExecutionEnd { .. }) => commands += 1,
+            StreamPayload::Closed { exit_code } => closed = Some(exit_code),
+            _ => {}
+        }
+    }
+    assert_eq!(closed, Some(Some(1)));
+    assert_eq!(
+        commands, 0,
+        "process closure is not an observed OSC 133 command boundary"
+    );
+}
+
+#[test]
 fn real_pty_output_and_successful_resize_are_in_the_same_stream() {
     if isolated("real_pty_output_and_successful_resize_are_in_the_same_stream") {
         return;
     }
-    let (tx, rx) = std::sync::mpsc::channel();
-    let session = doom_term_pty::PtySession::spawn(
+    let session = doom_term_pty::PtySession::create(
         format!("journal-{}", std::process::id()),
         80,
         24,
         None,
         Some("/bin/cat".into()),
-        move |event| {
-            let _ = tx.send(event);
-        },
-        || {},
     )
     .unwrap();
     let result = || {
         session.write(b"journal-before-resize\n").unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        let journal = session.stream();
+        let mut cursor = Sequence::default();
         let mut seen = false;
         while std::time::Instant::now() < deadline {
-            if let Ok(DemuxEvent::Output { data }) =
-                rx.recv_timeout(std::time::Duration::from_millis(50))
-            {
-                if data.contains("journal-before-resize") {
+            while let Some(record) = journal.read_after(cursor).unwrap() {
+                cursor = record.sequence;
+                if matches!(record.payload, StreamPayload::Event(DemuxEvent::Output { ref data }) if data.contains("journal-before-resize"))
+                {
                     seen = true;
-                    break;
                 }
             }
+            if seen {
+                break;
+            }
+            journal.wait_for_change(cursor, std::time::Duration::from_millis(50));
         }
         assert!(seen, "real PTY output did not arrive");
-        let journal = session.stream();
         let before_resize = journal.snapshot().high_water;
         session.resize(100, 35).unwrap();
         let after_resize = journal.snapshot().high_water;
@@ -183,29 +222,30 @@ exec sleep 30
     )
     .unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let (tx, rx) = std::sync::mpsc::channel();
-    let session = doom_term_pty::PtySession::spawn(
+    let session = doom_term_pty::PtySession::create(
         "fault-child".into(),
         80,
         24,
         Some(dir.path().display().to_string()),
         Some(script.display().to_string()),
-        move |event| {
-            let _ = tx.send(event);
-        },
-        || {},
     )
     .unwrap();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        let journal = session.stream();
+        let mut cursor = Sequence::default();
         let mut fault = false;
         while std::time::Instant::now() < deadline {
-            if let Ok(DemuxEvent::StreamFault { .. }) =
-                rx.recv_timeout(std::time::Duration::from_millis(50))
-            {
-                fault = true;
+            while let Ok(Some(record)) = journal.read_after(cursor) {
+                cursor = record.sequence;
+                if matches!(record.payload, StreamPayload::Fault { .. }) {
+                    fault = true;
+                }
+            }
+            if fault {
                 break;
             }
+            journal.wait_for_change(cursor, std::time::Duration::from_millis(50));
         }
         assert!(fault, "real child must emit an explicit stream fault");
         assert!(session.is_alive(), "fault must not kill the child");
@@ -213,10 +253,7 @@ exec sleep 30
         assert!(session.write(b"NOT_SENT").is_err());
         assert!(session.paste("NOT_SENT").is_err());
         assert!(session.resize(100, 35).is_err());
-        assert!(session
-            .get_replay_events()
-            .iter()
-            .any(|e| matches!(e, DemuxEvent::StreamFault { .. })));
+        assert!(journal.snapshot().ended);
     }));
     session.kill().unwrap();
     if let Err(panic) = result {

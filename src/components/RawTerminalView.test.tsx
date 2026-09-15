@@ -3,6 +3,7 @@ import { useState } from 'react';
 import { describe, it, expect, vi, beforeAll } from 'vitest';
 import { RawTerminalView, keyToBytes } from './RawTerminalView';
 import { ptyClient } from '../core/ptyClient';
+import { resetScrollback, stateOf } from '../core/scrollback';
 
 // jsdom has no ResizeObserver, and a pane given a session id constructs one.
 beforeAll(() => {
@@ -73,6 +74,29 @@ describe('RawTerminalView', () => {
     // terminal looked broken with nothing on screen saying why.
     render(<RawTerminalView {...base} isActive />);
     expect(document.activeElement).toBe(screen.getByTestId('raw-terminal'));
+  });
+
+  it('keeps following the tail across layout scrolls until the user explicitly scrolls', () => {
+    resetScrollback('follow');
+    render(<RawTerminalView {...base} sessionId="follow" isActive lines={[
+      { id: 'line', spans: [{ text: 'tail' }], timestamp: 0 },
+    ]} />);
+    const scroller = screen.getByTestId('raw-terminal').firstElementChild as HTMLDivElement;
+    Object.defineProperties(scroller, {
+      scrollHeight: { configurable: true, value: 1000 },
+      clientHeight: { configurable: true, value: 100 },
+    });
+    scroller.scrollTop = 400;
+    fireEvent.scroll(scroller);
+    expect(scroller.scrollTop).toBe(1000);
+    expect(stateOf('follow').detached).toBe(false);
+
+    fireEvent.wheel(scroller, { deltaY: -100 });
+    scroller.scrollTop = 300;
+    fireEvent.scroll(scroller);
+    expect(scroller.scrollTop).toBe(300);
+    expect(stateOf('follow').detached).toBe(true);
+    resetScrollback('follow');
   });
 
   it('does not steal the keyboard when it is not the active pane', () => {

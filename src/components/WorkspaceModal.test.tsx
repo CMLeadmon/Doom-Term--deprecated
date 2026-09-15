@@ -51,4 +51,10 @@ describe('WorkspaceModal', () => {
 
     expect((await screen.findByRole('alert')).textContent).toContain('permission denied');
   });
+  it('shows a partial-listing notice while keeping returned folders usable', async () => {
+    vi.spyOn(ptyClient, 'browseDirectory').mockResolvedValue({ ...listing, truncated: true });
+    render(<WorkspaceModal isOpen onClose={vi.fn()} onSelectWorkspace={vi.fn()} />);
+    expect((await screen.findByRole('status')).textContent).toMatch(/partial listing/i);
+    expect(screen.getByRole('option', { name: /doom-term/i })).toBeTruthy();
+  });
 });

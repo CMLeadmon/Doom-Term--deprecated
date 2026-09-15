@@ -54,6 +54,72 @@ fn identity_validation_does_not_accept_empty_truncated_or_non_hex_tokens() {
 }
 
 #[test]
+fn record_limit_includes_the_identity_envelope_not_only_the_payload() {
+    let stream = JournalHub::default()
+        .open(metadata("bounded-envelope"))
+        .unwrap();
+    stream.append(output(&"x".repeat(65536 - 1024))).unwrap();
+    // The output payload alone fits, but its complete record does not.
+    let payload = output(&"x".repeat(65536 - 100));
+    assert!(serde_json::to_vec(&payload).unwrap().len() < 65536);
+    assert_eq!(stream.append(payload), Err(StreamError::RecordTooLarge));
+    let fault = stream.read_after(Sequence::new(1)).unwrap().unwrap();
+    assert!(matches!(
+        fault.payload,
+        StreamPayload::Fault {
+            reason: StreamFault::RecordTooLarge
+        }
+    ));
+    assert!(serde_json::to_vec(&fault).unwrap().len() <= 65536);
+    assert!(stream.snapshot().ended);
+}
+
+#[test]
+fn terminal_outcome_survives_total_payload_eviction_without_turning_faults_into_exits() {
+    let hub = JournalHub::with_limits(Limits {
+        session_bytes: 1,
+        session_records: 1,
+        global_bytes: 1,
+    });
+    for (index, payload, expected) in [
+        (
+            "known",
+            StreamPayload::Closed { exit_code: Some(7) },
+            StreamEnd::Closed { exit_code: Some(7) },
+        ),
+        (
+            "unknown",
+            StreamPayload::Closed { exit_code: None },
+            StreamEnd::Closed { exit_code: None },
+        ),
+        (
+            "fault",
+            StreamPayload::Fault {
+                reason: StreamFault::ControlTooLong,
+            },
+            StreamEnd::Fault {
+                reason: StreamFault::ControlTooLong,
+            },
+        ),
+    ] {
+        let stream = hub.open(metadata(index)).unwrap();
+        assert_eq!(stream.snapshot().termination, None);
+        stream.append(payload).unwrap();
+        assert_eq!(
+            stream.read_after(Sequence::new(0)).unwrap_err(),
+            StreamError::Gap
+        );
+        assert_eq!(stream.snapshot().retained_bytes, 0);
+        assert_eq!(stream.snapshot().termination, Some(expected));
+        assert_eq!(
+            stream.append(StreamPayload::Closed { exit_code: Some(0) }),
+            Err(StreamError::Ended)
+        );
+        assert_eq!(stream.snapshot().termination, Some(expected));
+    }
+}
+
+#[test]
 fn epochs_do_not_alias_and_reopening_an_epoch_cannot_replace_its_records() {
     let hub = JournalHub::default();
     let meta = metadata("logical-id");

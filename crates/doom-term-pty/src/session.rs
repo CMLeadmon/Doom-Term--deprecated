@@ -9,7 +9,7 @@ use std::thread;
 use crate::demuxer::{DemuxEvent, StreamDemuxer};
 use crate::shell_integration::{apply_shell_integration, shell_launch};
 use crate::stream::{
-    Identity, JournalHub, StreamError, StreamFault, StreamJournal, StreamMetadata, StreamPayload,
+    Identity, JournalHub, StreamFault, StreamJournal, StreamMetadata, StreamPayload,
 };
 use crate::tmux::{self, TmuxHandle};
 
@@ -37,11 +37,10 @@ pub struct SessionInfo {
     pub is_alive: bool,
 }
 
-/// Where a session's events go, behind one lock so the reader thread, the
-/// alternate-screen poll and a reconnecting client all address the same slot.
-type EventSink = Arc<parking_lot::Mutex<Box<dyn FnMut(DemuxEvent) + Send>>>;
-type CloseSink = Arc<parking_lot::Mutex<Box<dyn FnMut() + Send>>>;
 type OwnedChild = Arc<parking_lot::Mutex<Option<Box<dyn portable_pty::Child + Send + Sync>>>>;
+
+#[cfg(all(test, unix))]
+mod tests;
 
 #[allow(dead_code)]
 pub struct PtySession {
@@ -63,15 +62,17 @@ pub struct PtySession {
     journal: StreamJournal,
     /// Serializes adapter observations (not blocking reads or callbacks).
     observations: Arc<parking_lot::Mutex<()>>,
-    /// Where this session's events go. Swappable — see `rebind`.
-    sink: EventSink,
-    close_sink: CloseSink,
     /// The tmux session backing this pane, when there is one. Its presence is
     /// what makes the shell outlive us.
     tmux: Option<TmuxHandle>,
     /// Why this session is not durable, when it is not. Reported to the UI:
     /// a persistence guarantee that silently is not one is worse than none.
     durability_detail: Option<String>,
+}
+
+pub struct DurableRebuild {
+    pub session: PtySession,
+    pub archive: std::result::Result<tmux::CapturedArchive, String>,
 }
 
 /// The directory a session should start in, falling back the way the previous
@@ -89,80 +90,7 @@ fn resolve_cwd(requested: Option<&str>) -> std::path::PathBuf {
     std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"))
 }
 
-/// Build the tmux client command, or say why we cannot.
-///
-/// The error is a sentence for a human, not a code: it is shown in the UI, and
-/// "tmux not found" is the difference between a user installing tmux and a user
-/// assuming their sessions are durable when they are not.
 type TmuxCommand = (CommandBuilder, Option<TmuxHandle>, Option<String>);
-
-fn build_tmux_command(
-    id: &str,
-    cols: u16,
-    rows: u16,
-    shell: &str,
-) -> std::result::Result<TmuxCommand, String> {
-    if std::env::var("DOOM_TERM_NO_TMUX").is_ok() {
-        return Err("disabled by DOOM_TERM_NO_TMUX".to_string());
-    }
-    let exe = tmux::resolve_tmux(sidecar_dir().as_deref())
-        .ok_or_else(|| "tmux not found on PATH".to_string())?;
-
-    let version =
-        crate::process_io::run(&exe, &["-V".into()], &[], std::time::Duration::from_secs(2))
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o).to_string())
-            .unwrap_or_default();
-    if !tmux::version_supported(&version) {
-        return Err(format!(
-            "tmux {} is too old; {}.{} or newer is required",
-            version.trim().trim_start_matches("tmux ").trim(),
-            tmux::MIN_MAJOR,
-            tmux::MIN_MINOR
-        ));
-    }
-
-    let conf = tmux::write_config().ok_or_else(|| "could not write the tmux config".to_string())?;
-    let name = tmux::session_name(id);
-    let mut launch = shell_launch(shell);
-
-    // Name ourselves to everything that runs in this pane.
-    //
-    // An agent's hook fires in the AGENT's process, which knows its own cwd and
-    // its own vendor session id but nothing about ours — so hook events were
-    // correlated by directory, and two agents in one repository were
-    // indistinguishable. This is the missing half of that identity: it is
-    // inherited by the shell, by the agent, and by the hook script the agent
-    // runs, so the hook can name the exact pane it belongs to.
-    //
-    // Through `-e` rather than the client's own environment: the pane's shell
-    // is a child of the tmux SERVER, not of the client we spawn here.
-    launch
-        .env
-        .push((SESSION_ID_ENV.to_string(), id.to_string()));
-
-    let mut cmd = CommandBuilder::new(&exe);
-    for arg in tmux::new_session_args(&conf, &name, cols, rows, &launch.env, shell, &launch.args) {
-        cmd.arg(arg);
-    }
-    // The daemon may itself have been launched from inside someone's tmux, and
-    // it hands its whole environment to this client. An inherited $TMUX makes
-    // tmux treat the client as a nested session, and — worse — leaves the value
-    // visible to the pane's shell, whose integration script decides whether to
-    // wrap its escape sequences by testing exactly that variable. It would then
-    // wrap for a server that is not ours. tmux sets both correctly for the pane
-    // it creates; ours must not pre-empt it.
-    cmd.env_remove("TMUX");
-    cmd.env_remove("TMUX_PANE");
-    // No -c here, deliberately: it would have to precede `--`, and everything
-    // after `--` belongs to the shell. `new-session` without -c takes the
-    // client's own working directory, and the caller sets that with cmd.cwd()
-    // immediately below — so the directory arrives the same way it does on the
-    // direct-spawn path. An already-existing session keeps the directory it was
-    // created in regardless, which is right: the user's `cd` history lives there.
-
-    Ok((cmd, Some(TmuxHandle::named(exe, name)), None))
-}
 
 /// How a pane names itself to the programs running inside it.
 ///
@@ -170,6 +98,7 @@ fn build_tmux_command(
 /// agent's hook event can be attributed to the exact pane that started it
 /// rather than to whichever session happens to share its directory.
 pub const SESSION_ID_ENV: &str = "DOOM_TERM_SESSION_ID";
+pub const SESSION_INCARNATION_ENV: &str = "DOOM_TERM_INCARNATION";
 
 /// Where a bundled tmux would live: beside the daemon executable, which is how
 /// Tauri lays sidecars out.
@@ -199,11 +128,21 @@ fn prepare_command(cmd: &mut CommandBuilder, id: &str) {
 }
 
 fn available_tmux() -> std::result::Result<std::path::PathBuf, String> {
+    available_tmux_before(std::time::Instant::now() + std::time::Duration::from_secs(2))
+}
+fn available_tmux_before(
+    deadline: std::time::Instant,
+) -> std::result::Result<std::path::PathBuf, String> {
     let exe = tmux::resolve_tmux(sidecar_dir().as_deref())
         .ok_or_else(|| "tmux unavailable or disabled".to_string())?;
-    let version =
-        crate::process_io::run(&exe, &["-V".into()], &[], std::time::Duration::from_secs(2))
-            .map_err(|_| "tmux version check failed".to_string())?;
+    let timeout = deadline
+        .saturating_duration_since(std::time::Instant::now())
+        .min(std::time::Duration::from_secs(2));
+    if timeout.is_zero() {
+        return Err("tmux bootstrap deadline expired".into());
+    }
+    let version = crate::process_io::run(&exe, &["-V".into()], &[], timeout)
+        .map_err(|_| "tmux version check failed".to_string())?;
     if !tmux::version_supported(&String::from_utf8_lossy(&version)) {
         return Err("tmux 3.7 or newer is required".into());
     }
@@ -211,6 +150,44 @@ fn available_tmux() -> std::result::Result<std::path::PathBuf, String> {
 }
 
 impl PtySession {
+    pub fn discover_durable() -> Result<Vec<tmux::DiscoveredPane>> {
+        let exe = available_tmux().map_err(anyhow::Error::msg)?;
+        tmux::discover_owned(&exe)
+    }
+    /// Explicit identity assignment only. No root, display client, journal or
+    /// input ownership is created; the caller must subsequently Attach.
+    pub fn identify_legacy(id: &str, pane: &str, root_pid: u32) -> Result<Identity> {
+        let exe = available_tmux().map_err(anyhow::Error::msg)?;
+        let handle = TmuxHandle::recover_legacy(exe, id, pane, root_pid)?;
+        Ok(handle
+            .incarnation()
+            .expect("recovery resolves an owned pane")
+            .clone())
+    }
+    /// One bounded cold bootstrap, with history kept outside the new journal.
+    pub fn rebuild_durable(
+        id: String,
+        incarnation: &Identity,
+        previous: Option<&Self>,
+    ) -> Result<DurableRebuild> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let exe = available_tmux_before(deadline).map_err(anyhow::Error::msg)?;
+        let handle = TmuxHandle::resolve_owned_before(exe, &id, incarnation, deadline)?;
+        let (cols, rows) = handle.geometry_before(deadline)?;
+        let archive = handle
+            .capture_archive_before(deadline)
+            .map_err(|_| "History unavailable: bounded capture failed".to_string());
+        if let Some(previous) = previous {
+            let meta = previous.stream().snapshot().metadata;
+            anyhow::ensure!(
+                meta.session_id == id && &meta.incarnation == incarnation && meta.durable,
+                "Rebuild cannot retire a different process incarnation"
+            );
+            previous.retire_adapter_before(deadline)?;
+        }
+        let session = Self::open_durable_adapter(id, cols, rows, handle, deadline)?;
+        Ok(DurableRebuild { session, archive })
+    }
     /// V2 creation opens a journal-owned display stream, without callbacks.
     /// Durable creation conflicts are errors, never an attach or direct fallback.
     pub fn create(
@@ -252,16 +229,7 @@ impl PtySession {
                 (cmd, None, Some(reason))
             }
         };
-        Self::start_adapter(
-            id,
-            cols,
-            rows,
-            built,
-            Identity::random()?,
-            None,
-            |_| {},
-            || {},
-        )
+        Self::start_adapter(id, cols, rows, built, Identity::random()?)
     }
 
     /// No shell, cwd, create-or-attach, or fallback may enter this path.
@@ -272,7 +240,7 @@ impl PtySession {
         rows: u16,
     ) -> Result<Self> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let exe = available_tmux().map_err(anyhow::Error::msg)?;
+        let exe = available_tmux_before(deadline).map_err(anyhow::Error::msg)?;
         let handle = TmuxHandle::resolve_owned_before(exe, &id, incarnation, deadline)?;
         Self::open_durable_adapter(id, cols, rows, handle, deadline)
     }
@@ -303,9 +271,6 @@ impl PtySession {
             rows,
             (cmd, Some(handle.clone()), None),
             incarnation,
-            None,
-            |_| {},
-            || {},
         )?;
         while session.is_alive() && std::time::Instant::now() < display_deadline {
             match session
@@ -318,7 +283,7 @@ impl PtySession {
             }
             thread::sleep(std::time::Duration::from_millis(10));
         }
-        session.retire_adapter()?;
+        session.retire_adapter_before(deadline)?;
         anyhow::bail!("Durable display attachment failed; the pane was not replaced or restarted")
     }
 
@@ -330,7 +295,19 @@ impl PtySession {
     }
 
     pub fn paste(&self, text: &str) -> Result<()> {
+        self.paste_checked(text, || Ok(()))
+    }
+    pub fn paste_checked(
+        &self,
+        text: &str,
+        mut authorize: impl FnMut() -> Result<()>,
+    ) -> Result<()> {
         let clean = crate::paste::prepare_paste(text)?;
+        let mut writer = self
+            .writer
+            .try_lock_for(std::time::Duration::from_secs(2))
+            .context("PTY input is busy; paste was not sent")?;
+        authorize()?;
         anyhow::ensure!(self.is_alive(), "Session is closed; paste was not sent");
         anyhow::ensure!(
             !self.journal.snapshot().ended,
@@ -340,14 +317,14 @@ impl PtySession {
             return Ok(());
         }
         if let Some(handle) = &self.tmux {
-            return handle.paste(&clean);
+            return handle.paste_checked(&clean, authorize);
         }
         let enabled = self.paste_mode.lock();
+        authorize()?;
         anyhow::ensure!(
             *enabled || !clean.contains('\n'),
             "Multiline paste blocked: child has not enabled bracketed paste"
         );
-        let mut writer = self.writer.lock();
         let result = (|| -> std::io::Result<()> {
             if *enabled {
                 writer.write_all(b"\x1b[200~")?;
@@ -361,92 +338,15 @@ impl PtySession {
         result.map_err(|_| anyhow::anyhow!("Paste delivery failed; delivery may be incomplete"))
     }
 
-    pub fn spawn<F, C>(
-        id: String,
-        cols: u16,
-        rows: u16,
-        cwd: Option<String>,
-        shell_cmd: Option<String>,
-        event_callback: F,
-        close_callback: C,
-    ) -> Result<Self>
-    where
-        F: FnMut(DemuxEvent) + Send + 'static,
-        C: FnMut() + Send + 'static,
-    {
-        let shell = shell_cmd.unwrap_or_else(|| {
-            std::env::var("SHELL").unwrap_or_else(|_| {
-                if cfg!(windows) {
-                    "powershell.exe".to_string()
-                } else {
-                    "/bin/bash".to_string()
-                }
-            })
-        });
-
-        let working_dir = resolve_cwd(cwd.as_deref());
-
-        // Prefer tmux. The shell then belongs to the tmux server rather than to
-        // us, so restarting or crashing the daemon detaches instead of killing —
-        // which is the entire reason this stage exists. Everything about the
-        // fallback path below is what shipped before, so a machine without tmux
-        // is no worse off than yesterday, only less durable.
-        let (mut cmd, tmux_handle, durability_detail) =
-            match build_tmux_command(&id, cols, rows, &shell) {
-                Ok(built) => built,
-                Err(reason) => {
-                    log::info!("session {}: direct spawn ({})", id, reason);
-                    let mut cmd = CommandBuilder::new(&shell);
-                    apply_shell_integration(&mut cmd, &shell);
-                    (cmd, None, Some(reason))
-                }
-            };
-
-        // Ask before attaching: the client repaints the visible screen as soon
-        // as it connects, and history is only distinguishable from it while the
-        // client is not there yet.
-        let replay_history = tmux_handle
-            .as_ref()
-            .filter(|handle| handle.has_session())
-            .and_then(|handle| handle.capture_history(tmux::REPLAY_LINES));
-
-        cmd.cwd(&working_dir);
-        cmd.env("TERM", "xterm-256color");
-        cmd.env("COLORTERM", "truecolor");
-        cmd.env("DOOM_TERM", "1");
-        // On the direct path `cmd` IS the shell, so this reaches it and
-        // everything it spawns. The tmux path cannot use this — see the `-e`
-        // arguments in build_tmux_command — because there `cmd` is the client.
-        cmd.env(SESSION_ID_ENV, &id);
-
-        Self::start_adapter(
-            id,
-            cols,
-            rows,
-            (cmd, tmux_handle, durability_detail),
-            Identity::random()?,
-            replay_history,
-            event_callback,
-            close_callback,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn start_adapter<F, C>(
+    fn start_adapter(
         id: String,
         cols: u16,
         rows: u16,
         built: TmuxCommand,
         incarnation: Identity,
-        replay_history: Option<String>,
-        event_callback: F,
-        close_callback: C,
-    ) -> Result<Self>
-    where
-        F: FnMut(DemuxEvent) + Send + 'static,
-        C: FnMut() + Send + 'static,
-    {
-        let (cmd, tmux_handle, durability_detail) = built;
+    ) -> Result<Self> {
+        let (mut cmd, tmux_handle, durability_detail) = built;
+        cmd.env(SESSION_INCARNATION_ENV, incarnation.as_str());
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows,
@@ -486,6 +386,7 @@ impl PtySession {
         let shell_pid_direct = child_pid;
         let child: OwnedChild = Arc::new(parking_lot::Mutex::new(Some(child)));
         let reader_child = child.clone();
+        let reader_tmux = tmux_handle.clone();
         let master = Arc::new(parking_lot::Mutex::new(pair.master));
         let paste_mode = Arc::new(parking_lot::Mutex::new(false));
         let reader_paste_mode = paste_mode.clone();
@@ -506,30 +407,11 @@ impl PtySession {
         // events are forwarded to the UI.
         let responder = writer.clone();
 
-        // Two threads emit events now — the reader and the alternate-screen
-        // poll — so the callback is shared rather than moved into one of them.
-        //
-        // Boxed rather than generic so it can be REPLACED later: a page reload
-        // opens a new WebSocket, and the session it is reconnecting to is still
-        // emitting into the previous connection's closed channel. See `rebind`.
-        let shared_callback: EventSink =
-            Arc::new(parking_lot::Mutex::new(Box::new(event_callback)));
-        let close_sink: CloseSink = Arc::new(parking_lot::Mutex::new(Box::new(close_callback)));
-        let reader_close = close_sink.clone();
-
-        if let Some(history) = replay_history {
-            // Above the live screen rather than through it: capture-pane was
-            // asked for history only (-E -1), so this precedes the attach's
-            // first bytes and nothing here is repainted by it.
-            (shared_callback.lock())(DemuxEvent::Output { data: history });
-        }
-
         // The alternate-screen poll. Emits only on change: the frontend treats
         // TuiMode as a state report, and a repeated one would re-render the
         // pane twice a second for no reason.
         if let Some(handle) = tmux_handle.clone() {
             let running_poll = running.clone();
-            let poll_callback = shared_callback.clone();
             let poll_journal = journal.clone();
             let poll_observations = observations.clone();
             threads.push(thread::spawn(move || {
@@ -550,7 +432,6 @@ impl PtySession {
                                     break;
                                 }
                             }
-                            (poll_callback.lock())(DemuxEvent::TuiMode { active });
                         }
                     }
                     thread::sleep(tmux::ALT_POLL);
@@ -558,7 +439,6 @@ impl PtySession {
             }));
         }
 
-        let reader_callback = shared_callback.clone();
         threads.push(thread::spawn(move || {
             let mut demuxer = StreamDemuxer::new();
             let mut buffer = [0u8; 8192];
@@ -574,8 +454,7 @@ impl PtySession {
                             continue;
                         }
                         let events = demuxer.process_bytes(&buffer[..n]);
-                        // Apply the last mode in this read before callbacks can
-                        // trigger input, and without holding locks over callbacks.
+                        // Apply the last mode in this read before input admission.
                         if let Some(enabled) = events.iter().rev().find_map(|event| match event {
                             DemuxEvent::BracketedPasteMode { enabled } => Some(*enabled),
                             _ => None,
@@ -583,7 +462,6 @@ impl PtySession {
                             *reader_paste_mode.lock() = enabled;
                         }
 
-                        let mut accepted = Vec::new();
                         for event in events {
                             let payload = match &event {
                                 DemuxEvent::StreamFault { reason } => {
@@ -591,23 +469,8 @@ impl PtySession {
                                 }
                                 _ => StreamPayload::Event(event.clone()),
                             };
-                            match reader_journal.append(payload) {
-                                Ok(_) => accepted.push(event),
-                                Err(error) => {
-                                    let reason = match error {
-                                        StreamError::RecordTooLarge => {
-                                            Some(StreamFault::RecordTooLarge)
-                                        }
-                                        StreamError::SequenceExhausted => {
-                                            Some(StreamFault::SequenceExhausted)
-                                        }
-                                        _ => None,
-                                    };
-                                    if let Some(reason) = reason {
-                                        accepted.push(DemuxEvent::StreamFault { reason });
-                                    }
-                                    break;
-                                }
+                            if reader_journal.append(payload).is_err() {
+                                break;
                             }
                         }
                         let replies = demuxer.take_responses();
@@ -617,10 +480,6 @@ impl PtySession {
                             if w.write_all(&replies).and_then(|_| w.flush()).is_err() {
                                 log::warn!("Failed to answer terminal query");
                             }
-                        }
-
-                        for event in accepted {
-                            (reader_callback.lock())(event);
                         }
                     }
                     Err(e) => {
@@ -670,14 +529,29 @@ impl PtySession {
                 None
             };
 
-            let end_event = DemuxEvent::ExecutionEnd { exit_code };
             {
                 let _order = reader_observations.lock();
-                let _ = reader_journal.append(StreamPayload::Event(end_event.clone()));
-                let _ = reader_journal.append(StreamPayload::Closed { exit_code });
+                // Process closure is not an observed OSC 133 command boundary.
+                if child_status_is_meaningful {
+                    reader_journal.observe_process_exit(exit_code);
+                } else if reader_tmux
+                    .as_ref()
+                    .and_then(TmuxHandle::pane_pid)
+                    .is_none()
+                {
+                    // The owned display ended and its exact pane is no longer
+                    // observable. tmux cannot give us the root's exit status
+                    // after removing the pane, but it can prove the process
+                    // incarnation no longer exists.
+                    reader_journal.observe_process_exit(None);
+                } else {
+                    // The display client is our child; the durable root is
+                    // not. Its exit status cannot certify the pane's exit.
+                    let _ = reader_journal.append(StreamPayload::Fault {
+                        reason: StreamFault::AdapterLost,
+                    });
+                }
             }
-            (reader_callback.lock())(end_event);
-            (reader_close.lock())();
         }));
 
         Ok(Self {
@@ -695,30 +569,9 @@ impl PtySession {
             shell_pid_direct,
             journal,
             observations,
-            sink: shared_callback,
-            close_sink,
             tmux: tmux_handle,
             durability_detail,
         })
-    }
-
-    /// Point this session's output at a different consumer.
-    ///
-    /// A session outlives the WebSocket that created it: reloading the page
-    /// opens a new connection, and without this the reader thread keeps sending
-    /// every byte into the previous connection's dropped channel. The shell is
-    /// alive, the keystrokes arrive, and NOTHING is drawn — which is exactly how
-    /// it failed. Reattaching a second tmux client instead of rebinding is what
-    /// made it worse: `new-session -A` attaches rather than creates, so each
-    /// reload added another client to one session, and tmux stalls the whole
-    /// server when it cannot write to a client nobody is reading.
-    pub fn rebind<F, C>(&self, callback: F, close_callback: C)
-    where
-        F: FnMut(DemuxEvent) + Send + 'static,
-        C: FnMut() + Send + 'static,
-    {
-        *self.close_sink.lock() = Box::new(close_callback);
-        *self.sink.lock() = Box::new(callback);
     }
 
     /// The pid whose /proc entry names the foreground command.
@@ -779,96 +632,106 @@ impl PtySession {
         self.durability_detail.clone()
     }
 
-    /// The pid to signal: the pane's shell under tmux, ours otherwise.
-    fn signal_target(&self) -> Option<u32> {
-        match &self.tmux {
-            Some(handle) => handle.pane_pid(),
-            None => self.child_pid,
-        }
-    }
-
-    pub fn get_replay_events(&self) -> Vec<DemuxEvent> {
-        // Legacy callback transport only, removed by the v2 transport cutover.
-        // Keep its previous 500-event delivery cap: copying the enlarged
-        // journal to that unbounded socket queue would amplify its old bug.
-        let snapshot = self.journal.snapshot();
-        let mut cursor = snapshot
-            .first_retained
-            .map(|seq| seq.get() - 1)
-            .unwrap_or(snapshot.high_water.get());
-        cursor = cursor.max(snapshot.high_water.get().saturating_sub(500));
-        let mut events = Vec::new();
-        while cursor < snapshot.high_water.get() {
-            let Ok(Some(record)) = self
-                .journal
-                .read_after(crate::stream::Sequence::new(cursor))
-            else {
-                break;
-            };
-            cursor = record.sequence.get();
-            match record.payload {
-                StreamPayload::Event(event) => events.push(event),
-                StreamPayload::Fault { reason } => events.push(DemuxEvent::StreamFault { reason }),
-                _ => {}
-            }
-        }
-        events
-    }
-
     pub fn stream(&self) -> StreamJournal {
         self.journal.clone()
     }
 
     pub fn write(&self, data: &[u8]) -> Result<()> {
+        self.write_checked(data, || Ok(()))
+    }
+    pub fn write_checked(
+        &self,
+        data: &[u8],
+        mut authorize: impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        let mut writer = self
+            .writer
+            .try_lock_for(std::time::Duration::from_secs(2))
+            .context("PTY input is busy; this input was not sent")?;
+        // A job admitted before disconnection may wait behind another writer.
+        // Recheck its socket lease after that wait, immediately before delivery.
+        authorize()?;
         anyhow::ensure!(
             !self.journal.snapshot().ended,
             "Rendering stream has ended; input was not sent"
         );
-        let mut writer = self.writer.lock();
+        if let Some(handle) = self
+            .tmux
+            .as_ref()
+            .filter(|handle| handle.incarnation().is_some())
+        {
+            return handle.write_checked(data, authorize);
+        }
         writer.write_all(data).context("Failed to write to PTY")?;
         writer.flush().context("Failed to flush PTY writer")?;
         Ok(())
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
+        self.resize_checked(cols, rows, || Ok(()))
+    }
+    pub fn resize_checked(
+        &self,
+        cols: u16,
+        rows: u16,
+        authorize: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
         anyhow::ensure!(cols > 0 && rows > 0, "Terminal dimensions must be positive");
         let _order = self.observations.lock();
+        authorize()?;
         anyhow::ensure!(!self.journal.snapshot().ended, "Rendering stream has ended");
+        let owned = self
+            .tmux
+            .as_ref()
+            .filter(|handle| handle.incarnation().is_some());
+        if let Some(handle) = owned {
+            handle.resize_owned(cols, rows)?;
+        }
         let master = self.master.lock();
-        master
+        let result = master
             .resize(PtySize {
                 rows,
                 cols,
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .context("Failed to resize PTY")?;
+            .context("Failed to resize PTY");
+        if result.is_err() && owned.is_some() {
+            // The pane may already have resized, but the display did not.
+            // Continuing that stream would fabricate a valid replay geometry.
+            let _ = self.journal.append(StreamPayload::Fault {
+                reason: StreamFault::AdapterLost,
+            });
+        }
+        result?;
         self.journal.append(StreamPayload::Resize { cols, rows })?;
         Ok(())
     }
 
     pub fn send_signal(&self, sig: &str) -> Result<()> {
+        self.send_signal_checked(sig, || Ok(()))
+    }
+    pub fn send_signal_checked(
+        &self,
+        sig: &str,
+        mut authorize: impl FnMut() -> Result<()>,
+    ) -> Result<()> {
         match sig {
             "SIGINT" | "INT" | "ctrl+c" => {
                 // The terminal line discipline owns ISIG and foreground-group
                 // delivery. A raw-mode agent must receive the byte without an
                 // extra killpg interrupting the application or its parent shell.
-                self.write(&[0x03])?;
+                self.write_checked(&[0x03], authorize)?;
             }
             "SIGTSTP" | "TSTP" | "ctrl+z" => {
-                self.write(&[0x1a])?;
+                self.write_checked(&[0x1a], authorize)?;
             }
             "EOF" | "ctrl+d" => {
-                self.write(&[0x04])?;
+                self.write_checked(&[0x04], authorize)?;
             }
-            "SIGKILL" | "KILL" =>
-            {
-                #[cfg(unix)]
-                if let Some(pid) = self.signal_target() {
-                    use nix::sys::signal::{killpg, Signal};
-                    use nix::unistd::Pid;
-                    let _ = killpg(Pid::from_raw(pid as i32), Signal::SIGKILL);
-                }
+            "SIGKILL" | "KILL" => {
+                authorize()?;
+                self.kill()?;
             }
             _ => {
                 log::warn!("Unsupported signal: {}", sig);
@@ -879,8 +742,7 @@ impl PtySession {
 
     /// Whether the reader thread is still attached to a live process.
     ///
-    /// Consulted by the daemon before rebinding or listing a session: both of
-    /// those used to treat a map entry as proof of life.
+    /// Whether this adapter's owned reader is still live.
     pub fn is_alive(&self) -> bool {
         self.running.load(Ordering::Relaxed)
     }
@@ -894,29 +756,46 @@ impl PtySession {
                 handle.kill_session(),
                 "Durable pane is missing or replaced; kill refused"
             );
-            if handle.incarnation().is_some() {
-                {
-                    let _order = self.observations.lock();
-                    let _ = self
-                        .journal
-                        .append(StreamPayload::Closed { exit_code: None });
-                }
-                return self.retire_adapter();
+            {
+                let _order = self.observations.lock();
+                self.journal.observe_process_exit(None);
             }
-            // Legacy callers may hold their session-map lock while killing;
-            // preserve asynchronous closure until the v2 lifecycle cutover.
-            // Waiting here could deadlock against their close callback.
-            self.running.store(false, Ordering::Relaxed);
-            return Ok(());
+            return self.retire_adapter();
         }
+        // The owned, unreaped Child is authority; a cached numeric pid is not.
+        // Hold this slot through signalling so the reader cannot reap the root
+        // and allow its pid to be reused between the check and the signal.
+        let mut slot = self.child.lock();
+        let child = slot
+            .as_mut()
+            .context("Direct PTY is already closed; kill refused")?;
+        anyhow::ensure!(
+            child.try_wait()?.is_none(),
+            "Direct PTY is already closed; kill refused"
+        );
+        #[cfg(unix)]
+        {
+            let pid = child
+                .process_id()
+                .context("Direct PTY process identity is unavailable")?;
+            nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            )
+            .context("Failed to kill the owned PTY process group")?;
+        }
+        #[cfg(not(unix))]
+        child.kill()?;
         self.running.store(false, Ordering::Relaxed);
-        let _ = self.send_signal("SIGKILL");
         Ok(())
     }
 
     /// Retire/reap only our display client and threads, never the pane/server.
     /// A direct child cannot be retired without killing the user's process.
     pub fn retire_adapter(&self) -> Result<()> {
+        self.retire_adapter_before(std::time::Instant::now() + std::time::Duration::from_secs(3))
+    }
+    fn retire_adapter_before(&self, deadline: std::time::Instant) -> Result<()> {
         anyhow::ensure!(self.is_durable(), "Direct PTY adapter cannot be retired");
         self.retired.store(true, Ordering::Relaxed);
         self.running.store(false, Ordering::Relaxed);
@@ -944,7 +823,7 @@ impl PtySession {
                 }
             }
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let deadline = deadline.min(std::time::Instant::now() + std::time::Duration::from_secs(3));
         let mut threads = self.threads.lock();
         while threads.iter().any(|thread| !thread.is_finished()) {
             anyhow::ensure!(

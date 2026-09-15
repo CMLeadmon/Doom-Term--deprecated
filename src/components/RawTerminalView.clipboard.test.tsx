@@ -34,6 +34,24 @@ afterEach(() => {
 });
 
 describe('terminal clipboard safety', () => {
+  it('cancels an asynchronous clipboard read when ownership changes without any screen output', async () => {
+    const resolve = delayedClipboard();
+    let permit = { id: sessionId, incarnation: '1'.repeat(32), attachment_id: '2'.repeat(32) };
+    render(<RawTerminalView {...props} captureInputIdentity={() => permit} />);
+    pasteChord();
+    permit = { ...permit, attachment_id: '3'.repeat(32) };
+    await act(async () => { resolve('old controller input'); });
+    expect(props.onPasteText).not.toHaveBeenCalled();
+    expect(screen.getByRole('status').textContent).toMatch(/ownership changed/i);
+  });
+
+  it('carries the captured ownership fence through a successful asynchronous clipboard read', async () => {
+    const resolve = delayedClipboard();
+    const permit = { id: sessionId, incarnation: '1'.repeat(32), attachment_id: '2'.repeat(32) };
+    render(<RawTerminalView {...props} captureInputIdentity={() => permit} />);
+    pasteChord(); await act(async () => { resolve('exact controller input'); });
+    expect(props.onPasteText).toHaveBeenCalledWith('exact controller input', permit);
+  });
   it('refuses multiline paste when the child has not enabled bracketed paste', () => {
     render(<RawTerminalView {...props} />);
     paste();

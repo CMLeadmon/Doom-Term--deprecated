@@ -35,6 +35,7 @@ fi
     agent=$1
     port=$2
     pane=$3
+    incarnation=$4
     # The sentinel preserves trailing newlines through command substitution.
     payload=$(head -c 65537 && printf .) || exit 0
     payload=${payload%.}
@@ -46,13 +47,16 @@ fi
     else
       set --
     fi
+    if [ -n "$pane" ] && [ -n "$incarnation" ]; then
+      set -- "$@" --header "X-Doom-Term-Incarnation: $incarnation"
+    fi
     # --disable must be first: user curl defaults can add URLs or output files.
     # A loopback event must also never take an inherited proxy route.
     printf "%s" "$payload" | curl --disable \
       --silent --noproxy "*" --max-time 2 --request POST \
       --header "Content-Type: application/json" "$@" --data-binary @- \
       "http://127.0.0.1:${port}/hook/${agent}"
-  ' sh "${1:-unknown}" "${DOOM_PORT:-1421}" "${DOOM_TERM_SESSION_ID:-}"
+  ' sh "${1:-unknown}" "${DOOM_PORT:-1421}" "${DOOM_TERM_SESSION_ID:-}" "${DOOM_TERM_INCARNATION:-}"
 } >/dev/null 2>&1
 
 exit 0

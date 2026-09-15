@@ -2,9 +2,11 @@
 //! not the terminal frontend, decides whether Ctrl+C or Ctrl+Z is a signal.
 #![cfg(unix)]
 
-use doom_term_pty::{DemuxEvent, PtySession};
+use doom_term_pty::{
+    stream::{Sequence, StreamPayload},
+    DemuxEvent, PtySession,
+};
 use std::os::unix::fs::PermissionsExt;
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 #[test]
@@ -46,25 +48,26 @@ fn raw_mode_receives_control_bytes_without_an_out_of_band_signal() {
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
 
     for (chord, byte) in [("ctrl+c", 3u8), ("ctrl+z", 26u8), ("ctrl+d", 4u8)] {
-        let (tx, rx) = mpsc::channel();
-        let session = PtySession::spawn(
+        let session = PtySession::create(
             format!("control-fixture-{byte}"),
             80,
             24,
             Some(fixture.path().display().to_string()),
             Some(script.display().to_string()),
-            move |event| {
-                let _ = tx.send(event);
-            },
-            || {},
         )
         .unwrap();
+        let journal = session.stream();
+        let mut cursor = Sequence::default();
         let mut output = String::new();
         let deadline = Instant::now() + Duration::from_secs(3);
         while !output.contains("READY") && Instant::now() < deadline {
-            if let Ok(DemuxEvent::Output { data }) = rx.recv_timeout(Duration::from_millis(50)) {
-                output.push_str(&data);
+            while let Some(record) = journal.read_after(cursor).unwrap() {
+                cursor = record.sequence;
+                if let StreamPayload::Event(DemuxEvent::Output { data }) = record.payload {
+                    output.push_str(&data);
+                }
             }
+            journal.wait_for_change(cursor, Duration::from_millis(50));
         }
         if !output.contains("READY") {
             let _ = session.kill();
@@ -76,11 +79,18 @@ fn raw_mode_receives_control_bytes_without_an_out_of_band_signal() {
         session.send_signal(chord).unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline {
-            match rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(DemuxEvent::Output { data }) => output.push_str(&data),
-                Ok(DemuxEvent::ExecutionEnd { .. }) => break,
-                _ => {}
+            while let Some(record) = journal.read_after(cursor).unwrap() {
+                cursor = record.sequence;
+                match record.payload {
+                    StreamPayload::Event(DemuxEvent::Output { data }) => output.push_str(&data),
+                    StreamPayload::Closed { .. } => break,
+                    _ => {}
+                }
             }
+            if journal.snapshot().ended {
+                break;
+            }
+            journal.wait_for_change(cursor, Duration::from_millis(50));
         }
         if session.is_alive() {
             let _ = session.kill();

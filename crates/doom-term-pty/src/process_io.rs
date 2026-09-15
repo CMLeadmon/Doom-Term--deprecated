@@ -3,7 +3,7 @@ use anyhow::Result;
 use std::{path::Path, time::Duration};
 
 #[derive(Clone, Copy)]
-pub(crate) struct HelperLimits {
+pub struct HelperLimits {
     pub timeout: Duration,
     pub input_bytes: usize,
     pub output_bytes: usize,
@@ -23,7 +23,7 @@ pub(crate) fn run(exe: &Path, args: &[String], input: &[u8], timeout: Duration) 
 }
 
 #[cfg(unix)]
-pub(crate) fn run_bounded(
+pub fn run_bounded(
     exe: &Path,
     args: &[String],
     input: &[u8],
@@ -41,7 +41,7 @@ pub(crate) fn run_bounded(
     anyhow::ensure!(
         limits.input_bytes <= crate::paste::MAX_PASTE_BYTES
             && limits.output_bytes <= 8 * 1024 * 1024
-            && limits.timeout <= Duration::from_secs(2)
+            && limits.timeout <= Duration::from_secs(30)
             && !limits.timeout.is_zero(),
         "Invalid terminal helper limits"
     );
@@ -141,7 +141,7 @@ pub(crate) fn run_bounded(
 }
 
 #[cfg(not(unix))]
-pub(crate) fn run_bounded(
+pub fn run_bounded(
     _exe: &Path,
     _args: &[String],
     _input: &[u8],

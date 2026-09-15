@@ -49,12 +49,12 @@ beforeEach(() => {
 afterEach(() => vi.unstubAllGlobals());
 
 describe('useTerminalSize', () => {
-  it('reports the measured grid to both the PTY and the emulator on mount', () => {
+  it('reports desired geometry without changing the parser before an ordered confirmation', () => {
     const ref = { current: paneOf(700, 450) };
     renderHook(() => useTerminalSize(ref, 'session-1'));
 
     expect(ptyClient.resizeSession).toHaveBeenCalledWith('session-1', 100, 30);
-    expect(resizeEmulator).toHaveBeenCalledWith('session-1', 100, 30);
+    expect(resizeEmulator).not.toHaveBeenCalled();
   });
 
   it('does not resend an unchanged size', () => {

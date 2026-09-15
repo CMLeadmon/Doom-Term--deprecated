@@ -7,20 +7,15 @@ struct Fixture {
     root: tempfile::TempDir,
     sessions: SessionsMap,
     usage: UsageHandle,
-    tx: tokio::sync::mpsc::UnboundedSender<ServerMessage>,
-    rx: tokio::sync::mpsc::UnboundedReceiver<ServerMessage>,
 }
 
 impl Fixture {
     fn new() -> Self {
         std::env::set_var("DOOM_TERM_NO_TMUX", "1");
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             root: tempfile::tempdir().unwrap(),
             sessions: Arc::new(RwLock::new(HashMap::new())),
             usage: Arc::new(usage::service::UsageService::new()),
-            tx,
-            rx,
         }
     }
 
@@ -30,18 +25,15 @@ impl Fixture {
             std::fs::copy("/bin/cat", &program).unwrap();
         }
         let id = format!("{}-{name}", self.root.path().display());
-        handle_client_msg(
-            ClientMessage::Spawn {
-                id: id.clone(),
-                cols: 80,
-                rows: 24,
-                cwd: Some(self.root.path().display().to_string()),
-                shell: Some(program.display().to_string()),
-            },
-            &self.sessions,
-            &self.usage,
-            &self.tx,
-        );
+        let session = PtySession::create(
+            id.clone(),
+            80,
+            24,
+            Some(self.root.path().display().to_string()),
+            Some(program.display().to_string()),
+        )
+        .unwrap();
+        self.sessions.write().insert(id.clone(), Arc::new(session));
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             if self
@@ -63,7 +55,26 @@ impl Fixture {
         id
     }
 
-    async fn hook(&self, agent: &str, pane: Option<&str>, count: u64) {
+    fn incarnation(&self, id: &str) -> String {
+        self.sessions
+            .read()
+            .get(id)
+            .unwrap()
+            .stream()
+            .snapshot()
+            .metadata
+            .incarnation
+            .as_str()
+            .to_owned()
+    }
+
+    async fn hook_with_incarnation(
+        &self,
+        agent: &str,
+        pane: Option<&str>,
+        incarnation: Option<&str>,
+        count: u64,
+    ) {
         let path = self.root.path().join(format!("{agent}-{count}.jsonl"));
         let record = if agent == "claude" {
             serde_json::json!({"type":"assistant", "message": {"model":"claude-haiku-4-5", "usage":{"input_tokens":count}}})
@@ -80,19 +91,14 @@ impl Fixture {
         let sessions = self.sessions.clone();
         let task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let (bus, _) = tokio::sync::broadcast::channel(4);
-            serve_hook(
-                stream,
-                &bus,
-                &Arc::new(RwLock::new(HashMap::new())),
-                Some(agent),
-                &sessions,
-            )
-            .await;
+            serve_hook(stream, &hooks::HookHub::default(), Some(agent), &sessions).await;
         });
-        let header = pane
+        let mut header = pane
             .map(|id| format!("X-Doom-Term-Session: {id}\r\n"))
             .unwrap_or_default();
+        if let Some(incarnation) = incarnation {
+            header.push_str(&format!("X-Doom-Term-Incarnation: {incarnation}\r\n"));
+        }
         let mut stream = TcpStream::connect(addr).await.unwrap();
         stream.write_all(format!("POST /hook HTTP/1.1\r\nHost: {addr}\r\n{header}Content-Length: {}\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
         let mut reply = String::new();
@@ -101,28 +107,24 @@ impl Fixture {
         assert!(reply.starts_with("HTTP/1.1 204"));
     }
 
-    fn context(&mut self, id: &str) -> Option<f64> {
-        handle_client_msg(
-            ClientMessage::GetTelemetry {
-                cwd: None,
-                session_id: Some(id.into()),
-            },
-            &self.sessions,
-            &self.usage,
-            &self.tx,
-        );
-        while let Ok(msg) = self.rx.try_recv() {
-            if let ServerMessage::Telemetry {
-                session_id,
-                context_used,
-                ..
-            } = msg
-            {
-                assert_eq!(session_id.as_deref(), Some(id));
-                return context_used;
-            }
-        }
-        panic!("missing telemetry response");
+    async fn hook(&self, agent: &str, pane: Option<&str>, count: u64) {
+        let incarnation = pane.map(|id| self.incarnation(id));
+        self.hook_with_incarnation(agent, pane, incarnation.as_deref(), count)
+            .await;
+    }
+
+    fn context(&self, id: &str) -> Option<f64> {
+        let session = self.sessions.read().get(id).cloned();
+        let ServerMessage::Telemetry {
+            session_id,
+            context_used,
+            ..
+        } = metadata::telemetry(None, Some(id.into()), session, &self.usage)
+        else {
+            panic!("missing telemetry response")
+        };
+        assert_eq!(session_id.as_deref(), Some(id));
+        context_used
     }
 
     fn wait_command(&self, id: &str, command: &str) {
@@ -225,21 +227,15 @@ fn unsupported_agent_history_cannot_invent_telemetry() {
         return;
     }
 
-    let mut fixture = Fixture::new();
+    let fixture = Fixture::new();
     for agent in ["agy", "antigravity"] {
         let id = fixture.pane(agent, agent);
-        handle_client_msg(
-            ClientMessage::GetTelemetry {
-                cwd: None,
-                session_id: Some(id.clone()),
-            },
-            &fixture.sessions,
+        let response = metadata::telemetry(
+            None,
+            Some(id.clone()),
+            fixture.sessions.read().get(&id).cloned(),
             &fixture.usage,
-            &fixture.tx,
         );
-        let response = std::iter::from_fn(|| fixture.rx.try_recv().ok())
-            .find(|msg| matches!(msg, ServerMessage::Telemetry { .. }))
-            .expect("telemetry response");
         let ServerMessage::Telemetry {
             session_id,
             agent_key,
@@ -266,7 +262,7 @@ fn unsupported_agent_history_cannot_invent_telemetry() {
 #[tokio::test]
 async fn same_agent_panes_in_one_directory_keep_their_own_context() {
     for agent in ["claude", "codex"] {
-        let mut fixture = Fixture::new();
+        let fixture = Fixture::new();
         let a = fixture.pane(agent, "a");
         let b = fixture.pane(agent, "b");
         fixture.hook(agent, Some(&a), 20000).await;
@@ -283,7 +279,7 @@ async fn same_agent_panes_in_one_directory_keep_their_own_context() {
 #[tokio::test]
 async fn an_unattributed_hook_cannot_describe_a_pane() {
     for agent in ["claude", "codex"] {
-        let mut fixture = Fixture::new();
+        let fixture = Fixture::new();
         let a = fixture.pane(agent, "a");
         fixture.hook(agent, None, 20000).await;
         assert_eq!(
@@ -295,23 +291,35 @@ async fn an_unattributed_hook_cannot_describe_a_pane() {
 }
 
 #[tokio::test]
+async fn a_stale_incarnation_hook_cannot_teach_the_replacement_its_transcript() {
+    let fixture = Fixture::new();
+    let id = fixture.pane("claude", "stale-incarnation");
+    fixture
+        .hook_with_incarnation("claude", Some(&id), Some(&"f".repeat(32)), 20000)
+        .await;
+    assert_eq!(fixture.context(&id), None);
+    fixture.hook("claude", Some(&id), 20000).await;
+    assert_eq!(fixture.context(&id), Some(0.1));
+}
+
+#[tokio::test]
 async fn a_new_agent_process_in_the_same_pane_does_not_inherit_the_old_transcript() {
-    let mut fixture = Fixture::new();
+    let fixture = Fixture::new();
     let program = fixture.root.path().join("claude");
     std::fs::copy("/bin/cat", &program).unwrap();
     let id = format!("{}-restart", fixture.root.path().display());
-    handle_client_msg(
-        ClientMessage::Spawn {
-            id: id.clone(),
-            cols: 80,
-            rows: 24,
-            cwd: Some(fixture.root.path().display().to_string()),
-            shell: Some("/bin/sh".into()),
-        },
-        &fixture.sessions,
-        &fixture.usage,
-        &fixture.tx,
-    );
+    let session = PtySession::create(
+        id.clone(),
+        80,
+        24,
+        Some(fixture.root.path().display().to_string()),
+        Some("/bin/sh".into()),
+    )
+    .unwrap();
+    fixture
+        .sessions
+        .write()
+        .insert(id.clone(), Arc::new(session));
     fixture.wait_command(&id, "sh");
     let session = fixture.sessions.read().get(&id).unwrap().clone();
     session

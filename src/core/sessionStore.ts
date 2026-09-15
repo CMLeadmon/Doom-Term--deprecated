@@ -2,6 +2,7 @@ import { ProjectWorkspace, SessionGroup, SessionNode, WorkspaceSet } from '../ty
 import { uniqueId } from './ids';
 import { nextSessionNumber } from './sessionNumbers';
 import { paneLeaf, treeFromLayout } from './paneTree';
+import { workspacePresentation } from './workspacePresentation';
 
 const STORAGE_KEY = 'DOOM_TERM_WORKSPACE_V1';
 
@@ -62,7 +63,7 @@ export function backfillPaneTrees(set: WorkspaceSet): WorkspaceSet {
 }
 
 const migrateWorkspaceSet = (set: WorkspaceSet): WorkspaceSet =>
-  backfillPaneTrees(backfillSessionNumbers(set));
+  backfillPaneTrees(backfillSessionNumbers(workspacePresentation(set)));
 
 export function createDefaultWorkspace(): ProjectWorkspace {
   const initialNode: SessionNode = {
@@ -231,7 +232,7 @@ export class SessionStore {
 
     this.saveTimeout = window.setTimeout(() => {
       try {
-        window.localStorage.setItem(SET_STORAGE_KEY, JSON.stringify(set));
+        window.localStorage.setItem(SET_STORAGE_KEY, JSON.stringify(workspacePresentation(set)));
         const active = set.workspaces.find((w) => w.id === set.activeWorkspaceId);
         if (active) this.addRecentWorkspace(active.rootPath, active.name);
       } catch (e) {

@@ -1,12 +1,13 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { act, renderHook } from '@testing-library/react';
+import { act, renderHook, waitFor } from '@testing-library/react';
 import { useWorkspaceSet } from './useWorkspaceSet';
 import { usePtyEvents } from './usePtyEvents';
-import { ptyClient } from '../core/ptyClient';
+import { ptyClient, type DemuxEventHandler } from '../core/ptyClient';
 import { useState } from 'react';
 import type { AppTelemetry } from '../hud/state';
 import { closeDisposition } from '../core/sessionClose';
 import { leafSessionIds } from '../core/paneTree';
+import { BOOTSTRAP_COLS, BOOTSTRAP_ROWS } from '../core/emulatorRegistry';
 
 /**
  * jsdom's `localStorage` is shadowed here by Node's own experimental global,
@@ -17,8 +18,12 @@ import { leafSessionIds } from '../core/paneTree';
 const V2 = 'DOOM_TERM_WORKSPACES_V2';
 let store: Map<string, string>;
 let original: PropertyDescriptor | undefined;
+let ptyHandler: DemuxEventHandler | undefined;
 
 beforeEach(() => {
+  ptyHandler = undefined;
+  const register = ptyClient.registerHandler.bind(ptyClient);
+  vi.spyOn(ptyClient, 'registerHandler').mockImplementation(handler => { ptyHandler = handler; return register(handler); });
   store = new Map();
   original = Object.getOwnPropertyDescriptor(window, 'localStorage');
   Object.defineProperty(window, 'localStorage', {
@@ -33,9 +38,11 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  ptyClient.forgetSession('n1');
   if (original) Object.defineProperty(window, 'localStorage', original);
   else delete (window as unknown as Record<string, unknown>).localStorage;
   vi.useRealTimers();
+  vi.restoreAllMocks();
 });
 
 /** A stored set, as a previous run would have left it. */
@@ -59,6 +66,123 @@ const storedSet = () => JSON.stringify({
 });
 
 describe('first-run workspace choice', () => {
+  it('recovers a daemon-only owned identity by attachment, never create or command replay', async () => {
+    store.set(V2, storedSet());
+    const bind = vi.spyOn(ptyClient, 'bindExisting').mockReturnValue(true);
+    const create = vi.spyOn(ptyClient, 'createSession');
+    const ensure = vi.spyOn(ptyClient, 'ensureSession').mockImplementation(() => {});
+    const { result } = renderHook(() => useWorkspaceSet());
+    await act(async () => { await result.current.handleRecoverSession({ id: 'orphan', incarnation: 'a'.repeat(32),
+      durable: true, identity_status: 'owned', command: 'never execute this', cwd: '/survivor' }); });
+    expect(result.current.activeNode).toMatchObject({ id: 'orphan', incarnation: 'a'.repeat(32), agentState: 'unknown', commandHistory: [] });
+    expect(bind).toHaveBeenCalledWith('orphan', 'a'.repeat(32));
+    expect(create).not.toHaveBeenCalled();
+    expect(ensure.mock.calls.every(call => call[2] === 'a'.repeat(32))).toBe(true);
+  });
+
+  it('preserves a conflicting cached pane as a separately addressable snapshot when recovering its replacement', async () => {
+    const data = JSON.parse(storedSet());
+    const old = data.workspaces[0].nodes.n1;
+    old.incarnation = '1'.repeat(32); old.title = 'My cached work'; old.titleLocked = true;
+    old.tuiLines = [{ id: 'cache', timestamp: 1, spans: [{ text: 'OLD TRANSCRIPT' }] }];
+    store.set(V2, JSON.stringify(data));
+    const bind = vi.spyOn(ptyClient, 'bindExisting').mockReturnValue(true);
+    vi.spyOn(ptyClient, 'ensureSession').mockImplementation(() => {});
+    const kill = vi.spyOn(ptyClient, 'killSession');
+    const { result } = renderHook(() => useWorkspaceSet());
+    await act(async () => { await result.current.handleRecoverSession({ id: 'n1', incarnation: 'a'.repeat(32), durable: true, identity_status: 'owned' }); });
+    const cache = Object.values(result.current.workspace.nodes).find(node => node.id !== 'n1')!;
+    expect(cache).toMatchObject({ title: 'My cached work', titleLocked: true, number: 1, tuiLines: old.tuiLines,
+      snapshotOf: { sessionId: 'n1', incarnation: old.incarnation } });
+    expect(result.current.bindingFor(cache.id)).toBe('snapshot');
+    expect(result.current.activeNode).toMatchObject({ id: 'n1', incarnation: 'a'.repeat(32), number: 2, tuiLines: [], agentState: 'unknown' });
+    expect(leafSessionIds(result.current.activeGroup.paneTree!)).toEqual([cache.id, 'n1']);
+    expect(bind).toHaveBeenCalledWith('n1', 'a'.repeat(32));
+    expect(kill).not.toHaveBeenCalled();
+  });
+
+  it('waits for legacy identity confirmation, retaining caches after an uncertain result', async () => {
+    store.set(V2, storedSet());
+    let reject!: (error: Error) => void;
+    const recover = vi.spyOn(ptyClient, 'recoverLegacy').mockReturnValue(new Promise((_, fail) => { reject = fail; }));
+    const bind = vi.spyOn(ptyClient, 'bindExisting').mockReturnValue(true);
+    vi.spyOn(ptyClient, 'ensureSession').mockImplementation(() => {});
+    const { result } = renderHook(() => useWorkspaceSet());
+    const before = result.current.workspace;
+    const target = { id: 'n1', durable: true, identity_status: 'unidentified' as const, pane: '%7', root_pid: 123 };
+    let pending!: Promise<void>;
+    act(() => { pending = Promise.resolve(result.current.handleRecoverSession(target)); });
+    expect(result.current.workspace).toBe(before);
+    act(() => { void result.current.handleRecoverSession(target); });
+    expect(recover).toHaveBeenCalledTimes(1);
+    await act(async () => { reject(new Error('Unknown')); await pending; });
+    expect(result.current.workspace).toBe(before);
+    expect(bind).not.toHaveBeenCalled();
+  });
+
+  it('keeps the original cached pane when explicit revival is refused or uncertain', async () => {
+    const stored = JSON.parse(storedSet());
+    stored.workspaces[0].nodes.n1.tuiLines = [{ id: 'cached', spans: [{ text: 'keep this transcript' }], timestamp: 0 }];
+    store.set(V2, JSON.stringify(stored));
+    const create = vi.spyOn(ptyClient, 'createSession').mockRejectedValue(new Error('Delivery unknown'));
+    const ensure = vi.spyOn(ptyClient, 'ensureSession').mockImplementation(() => {});
+    const { result } = renderHook(() => useWorkspaceSet());
+    const before = result.current.activeNode;
+    await act(async () => { await result.current.handleReviveNode('n1'); });
+    expect(result.current.activeNode).toEqual(before);
+    expect(create).toHaveBeenCalledExactlyOnceWith(expect.not.stringMatching(/^n1$/), BOOTSTRAP_COLS, BOOTSTRAP_ROWS, '/home/u/proj');
+    expect(ensure).not.toHaveBeenCalled();
+  });
+  it('replaces only the original cached pane after confirmed Create even if workspace focus moves', async () => {
+    store.set(V2, storedSet());
+    let confirm!: (incarnation: string) => void;
+    const create = vi.spyOn(ptyClient, 'createSession').mockReturnValue(new Promise(resolve => { confirm = resolve; }));
+    vi.spyOn(ptyClient, 'ensureSession').mockImplementation(() => {});
+    const { result } = renderHook(() => useWorkspaceSet());
+    const before = result.current.activeNode;
+    let pending!: Promise<void>;
+    act(() => { pending = Promise.resolve(result.current.handleReviveNode('n1')); });
+    expect(result.current.activeNode).toBe(before);
+    act(() => { result.current.handleReviveNode('n1'); result.current.handleOpenWorkspaceFolder('/visible'); });
+    const visible = result.current.workspaceSet.activeWorkspaceId;
+    expect(create).toHaveBeenCalledTimes(1);
+    await act(async () => { confirm('a'.repeat(32)); await pending; });
+    const originalWorkspace = result.current.workspaceSet.workspaces.find(w => w.id === 'w')!;
+    const id = create.mock.calls[0][0];
+    expect(id).not.toBe('n1');
+    expect(originalWorkspace.nodes.n1).toBeUndefined();
+    expect(originalWorkspace.nodes[id]).toMatchObject({ incarnation: 'a'.repeat(32), tuiLines: [], agentState: 'unknown', cwd: '/home/u/proj', number: 1 });
+    expect(leafSessionIds(originalWorkspace.groups[0].paneTree!)).toEqual([id]);
+    expect(result.current.workspaceSet.activeWorkspaceId).toBe(visible);
+  });
+  it('binds exact restored incarnations in background and parked workspaces before focus, never scratchpads or legacy ids', async () => {
+    const data = JSON.parse(storedSet());
+    data.workspaces[0].nodes.n1.incarnation = '1'.repeat(32);
+    const background = structuredClone(data.workspaces[0]);
+    background.id = 'background';
+    background.nodes = {
+      parked: { ...background.nodes.n1, id: 'parked', parked: true },
+      scratch: { ...background.nodes.n1, id: 'scratch', kind: 'scratchpad' },
+      legacy: { ...background.nodes.n1, id: 'legacy', incarnation: undefined },
+    };
+    background.groups[0].nodeIds = ['scratch']; background.groups[0].activeNodeId = 'scratch';
+    background.groups[0].paneTree = { type: 'leaf', sessionId: 'scratch' };
+    data.workspaces.push(background); store.set(V2, JSON.stringify(data));
+    const connected = vi.spyOn(ptyClient, 'getIsConnected').mockReturnValue(true);
+    const listing = vi.spyOn(ptyClient, 'listSessions').mockResolvedValue({ request_id: 'fixture', sessions:
+      ['n1', 'parked', 'scratch', 'legacy'].map(id => ({ id, incarnation: '1'.repeat(32), durable: true })) });
+    const bind = vi.spyOn(ptyClient, 'bindExisting').mockReturnValue(true);
+    const create = vi.spyOn(ptyClient, 'createSession');
+    try {
+      const { result, unmount } = renderHook(() => useWorkspaceSet());
+      await waitFor(() => expect(bind).toHaveBeenCalledWith('parked', '1'.repeat(32)));
+      expect(bind).toHaveBeenCalledWith('n1', '1'.repeat(32));
+      expect(bind.mock.calls.map(args => args[0])).not.toContain('scratch');
+      expect(bind.mock.calls.map(args => args[0])).not.toContain('legacy');
+      expect(result.current.activeNode.id).toBe('n1'); expect(create).not.toHaveBeenCalled();
+      expect(result.current.bindingFor('legacy')).toBe('snapshot'); unmount();
+    } finally { connected.mockRestore(); listing.mockRestore(); bind.mockRestore(); create.mockRestore(); }
+  });
   it('repairs duplicate restored numbers while preserving already unique slots', () => {
     const stored = JSON.parse(storedSet());
     const other = structuredClone(stored.workspaces[0]);
@@ -103,16 +227,51 @@ describe('first-run workspace choice', () => {
     act(() => { replacement = result.current.handleCreateNode('g'); });
     expect(leafSessionIds(result.current.activeGroup.paneTree!)).toEqual(['n1', replacement!]);
   });
-  it('does not kill sessions when closing the last workspace is refused', () => {
+  it('does not kill sessions when closing the last workspace is refused', async () => {
     store.set(V2, storedSet());
-    const kill = vi.spyOn(ptyClient, 'killSession').mockImplementation(() => {});
+    const kill = vi.spyOn(ptyClient, 'killSession').mockResolvedValue(false);
     try {
       const { result } = renderHook(() => useWorkspaceSet());
-      act(() => result.current.handleCloseWorkspace('w'));
+      await act(async () => { await result.current.handleCloseWorkspace('w'); });
       expect(result.current.workspace.id).toBe('w');
       expect(result.current.activeNode.id).toBe('n1');
       expect(kill).not.toHaveBeenCalled();
     } finally { kill.mockRestore(); }
+  });
+  it('keeps a node and its cached lines when an explicit Kill is refused or uncertain', async () => {
+    store.set(V2, storedSet());
+    vi.spyOn(ptyClient, 'killSession').mockResolvedValue(false);
+    const create = vi.spyOn(ptyClient, 'createSession');
+    const { result } = renderHook(() => useWorkspaceSet());
+    await act(async () => { await result.current.handleKillNode('n1'); });
+    expect(result.current.workspace.nodes.n1).toBeDefined();
+    expect(create).not.toHaveBeenCalled();
+  });
+  it('waits for Kill confirmation and removes only the original workspace node if focus moves', async () => {
+    store.set(V2, storedSet());
+    let confirm!: (value: boolean) => void;
+    vi.spyOn(ptyClient, 'killSession').mockImplementation(() => new Promise(resolve => { confirm = resolve; }));
+    const { result } = renderHook(() => useWorkspaceSet());
+    let killing: unknown;
+    act(() => { killing = result.current.handleKillNode('n1'); });
+    const retainedWhilePending = result.current.workspace.nodes.n1;
+    act(() => result.current.handleOpenWorkspaceFolder('/other'));
+    const active = result.current.workspace.id;
+    await act(async () => { confirm(true); await killing; });
+    expect(retainedWhilePending).toBeDefined();
+    expect(result.current.workspace.id).toBe(active);
+    const originalWorkspace = result.current.workspaceSet.workspaces.find(candidate => candidate.id === 'w')!;
+    expect(originalWorkspace.nodes.n1).toBeUndefined();
+    expect(Object.values(originalWorkspace.nodes)).toHaveLength(1);
+    expect(Object.values(originalWorkspace.nodes)[0].cwd).toBe('/home/u/proj');
+  });
+  it('retains an entire workspace when any of its Kill confirmations fails', async () => {
+    store.set(V2, storedSet());
+    vi.spyOn(ptyClient, 'killSession').mockResolvedValue(false);
+    const { result } = renderHook(() => useWorkspaceSet());
+    act(() => result.current.handleOpenWorkspaceFolder('/other'));
+    await act(async () => { await result.current.handleCloseWorkspace('w'); });
+    expect(result.current.workspaceSet.workspaces.some(candidate => candidate.id === 'w')).toBe(true);
   });
   it('selects a session in its owning workspace without adding it to the foreground group', () => {
     store.set(V2, storedSet());
@@ -136,16 +295,25 @@ describe('first-run workspace choice', () => {
       usePtyEvents(workspaces.setEventWorkspace, setTelemetry);
       return workspaces;
     });
-    const receive = (event: string) => (ptyClient as unknown as {
-      handleServerMessage: (message: unknown) => void;
-    }).handleServerMessage({ event: 'PtyEvent', data: { session_id: 'n1', event: { type: event } } });
+    // Test the hook's already-applied stream projection. Parser ordering and
+    // socket ownership are exercised by the public client transport suites.
+    let sequence = 0;
+    const receive = (event: 'PromptStart' | 'CommandStart' | 'ExecutionStart') => ptyHandler!.onStreamRecord?.({
+      session_id: 'n1', incarnation: '1'.repeat(32), stream_epoch: '2'.repeat(32), sequence: String(++sequence), observed_micros: sequence,
+      payload: { type: 'Event', payload: { type: event } },
+    }, { phase: 'live', eventId: 'fixture/' + sequence, clockEpoch: '3'.repeat(32), observedMicros: sequence,
+      state: { atPrompt: event !== 'ExecutionStart', closed: false, completedCommands: 0, lastExecutionDurationMs: null,
+        lastExitCode: null, cwd: null, agentState: 'idle', isTuiActive: false } });
     act(() => { receive('PromptStart'); receive('CommandStart'); });
     expect(closeDisposition(result.current.activeNode)).toBe('kill');
     act(() => receive('ExecutionStart'));
     expect(closeDisposition(result.current.activeNode)).toBe('confirm');
   });
   it('routes background workspace events without changing focus or visible telemetry', () => {
-    store.set(V2, storedSet());
+    ptyClient.bindExisting('n1', '1'.repeat(32));
+    const stored = JSON.parse(storedSet());
+    stored.workspaces[0].nodes.n1.incarnation = '1'.repeat(32);
+    store.set(V2, JSON.stringify(stored));
     const { result } = renderHook(() => {
       const workspaces = useWorkspaceSet();
       const [telemetry, setTelemetry] = useState<AppTelemetry>({ cwd: '/visible' });
@@ -155,12 +323,12 @@ describe('first-run workspace choice', () => {
     act(() => result.current.handleOpenWorkspaceFolder('/visible'));
     const activeId = result.current.activeNode.id;
     ptyClient.setActiveSession(activeId);
-    const receive = (message: unknown) => (ptyClient as unknown as {
-      handleServerMessage: (message: unknown) => void;
-    }).handleServerMessage(message);
+    const receive = (message: { event: string; data: unknown }) => (ptyClient as unknown as {
+      handleServerMessage: (event: string, data: unknown) => void;
+    }).handleServerMessage(message.event, message.data);
     act(() => {
-      receive({ event: 'AgentEvent', data: { agent: 'claude', event: 'PermissionRequest', doom_session_id: 'n1', cwd: '/home/u/proj' } });
-      receive({ event: 'Telemetry', data: { session_id: 'n1', current_dir: '/home/u/proj/sub', git_branch: 'feature/observed', agent_key: 'claude', isolation: 'host' } });
+      receive({ event: 'AgentEvent', data: { agent: 'claude', event: 'PermissionRequest', doom_session_id: 'n1', cwd: '/home/u/proj', incarnation: '1'.repeat(32), event_id: 'a'.repeat(32), phase: 'catch-up' } });
+      receive({ event: 'Telemetry', data: { session_id: 'n1', incarnation: '1'.repeat(32), current_dir: '/home/u/proj/sub', git_branch: 'feature/observed', agent_key: 'claude', isolation: 'host' } });
     });
     const background = result.current.workspaceSet.workspaces.find((w) => w.id === 'w')!.nodes.n1;
     expect(background.blockedOnUser).toBe(true);
@@ -168,8 +336,71 @@ describe('first-run workspace choice', () => {
     expect(background.cwd).toBe('/home/u/proj/sub');
     expect(result.current.activeNode.id).toBe(activeId);
     expect(result.current.telemetry.cwd).toBe('/visible');
-    act(() => receive({ event: 'SessionClosed', data: { session_id: 'n1' } }));
+    act(() => ptyHandler!.onSessionClosed?.('n1'));
     expect(result.current.workspaceSet.workspaces.find((w) => w.id === 'w')!.nodes.n1.exited).toBe(true);
+  });
+  it('clears stale observed telemetry when the exact active process becomes unavailable', () => {
+    ptyClient.bindExisting('n1', '1'.repeat(32));
+    const stored = JSON.parse(storedSet());
+    stored.workspaces[0].nodes.n1.incarnation = '1'.repeat(32);
+    store.set(V2, JSON.stringify(stored));
+    const { result } = renderHook(() => {
+      const workspaces = useWorkspaceSet();
+      const [telemetry, setTelemetry] = useState<AppTelemetry>({
+        sessionId: 'n1', cwd: '/stale', branch: 'stale', isolation: 'host', agent: 'claude',
+        agentName: 'CLAUDE', model: 'stale-model', contextUsed: 0.75, rateUsed: 0.5,
+        chips: [true, false, true], pendingApproval: true,
+      });
+      usePtyEvents(workspaces.setEventWorkspace, setTelemetry);
+      return { ...workspaces, telemetry };
+    });
+    ptyClient.setActiveSession('n1');
+    const receive = (event: string, data: unknown) => (ptyClient as unknown as {
+      handleServerMessage: (event: string, data: unknown) => void;
+    }).handleServerMessage(event, data);
+    act(() => receive('TelemetryUnavailable', { session_id: 'n1', incarnation: '2'.repeat(32) }));
+    expect(result.current.telemetry.contextUsed).toBe(0.75);
+    act(() => receive('TelemetryUnavailable', { session_id: 'n1', incarnation: '1'.repeat(32) }));
+    expect(result.current.telemetry).toMatchObject({ sessionId: 'n1', chips: [true, false, true], pendingApproval: true });
+    expect(result.current.telemetry).not.toHaveProperty('cwd');
+    expect(result.current.telemetry).not.toHaveProperty('branch');
+    expect(result.current.telemetry).not.toHaveProperty('agent');
+    expect(result.current.telemetry).not.toHaveProperty('model');
+    expect(result.current.telemetry).not.toHaveProperty('contextUsed');
+    expect(result.current.telemetry).not.toHaveProperty('rateUsed');
+  });
+  it('restores hook state without counting an ask and counts a new live source only once', () => {
+    const stored = JSON.parse(storedSet());
+    stored.workspaces[0].nodes.n1.incarnation = '1'.repeat(32);
+    stored.workspaces[0].nodes.n1.attentionSerial = 3;
+    store.set(V2, JSON.stringify(stored));
+    const { result } = renderHook(() => {
+      const workspace = useWorkspaceSet();
+      const [, setTelemetry] = useState<AppTelemetry>({});
+      usePtyEvents(workspace.setEventWorkspace, setTelemetry);
+      return workspace;
+    });
+    const restored = { agent: 'claude', event: 'PermissionRequest' as const, doomSessionId: 'n1', cwd: null,
+      incarnation: '1'.repeat(32), eventId: 'a'.repeat(32), phase: 'catch-up' as const };
+    // Storage is presentation-only. Replaying a hook must also preserve a
+    // count already observed in this live run, not revive one from disk.
+    expect(result.current.activeNode.attentionSerial).toBeUndefined();
+    act(() => result.current.setWorkspace(previous => ({ ...previous,
+      nodes: { ...previous.nodes, n1: { ...previous.nodes.n1, attentionSerial: 3 } } })));
+    act(() => ptyHandler!.onAgentEvent?.(restored));
+    expect(result.current.activeNode.blockedOnUser).toBe(true);
+    expect(result.current.activeNode.attentionSerial).toBe(3);
+    expect(result.current.activeNode.lastLiveAskEventId).toBeUndefined();
+    act(() => ptyHandler!.onAgentEvent?.(restored));
+    expect(result.current.activeNode.attentionSerial).toBe(3);
+    act(() => ptyHandler!.onAgentEvent?.({ ...restored, event: 'Stop', eventId: 'b'.repeat(32) }));
+    expect(result.current.activeNode.blockedOnUser).toBe(false);
+    const live = { ...restored, phase: 'live' as const, eventId: 'c'.repeat(32) };
+    act(() => { ptyHandler!.onAgentEvent?.(live); ptyHandler!.onAgentEvent?.(live); });
+    expect(result.current.activeNode.attentionSerial).toBe(4);
+    expect(result.current.activeNode.lastLiveAskEventId).toBe(live.eventId);
+    act(() => ptyHandler!.onAgentEvent?.({ ...live, event: 'Stop', incarnation: '2'.repeat(32) }));
+    expect(result.current.activeNode.blockedOnUser).toBe(true);
   });
   it('asks where to open when there is nothing to restore', () => {
     const { result } = renderHook(() => useWorkspaceSet());

@@ -16,9 +16,10 @@ import { disposeActivity } from '../core/activityMonitor';
 import { attentionQueue } from '../core/attentionQueue';
 import { ptyClient } from '../core/ptyClient';
 import { audioEngine } from '../core/audioEngine';
-import { equalizeTree, paneLeaf, removeLeaf, splitLeaf, treeForSelection, treeFromLayout } from '../core/paneTree';
+import { placeRecoveredSession } from '../core/recoveryPlacement';
+import { equalizeTree, paneLeaf, removeLeaf, replaceLeaf, splitLeaf, treeForSelection, treeFromLayout } from '../core/paneTree';
 import {
-  reconcileSessions, sessionBinding, type RecoverableSession, type RecoveryState,
+  knownIncarnation, reconcileSessions, sessionBinding, type RecoverableSession, type RecoveryState,
 } from '../core/sessionRecovery';
 
 /**
@@ -60,6 +61,8 @@ export function useWorkspaceSet() {
    * shell wearing its scrollback.
    */
   const [reconciled, setReconciled] = useState(false);
+  const pendingClosures = useRef(new Set<string>());
+  const pendingRecoveries = useRef(new Set<string>());
   /**
    * The ids that came off disk at boot, captured before anything can add to
    * them. A session created later in this run has no stored state to lose and
@@ -123,18 +126,27 @@ export function useWorkspaceSet() {
 
   useEffect(() => {
     let disposed = false;
+    let refreshing = false;
     const refresh = async () => {
-      if (!ptyClient.getIsConnected()) return;
+      if (refreshing || !ptyClient.getIsConnected()) return;
+      refreshing = true;
       try {
         const listing = await ptyClient.listSessions();
         if (disposed) return;
-        const storedIds = workspaceSetRef.current.workspaces.flatMap((candidate) =>
-          Object.keys(candidate.nodes)
-        );
-        const next = reconcileSessions(storedIds, listing.sessions);
+        const nodes = workspaceSetRef.current.workspaces.flatMap(candidate => Object.values(candidate.nodes))
+          .filter(node => node.kind !== 'scratchpad' && !node.snapshotOf);
+        const next = reconcileSessions(nodes, listing.sessions, !listing.discovery_error);
         setRecoveryState((previous) =>
           JSON.stringify(previous) === JSON.stringify(next) ? previous : next
         );
+        // Routing is independent of focus and pane geometry: parked sessions
+        // are still known nodes and must keep receiving live events.
+        for (const node of nodes) {
+          if (next.matched.includes(node.id) && knownIncarnation(node.incarnation)) {
+            ptyClient.setCachedHistoryBudget(node.id, node.tuiLines);
+            ptyClient.bindExisting(node.id, node.incarnation);
+          }
+        }
         // Only after a reply that actually described the daemon. A failed or
         // timed-out request must keep restored ids waiting rather than release
         // them to spawn — see the catch below.
@@ -142,8 +154,12 @@ export function useWorkspaceSet() {
       } catch {
         // A daemon restart is normal. The next interval asks again; recovery
         // never turns a missing reply into an automatic spawn.
-      }
+      } finally { refreshing = false; }
     };
+    const unbindConnection = ptyClient.onConnection(state => {
+      if (state.status === 'ready') void refresh();
+      else setReconciled(false);
+    });
     void refresh();
     // Longer than the request's 5 s timeout, so an unresponsive daemon cannot
     // accumulate overlapping recovery requests.
@@ -151,8 +167,31 @@ export function useWorkspaceSet() {
     return () => {
       disposed = true;
       window.clearInterval(timer);
+      unbindConnection();
     };
   }, []);
+
+  useEffect(() => ptyClient.onIncarnation((id, incarnation) => {
+    setEventWorkspace(previous => {
+      const node = previous.nodes[id];
+      if (!node || node.snapshotOf || node.incarnation === incarnation) return previous;
+      return { ...previous, nodes: { ...previous.nodes, [id]: { ...node, incarnation } } };
+    });
+  }), [setEventWorkspace]);
+
+  useEffect(() => {
+    if (needsWorkspaceChoice) return;
+    // Only nodes introduced by this run can request creation. Restored nodes
+    // must pass exact-incarnation reconciliation above, even when selected.
+    for (const candidate of workspaceSet.workspaces) {
+      for (const node of Object.values(candidate.nodes)) {
+        if (node.kind !== 'scratchpad' && !node.snapshotOf && !restoredIds.current.has(node.id)) {
+          ptyClient.setCachedHistoryBudget(node.id, node.tuiLines);
+          ptyClient.ensureSession(node.id, node.cwd, node.incarnation);
+        }
+      }
+    }
+  }, [workspaceSet, needsWorkspaceChoice]);
 
   const handleCreateNode = (
     groupId: string,
@@ -280,14 +319,33 @@ export function useWorkspaceSet() {
       : prev);
   };
 
-  const handleCloseWorkspace = (id: string) => {
-    // Match closeWorkspace's last-workspace guard before touching any PTY.
-    if (workspaceSet.workspaces.length <= 1) return;
-    const closing = workspaceSet.workspaces.find((w) => w.id === id);
-    Object.values(closing?.nodes ?? {}).forEach((node) => {
-      if (node.kind !== 'scratchpad') ptyClient.killSession(node.id);
-    });
-    setWorkspaceSet((prev) => closeWorkspace(prev, id));
+  const cachedOnly = (node: SessionNode): boolean => {
+    const status = ptyClient.getAttachmentState(node.id)?.status;
+    return !!node.snapshotOf || node.kind === 'scratchpad' || status === 'closed' || status === 'missing' || status === 'replaced'
+      || (restoredIds.current.has(node.id) && reconciled && recoveryState.snapshots.includes(node.id));
+  };
+
+  const handleCloseWorkspace = async (id: string) => {
+    const current = workspaceSetRef.current;
+    if (current.workspaces.length <= 1) return;
+    const closing = current.workspaces.find(candidate => candidate.id === id);
+    if (!closing) return;
+    const nodes = Object.values(closing.nodes);
+    if (nodes.some(node => pendingClosures.current.has(node.id))) return;
+    nodes.forEach(node => pendingClosures.current.add(node.id));
+    try {
+      const results = await Promise.all(nodes.map(node => cachedOnly(node) ? true : ptyClient.killSession(node.id)));
+      if (results.some(result => !result)) return; // Preserve every uncertain cache.
+      const latest = workspaceSetRef.current;
+      const target = latest.workspaces.find(candidate => candidate.id === id);
+      if (!target || latest.workspaces.length <= 1 || Object.keys(target.nodes).length !== nodes.length
+          || nodes.some(node => !target.nodes[node.id] || target.nodes[node.id].incarnation !== node.incarnation)) return;
+      nodes.forEach(node => {
+        ptyClient.forgetSession(node.id); disposeEmulator(node.id);
+        disposeActivity(node.id); attentionQueue.dispose(node.id);
+      });
+      setWorkspaceSet(previous => closeWorkspace(previous, id));
+    } finally { nodes.forEach(node => pendingClosures.current.delete(node.id)); }
   };
 
   const handleSelectNode = (nodeId: string, groupId?: string) => {
@@ -326,53 +384,41 @@ export function useWorkspaceSet() {
   /** Restoring is selecting: it re-enters geometry and takes keyboard focus. */
   const handleRestoreNode = (nodeId: string) => handleSelectNode(nodeId);
 
-  const handleRecoverSession = (session: RecoverableSession) => {
-    if (workspace.nodes[session.id]) {
-      handleSelectNode(session.id);
-      return;
-    }
-    const group = activeGroup;
-    const recovered: SessionNode = {
-      id: session.id,
-      groupId: group.id,
-      title: derivedSessionTitle(session.cwd || '~', ''),
-      number: nextSessionNumber(
-        workspaceSet.workspaces.flatMap(w => Object.values(w.nodes)).map((node) => node.number).filter((n): n is number => n !== null),
-      ),
-      kind: 'terminal',
-      cwd: session.cwd || '~',
-      gitBranch: '',
-      activeBlockId: null,
-      isTuiActive: false,
-      agentState: 'idle',
-      tuiLines: [],
-      commandHistory: [],
-      createdAt: Date.now(),
-      lastUsedAt: Date.now(),
-    };
-    setWorkspace((prev) => ({
-      ...prev,
-      activeGroupId: group.id,
-      groups: prev.groups.map((candidate) => {
-        if (candidate.id !== group.id) return candidate;
-        const base = candidate.paneTree ?? paneLeaf(candidate.activeNodeId);
-        return {
-          ...candidate,
-          activeNodeId: session.id,
-          nodeIds: [...candidate.nodeIds, session.id],
-          paneTree: splitLeaf(base, candidate.activeNodeId, session.id, 'row'),
-        };
-      }),
-      nodes: { ...prev.nodes, [session.id]: recovered },
-    }));
-    // Spawn is attach-or-create. For a listed tmux id this attaches and replays
-    // its buffer; it never re-executes the command reported by ListSessions.
-    ptyClient.ensureSession(session.id, recovered.cwd);
-    setRecoveryState((previous) => ({
-      ...previous,
-      matched: [...previous.matched, session.id],
-      recoverable: previous.recoverable.filter((candidate) => candidate.id !== session.id),
-    }));
+  const handleRecoverSession = async (session: RecoverableSession) => {
+    if (pendingRecoveries.current.has(session.id) || pendingClosures.current.has(session.id)) return;
+    const workspaceId = workspace.id;
+    const groupId = activeGroup.id;
+    pendingRecoveries.current.add(session.id);
+    try {
+      const incarnation = session.identity_status === 'unidentified'
+        ? await ptyClient.recoverLegacy(session)
+        : session.identity_status !== 'replaced' && knownIncarnation(session.incarnation) ? session.incarnation : null;
+      if (!incarnation) return; // A partial or replaced metadata record is not permission to adopt it.
+      const current = workspaceSetRef.current;
+      const existing = current.workspaces.find(w => w.nodes[session.id])?.nodes[session.id];
+      if (existing?.incarnation === incarnation && !existing.snapshotOf) {
+        ptyClient.bindExisting(session.id, incarnation);
+        handleSelectNode(session.id); return;
+      }
+      const snapshotId = uniqueId('snapshot');
+      const now = Date.now();
+      if (placeRecoveredSession(current, workspaceId, groupId, session, incarnation, snapshotId, now) === current) return;
+      // Copy the old presentation before disposing its parser. Never kill the
+      // old root, run the reported command, or submit a creation request here.
+      ptyClient.forgetSession(session.id); disposeEmulator(session.id);
+      disposeActivity(session.id); attentionQueue.dispose(session.id);
+      restoredIds.current.delete(session.id);
+      setWorkspaceSet(previous => placeRecoveredSession(previous, workspaceId, groupId, session, incarnation, snapshotId, now));
+      ptyClient.bindExisting(session.id, incarnation);
+      setRecoveryState(previous => ({ ...previous,
+        matched: [...previous.matched.filter(id => id !== session.id), session.id],
+        snapshots: previous.snapshots.filter(id => id !== session.id),
+        recoverable: previous.recoverable.filter(candidate => candidate.id !== session.id || candidate.incarnation !== session.incarnation),
+      }));
+    } catch {
+      // Identity assignment may have completed. Discovery is read-only; neither
+      // this catch nor reconnect retries adoption or changes the saved cache.
+    } finally { pendingRecoveries.current.delete(session.id); }
   };
 
   const handleSetGroupLayout = (groupId: string, layout: SplitLayoutMode) => {
@@ -451,50 +497,54 @@ export function useWorkspaceSet() {
     ptyClient.setActiveSession(fallback);
   };
 
-  const handleKillNode = (nodeId: string) => {
-    // Closing the last session used to be refused outright, which left Ctrl+W
-    // silently doing nothing and no way at all to restart a wedged shell — and
-    // with the tab strip gone there is no × to fall back on either. There must
-    // always be somewhere to type, so replace it rather than refuse: open a
-    // fresh session first, then close this one.
-    const group = workspace.groups.find((candidate) => candidate.id === workspace.nodes[nodeId]?.groupId);
-    if (group && group.nodeIds.length <= 1 && !workspace.nodes[nodeId]?.parked) {
-      handleCreateNode(group.id, 'terminal');
-    }
-
-    ptyClient.killSession(nodeId);
-    disposeEmulator(nodeId);
-    disposeActivity(nodeId);
-    attentionQueue.dispose(nodeId);
-
-    setWorkspace((prev) => {
-      const nextNodes = { ...prev.nodes };
-      delete nextNodes[nodeId];
-
-      const nextGroups = prev.groups
-        .map((g) => {
-          const filtered = g.nodeIds.filter((id) => id !== nodeId);
-          return {
-            ...g,
-            nodeIds: filtered,
-            activeNodeId: g.activeNodeId === nodeId ? filtered[0] || '' : g.activeNodeId,
-            paneTree: g.paneTree ? removeLeaf(g.paneTree, nodeId) ?? undefined : undefined,
-            zoomedSessionId: g.zoomedSessionId === nodeId ? undefined : g.zoomedSessionId,
+  const handleKillNode = async (nodeId: string) => {
+    const owner = workspaceSetRef.current.workspaces.find(candidate => candidate.nodes[nodeId]);
+    const original = owner?.nodes[nodeId];
+    if (!owner || !original || pendingClosures.current.has(nodeId)) return;
+    pendingClosures.current.add(nodeId);
+    try {
+      if (!cachedOnly(original) && !await ptyClient.killSession(nodeId)) return;
+      const latest = workspaceSetRef.current.workspaces.find(candidate => candidate.id === owner.id)?.nodes[nodeId];
+      if (!latest || latest.incarnation !== original.incarnation) return;
+      // No optimistic cache deletion, replacement spawn or active-workspace
+      // mutation while the correlated lifecycle result is still unknown.
+      ptyClient.forgetSession(nodeId);
+      disposeEmulator(nodeId); disposeActivity(nodeId); attentionQueue.dispose(nodeId);
+      const replacementId = uniqueId('node');
+      const replacementCreatedAt = Date.now();
+      setWorkspaceSet(previous => {
+        const workspace = previous.workspaces.find(candidate => candidate.id === owner.id);
+        const node = workspace?.nodes[nodeId];
+        if (!workspace || !node || node.incarnation !== original.incarnation) return previous;
+        const group = workspace.groups.find(candidate => candidate.id === node.groupId);
+        const needsReplacement = !!group?.nodeIds.includes(nodeId) && group.nodeIds.length === 1;
+        const nodes = { ...workspace.nodes }; delete nodes[nodeId];
+        if (needsReplacement) {
+          nodes[replacementId] = {
+            id: replacementId, groupId: node.groupId, title: derivedSessionTitle(node.cwd, ''),
+            number: nextSessionNumber(previous.workspaces.flatMap(candidate => Object.values(candidate.nodes))
+              .filter(candidate => candidate.id !== nodeId).map(candidate => candidate.number).filter((number): number is number => number !== null)),
+            kind: 'terminal', cwd: node.cwd, gitBranch: '', activeBlockId: null,
+            isTuiActive: false, agentState: 'unknown', tuiLines: [], commandHistory: [], createdAt: replacementCreatedAt,
           };
-        })
-        .filter((g) => g.nodeIds.length > 0);
-
-      const nextActiveGroupId = nextGroups.some((g) => g.id === prev.activeGroupId)
-        ? prev.activeGroupId
-        : nextGroups[0]?.id || '';
-
-      return {
-        ...prev,
-        activeGroupId: nextActiveGroupId,
-        groups: nextGroups,
-        nodes: nextNodes,
-      };
-    });
+        }
+        const groups = workspace.groups.map(candidate => {
+          const ids = candidate.nodeIds.filter(id => id !== nodeId);
+          if (needsReplacement && candidate.id === node.groupId) ids.push(replacementId);
+          return {
+            ...candidate, nodeIds: ids,
+            activeNodeId: candidate.activeNodeId === nodeId ? ids[0] ?? '' : candidate.activeNodeId,
+            paneTree: needsReplacement && candidate.id === node.groupId ? paneLeaf(replacementId)
+              : candidate.paneTree ? removeLeaf(candidate.paneTree, nodeId) ?? undefined : undefined,
+            zoomedSessionId: candidate.zoomedSessionId === nodeId ? undefined : candidate.zoomedSessionId,
+          };
+        }).filter(candidate => candidate.nodeIds.length > 0);
+        return replaceWorkspace(previous, {
+          ...workspace, nodes, groups,
+          activeGroupId: groups.some(candidate => candidate.id === workspace.activeGroupId) ? workspace.activeGroupId : groups[0]?.id ?? '',
+        });
+      });
+    } finally { pendingClosures.current.delete(nodeId); }
   };
 
   /**
@@ -503,40 +553,56 @@ export function useWorkspaceSet() {
    */
   const bindingFor = useCallback(
     (nodeId: string) =>
-      sessionBinding(nodeId, restoredIds.current.has(nodeId), reconciled, recoveryState),
-    [reconciled, recoveryState],
+      workspaceSet.workspaces.some(w => w.nodes[nodeId]?.snapshotOf) ? 'snapshot'
+        : sessionBinding(nodeId, restoredIds.current.has(nodeId), reconciled, recoveryState),
+    [workspaceSet, reconciled, recoveryState],
   );
 
-  /**
-   * Start a fresh process under a snapshot's id, because the user asked.
-   *
-   * The deliberate action the automatic spawn used to perform silently. The
-   * cached lines are cleared with it: keeping a dead session's scrollback above
-   * a new shell's first prompt is exactly the dishonest presentation this
-   * whole path exists to stop.
-   */
-  const handleReviveNode = useCallback((nodeId: string) => {
-    restoredIds.current.delete(nodeId);
-    setRecoveryState((previous) => ({
-      ...previous,
-      snapshots: previous.snapshots.filter((id) => id !== nodeId),
-    }));
-    setWorkspace((prev) => {
-      const target = prev.nodes[nodeId];
-      if (!target) return prev;
-      return {
-        ...prev,
-        nodes: {
-          ...prev.nodes,
-          [nodeId]: { ...target, tuiLines: [], cursor: undefined, exited: false },
-        },
-      };
-    });
-    const cwd = workspaceSetRef.current.workspaces
-      .flatMap((candidate) => Object.values(candidate.nodes))
-      .find((node) => node.id === nodeId)?.cwd;
-    ptyClient.ensureSession(nodeId, cwd);
-  }, [setWorkspace]);
+  /** Explicit fresh creation has a fresh logical id. Keep the original cache
+   * and layout until the daemon confirms it; unknown outcomes are discoverable
+   * processes, never a reason to retry or erase the old view. */
+  const handleReviveNode = useCallback(async (nodeId: string) => {
+    const owner = workspaceSetRef.current.workspaces.find(candidate => candidate.nodes[nodeId]);
+    const original = owner?.nodes[nodeId];
+    if (!owner || !original || original.kind === 'scratchpad' || pendingClosures.current.has(nodeId)) return;
+    const status = ptyClient.getAttachmentState(nodeId)?.status;
+    if (status && !['missing', 'closed', 'replaced', 'disconnected', 'failed', 'incompatible'].includes(status)) return;
+    pendingClosures.current.add(nodeId);
+    const freshId = uniqueId('node');
+    const createdAt = Date.now();
+    try {
+      const incarnation = await ptyClient.createSession(freshId, BOOTSTRAP_COLS, BOOTSTRAP_ROWS, original.cwd);
+      const latest = workspaceSetRef.current.workspaces.find(candidate => candidate.id === owner.id)?.nodes[nodeId];
+      if (!latest || latest.incarnation !== original.incarnation) return;
+      ptyClient.forgetSession(nodeId);
+      disposeEmulator(nodeId); disposeActivity(nodeId); attentionQueue.dispose(nodeId);
+      restoredIds.current.delete(nodeId);
+      setWorkspaceSet(previous => {
+        const workspace = previous.workspaces.find(candidate => candidate.id === owner.id);
+        const old = workspace?.nodes[nodeId];
+        if (!workspace || !old || old.incarnation !== original.incarnation) return previous;
+        const nodes = { ...workspace.nodes }; delete nodes[nodeId];
+        nodes[freshId] = {
+          id: freshId, incarnation, groupId: old.groupId, title: old.title, number: old.number,
+          kind: 'terminal', cwd: old.cwd, gitBranch: '', activeBlockId: null, isTuiActive: false,
+          agentState: 'unknown', tuiLines: [], commandHistory: [], createdAt, parked: old.parked,
+        };
+        return replaceWorkspace(previous, { ...workspace, nodes, groups: workspace.groups.map(group => ({
+          ...group, nodeIds: group.nodeIds.map(id => id === nodeId ? freshId : id),
+          activeNodeId: group.activeNodeId === nodeId ? freshId : group.activeNodeId,
+          paneTree: group.paneTree ? replaceLeaf(group.paneTree, nodeId, freshId) : undefined,
+          zoomedSessionId: group.zoomedSessionId === nodeId ? freshId : group.zoomedSessionId,
+        })) });
+      });
+      setRecoveryState(previous => ({ ...previous,
+        snapshots: previous.snapshots.filter(id => id !== nodeId),
+        matched: previous.matched.filter(id => id !== nodeId),
+      }));
+    } catch {
+      // PtyClient reports refusal/uncertainty on the existing transient surface.
+      // The cached node, history and selection remain exactly as they were.
+    } finally { pendingClosures.current.delete(nodeId); }
+  }, []);
 
   return {
     workspaceSet,

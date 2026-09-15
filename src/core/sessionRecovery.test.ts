@@ -4,12 +4,13 @@ import {
 } from './sessionRecovery';
 
 const live = (id: string): RecoverableSession => ({
-  id, cwd: `/repo/${id}`, command: 'bash', durable: true,
+  id, cwd: `/repo/${id}`, command: 'bash', durable: true, incarnation: '1'.repeat(32),
 });
+const stored = (id: string) => ({ id, incarnation: '1'.repeat(32) });
 
 describe('reconcileSessions', () => {
   it('separates matches, daemon-only recoverables, and stored snapshots', () => {
-    expect(reconcileSessions(['kept', 'snapshot'], [live('kept'), live('orphan')])).toEqual({
+    expect(reconcileSessions([stored('kept'), stored('snapshot')], [live('kept'), live('orphan')])).toEqual({
       matched: ['kept'],
       recoverable: [live('orphan')],
       snapshots: ['snapshot'],
@@ -20,6 +21,27 @@ describe('reconcileSessions', () => {
     const rows = [live('orphan'), { ...live('orphan'), command: 'codex' }];
     expect(reconcileSessions([], rows).recoverable).toEqual([live('orphan')]);
     expect(rows).toHaveLength(2);
+  });
+
+  it('does not promote legacy id-only storage into an exact process match', () => {
+    expect(reconcileSessions(['legacy'], [live('legacy')])).toEqual({ matched: [], snapshots: ['legacy'], recoverable: [live('legacy')] });
+  });
+  it('preserves a snapshot and offers a replacement incarnation separately', () => {
+    const replacement = { ...live('kept'), incarnation: '2'.repeat(32) };
+    expect(reconcileSessions([stored('kept')], [replacement])).toEqual({ matched: [], snapshots: ['kept'], recoverable: [replacement] });
+  });
+  it('does not guess when discovery contains conflicting identities under one logical id', () => {
+    const rows = [live('kept'), { ...live('kept'), incarnation: '2'.repeat(32) }];
+    expect(reconcileSessions([stored('kept')], rows)).toEqual({ matched: [], snapshots: ['kept'], recoverable: rows });
+  });
+  it('keeps unidentified durable panes as explicit recovery choices', () => {
+    const unknown = { ...live('old'), incarnation: null, identity_status: 'unidentified' as const };
+    expect(reconcileSessions([stored('old')], [unknown])).toEqual({ matched: [], snapshots: ['old'], recoverable: [unknown] });
+  });
+  it('does not turn incomplete discovery into observed absence', () => {
+    const state = reconcileSessions([stored('missing'), stored('known')], [live('known')], false);
+    expect(state.matched).toEqual(['known']); expect(state.snapshots).toEqual([]);
+    expect(sessionBinding('missing', true, true, state)).toBe('waiting');
   });
 });
 
@@ -35,13 +57,13 @@ describe('cold startup with a stored active id', () => {
   });
 
   it('presents a restored id the empty daemon does not hold as a snapshot', () => {
-    const state = reconcileSessions(['stored'], []);
+    const state = reconcileSessions([stored('stored')], []);
     expect(state.snapshots).toEqual(['stored']);
     expect(sessionBinding('stored', true, true, state)).toBe('snapshot');
   });
 
   it('binds a restored id the daemon still holds', () => {
-    const state = reconcileSessions(['stored'], [live('stored')]);
+    const state = reconcileSessions([stored('stored')], [live('stored')]);
     expect(state.matched).toEqual(['stored']);
     expect(sessionBinding('stored', true, true, state)).toBe('ready');
   });

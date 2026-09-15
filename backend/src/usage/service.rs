@@ -227,7 +227,8 @@ mod tests {
     #[test]
     #[ignore]
     fn probes_the_live_endpoint() {
-        let got = fetch_fraction().expect("the read itself failed — network, or a changed contract");
+        let got =
+            fetch_fraction().expect("the read itself failed — network, or a changed contract");
         match got {
             // Prints the fraction, never the token.
             Some(f) => {

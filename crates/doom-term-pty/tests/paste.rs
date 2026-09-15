@@ -1,8 +1,10 @@
 #![cfg(unix)]
 
-use doom_term_pty::{DemuxEvent, PtySession};
+use doom_term_pty::{
+    stream::{Sequence, StreamPayload},
+    DemuxEvent, PtySession,
+};
 use std::os::unix::fs::PermissionsExt;
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 fn isolated(test: &str, tmux: bool) -> bool {
@@ -41,7 +43,6 @@ fn isolated(test: &str, tmux: bool) -> bool {
 struct Fixture {
     session: PtySession,
     dir: tempfile::TempDir,
-    rx: mpsc::Receiver<DemuxEvent>,
 }
 
 impl Drop for Fixture {
@@ -58,20 +59,15 @@ impl Fixture {
             "#!/bin/sh\nstty raw -echo\nprintf '{mode}READY'\ndd bs=1 count={expected_len} of=received 2>/dev/null\nprintf DONE\nsleep 30\n"
         )).unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let (tx, rx) = mpsc::channel();
-        let session = PtySession::spawn(
+        let session = PtySession::create(
             id.into(),
             80,
             24,
             Some(dir.path().display().to_string()),
             Some(script.display().to_string()),
-            move |event| {
-                let _ = tx.send(event);
-            },
-            || {},
         )
         .unwrap();
-        let fixture = Self { session, dir, rx };
+        let fixture = Self { session, dir };
         fixture.wait_for("READY");
         fixture
     }
@@ -79,14 +75,19 @@ impl Fixture {
     fn wait_for(&self, marker: &str) {
         let deadline = Instant::now() + Duration::from_secs(4);
         let mut output = String::new();
+        let journal = self.session.stream();
+        let mut cursor = Sequence::default();
         while Instant::now() < deadline {
-            if let Ok(DemuxEvent::Output { data }) = self.rx.recv_timeout(Duration::from_millis(50))
-            {
-                output.push_str(&data);
-                if output.contains(marker) {
-                    return;
+            while let Some(record) = journal.read_after(cursor).unwrap() {
+                cursor = record.sequence;
+                if let StreamPayload::Event(DemuxEvent::Output { data }) = record.payload {
+                    output.push_str(&data);
                 }
             }
+            if output.contains(marker) {
+                return;
+            }
+            journal.wait_for_change(cursor, Duration::from_millis(50));
         }
         panic!("child did not report {marker}: {output:?}");
     }

@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   createDefaultWorkspace, createWorkspaceForFolder, SessionStore, backfillPaneTrees,
   backfillSessionNumbers, readStoredWorkspaceSet,
@@ -125,6 +125,43 @@ describe('stored workspaces', () => {
     const ws = createWorkspaceForFolder(path);
     return JSON.stringify({ workspaces: [ws], activeWorkspaceId: ws.id });
   };
+
+  it('persists presentation and incarnation but no live lease, parser cursor, or replayable state', () => {
+    const workspace = createDefaultWorkspace();
+    Object.assign(workspace.nodes['node-1'], { incarnation: 'a'.repeat(32), attachment_id: 'secret-lease',
+      stream_epoch: 'b'.repeat(32), appliedSequence: '123', pendingWrites: ['NEVER REPLAY'], atPrompt: true,
+      executionSerial: 12, lastLiveExecutionEventId: 'old', lastHookEventId: 'old-ask', blockedOnUser: true,
+      agentState: 'running', tuiLines: [{ id: 'line', timestamp: 1, spans: [{ text: 'CACHED OUTPUT' }] }],
+      snapshotOf: { sessionId: 'source', incarnation: 'c'.repeat(32) },
+    });
+    withLocalStorage({}, () => {
+      vi.useFakeTimers();
+      try {
+        SessionStore.saveWorkspaceSet({ workspaces: [workspace], activeWorkspaceId: workspace.id });
+        vi.advanceTimersByTime(400);
+        const saved = window.localStorage.getItem(V2)!;
+        expect(saved).not.toMatch(/attachment_id|secret-lease|stream_epoch|appliedSequence|pendingWrites|NEVER REPLAY|executionSerial|lastLiveExecutionEventId|lastHookEventId|blockedOnUser|atPrompt/);
+        const restored = readStoredWorkspaceSet()!.workspaces[0].nodes['node-1'];
+        expect(restored).toMatchObject({ incarnation: 'a'.repeat(32), agentState: 'unknown',
+          tuiLines: workspace.nodes['node-1'].tuiLines, snapshotOf: { sessionId: 'source', incarnation: 'c'.repeat(32) } });
+        expect(workspace.nodes['node-1'].agentState).toBe('running');
+      } finally { vi.useRealTimers(); }
+    });
+  });
+
+  it('sanitizes legacy caches on read and bounds retained lines without silently treating them as complete', () => {
+    const workspace = createDefaultWorkspace();
+    Object.assign(workspace.nodes['node-1'], { attachment_id: 'old-lease', appliedSequence: '100',
+      tuiLines: Array.from({ length: 5001 }, (_, i) => ({ id: String(i), timestamp: i, spans: [{ text: String(i) }] })),
+    });
+    withLocalStorage({ [V1]: JSON.stringify(workspace) }, () => {
+      const restored = readStoredWorkspaceSet()!.workspaces[0].nodes['node-1'];
+      expect(JSON.stringify(restored)).not.toMatch(/old-lease|appliedSequence/);
+      expect(restored.tuiLines).toHaveLength(5000);
+      expect(restored.tuiLines[0].id).toBe('1');
+      expect(restored.cacheTruncated).toBe(true);
+    });
+  });
 
   it('reports nothing stored when storage is unavailable', () => {
     // Same branch loadRecentWorkspaces has: no storage is not a restore.

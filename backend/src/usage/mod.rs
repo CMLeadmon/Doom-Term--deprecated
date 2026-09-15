@@ -5,7 +5,7 @@
 
 pub mod codex;
 pub mod context;
-pub mod hint;
 pub mod credentials;
+pub mod hint;
 pub mod limits;
 pub mod service;

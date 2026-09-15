@@ -5,8 +5,11 @@ import { getEmulator, onScreenParsed } from '../core/emulatorRegistry';
 import { noteOutput } from '../core/activityMonitor';
 import { attentionQueue } from '../core/attentionQueue';
 import { forgetMarkingAgent } from '../core/turnMarks';
+import { projectStreamRecord } from '../core/streamProjection';
+import type { StreamRecord } from '../core/streamProtocol';
 import { ptyClient } from '../core/ptyClient';
 import { audioEngine } from '../core/audioEngine';
+import { boundCachedLines } from '../core/presentationCache';
 import { type AppTelemetry } from '../hud/state';
 
 type WorkspaceUpdater = (updater: (prev: ProjectWorkspace) => ProjectWorkspace) => void;
@@ -66,7 +69,36 @@ export function resolveAgentEventTarget(
  * Module scope rather than hook state: the value is read inside the parsed-frame
  * handler, which must not re-subscribe every time it changes.
  */
-const reportedTuiState = new Map<string, boolean>();
+export interface ReportedTuiState { stream: string; active?: boolean }
+
+/** A daemon observation belongs only to the stream that produced it. */
+export function advanceReportedTuiState(
+  previous: ReportedTuiState | undefined,
+  record: StreamRecord,
+): ReportedTuiState {
+  const stream = `${record.incarnation}/${record.stream_epoch}`;
+  const current = previous?.stream === stream ? previous : { stream };
+  return record.payload.type === 'Event' && record.payload.payload.type === 'TuiMode'
+    ? { stream, active: record.payload.payload.payload.active }
+    : current;
+}
+
+const reportedTuiState = new Map<string, ReportedTuiState>();
+
+/** Drop only daemon-derived observations; local controls and attention state survive. */
+export function clearObservedTelemetry(previous: AppTelemetry, sessionId: string): AppTelemetry {
+  return {
+    sessionId,
+    chips: previous.chips,
+    shellMetrics: previous.shellMetrics,
+    pendingApproval: previous.pendingApproval,
+    permissionMode: previous.permissionMode,
+    agentBusy: previous.agentBusy,
+    waiting: previous.waiting,
+    mode: previous.mode,
+    transport: previous.transport,
+  };
+}
 
 /**
  * Put the session's screen where the one view will read it.
@@ -101,44 +133,38 @@ export function applyScreenToNode(
 export function usePtyEvents(setWorkspace: WorkspaceUpdater, setTelemetry: TelemetryUpdater) {
   useEffect(() => {
     const unbindPty = ptyClient.registerHandler({
-      onOutput: (rawChunk, sessionId) => {
-        // Feed the session's own screen. It owns cursor position, colour state
-        // and the grid, so a chunk boundary landing mid-escape or mid-row no
-        // longer corrupts anything.
-        //
-        // Parsing is ASYNCHRONOUS, so the render happens in the onScreenParsed
-        // handler below rather than here — reading the buffer on the next line
-        // would read the previous frame's content.
-        getEmulator(sessionId).write(rawChunk);
-
-        // Recorded here, not in the updater: React may run an updater late or
-        // more than once, and the mark's pulse is timed off this. It lives
-        // outside React state because a PTY chunk must not write to storage.
+      onOutput: (_rawChunk, sessionId) => {
+        // StreamApplication already parsed these live bytes. Never parse twice.
         noteOutput(sessionId);
         attentionQueue.noteOutput(sessionId);
       },
-
-      /**
-       * An agent told us it is blocked on a human, through its own hook.
-       *
-       * This is the OTHER half of the approval gate we deleted. The gate both
-       * decided whether a command could run and told you something needed
-       * attention; only the deciding is gone. In pass-through the app never
-       * sees the command, but the vendor will happily tell us it has stopped —
-       * and that is the single most valuable thing the terminal can know about
-       * a session nobody is looking at.
-       *
-       * Correlated by the pane id the hook forwards, falling back to the
-       * directory only when it could not. See `resolveAgentEventTarget`.
-       */
-      onAgentEvent: ({ event, cwd, doomSessionId }) => {
+      onStreamRecord: (record, context) => {
+        const id = record.session_id;
+        reportedTuiState.set(id, advanceReportedTuiState(reportedTuiState.get(id), record));
+        setWorkspace(previous => {
+          const node = previous.nodes[id];
+          if (!node) return previous;
+          const projected = projectStreamRecord(node, record, context);
+          return projected === node ? previous : { ...previous, nodes: { ...previous.nodes, [id]: projected } };
+        });
+        if (context.phase === 'live' && id === ptyClient.getSessionId()
+            && record.payload.type === 'Event' && record.payload.payload.type === 'Cwd') {
+          ptyClient.requestTelemetry(record.payload.payload.payload.path);
+        }
+      },
+      onStreamActivity: (record) => {
+        if (record.session_id === ptyClient.getSessionId() && record.payload.type === 'Event'
+            && record.payload.payload.type === 'TuiMode' && record.payload.payload.payload.active) {
+          audioEngine.playSound('door', 2);
+        }
+      },
+      onAgentEvent: ({ event, doomSessionId, incarnation, eventId, phase }) => {
         const blocked = event === 'PermissionRequest';
         const cleared = event === 'Stop';
         if (!blocked && !cleared) return;
         setWorkspace((prev) => {
-          const match = resolveAgentEventTarget(prev.nodes, { cwd, doomSessionId });
-          if (!match) return prev;
-          if (!!match.blockedOnUser === blocked) return prev;
+          const match = prev.nodes[doomSessionId];
+          if (!match || match.incarnation !== incarnation || match.lastHookEventId === eventId) return prev;
           return {
             ...prev,
             nodes: {
@@ -146,132 +172,17 @@ export function usePtyEvents(setWorkspace: WorkspaceUpdater, setTelemetry: Telem
               [match.id]: {
                 ...match,
                 blockedOnUser: blocked,
-                attentionSerial: blocked ? (match.attentionSerial ?? 0) + 1 : match.attentionSerial,
+                lastHookEventId: eventId,
+                lastLiveAskEventId: blocked && phase === 'live' ? eventId : match.lastLiveAskEventId,
+                attentionSerial: blocked && phase === 'live' ? (match.attentionSerial ?? 0) + 1 : match.attentionSerial,
               },
             },
           };
         });
       },
 
-      onPromptStart: (sessionId) => {
-        setWorkspace((prev) => {
-          const target = prev.nodes[sessionId];
-          if (!target || target.atPrompt === true) return prev;
-          return { ...prev, nodes: { ...prev.nodes, [sessionId]: { ...target, atPrompt: true } } };
-        });
-      },
-
-      onCommandStart: (sessionId) => {
-        // OSC 133 B ends the prompt and begins editable command input. The
-        // shell is still idle; only OSC 133 C proves execution has begun.
-        setWorkspace((prev) => {
-          const target = prev.nodes[sessionId];
-          if (!target || target.atPrompt === true) return prev;
-          return { ...prev, nodes: { ...prev.nodes, [sessionId]: { ...target, atPrompt: true } } };
-        });
-      },
-
-      onExecutionStart: (sessionId) => {
-        const startedAt = Date.now();
-        setWorkspace((prev) => {
-          const target = prev.nodes[sessionId];
-          if (!target) return prev;
-          return {
-            ...prev,
-            nodes: {
-              ...prev.nodes,
-              [sessionId]: { ...target, atPrompt: false, lastExecutionStartedAt: startedAt },
-            },
-          };
-        });
-      },
-
-      onExecutionEnd: (exitCode, sessionId) => {
-        const endedAt = Date.now();
-        setWorkspace((prev) => {
-          const target = prev.nodes[sessionId];
-          if (!target) return prev;
-          return {
-            ...prev,
-            nodes: {
-              ...prev.nodes,
-              [sessionId]: {
-                ...target,
-                lastExitCode: exitCode,
-                executionSerial: (target.executionSerial ?? 0) + 1,
-                lastExecutionDurationMs: target.lastExecutionStartedAt
-                  ? Math.max(0, endedAt - target.lastExecutionStartedAt)
-                  : undefined,
-                lastExecutionStartedAt: undefined,
-              },
-            },
-          };
-        });
-      },
-
-      onCwd: (cwd, sessionId) => {
-        setWorkspace((prev) => {
-          const target = prev.nodes[sessionId];
-          if (!target || target.cwd === cwd) return prev;
-          // The directory moved, so the branch may have too — ask about this
-          // path specifically rather than trusting the daemon's own directory.
-          if (sessionId === prev.groups.find((g) => g.id === prev.activeGroupId)?.activeNodeId) {
-            ptyClient.requestTelemetry(cwd);
-          }
-          return {
-            ...prev,
-            nodes: { ...prev.nodes, [sessionId]: { ...target, cwd } },
-          };
-        });
-      },
-
-      /*
-        onExecutionStart / onExecutionEnd used to open and freeze command
-        blocks here. Both are gone with the block editor: nothing creates a
-        block any more, so the handlers were mutating a list that was always
-        empty and persisting it to localStorage forever.
-
-        The shell's own OSC 133 boundaries still arrive; when there is a reason
-        to use them again — an exit code for the waiting list is the obvious
-        one — they should write a narrow field, not resurrect the block model.
-      */
-
-      onTuiMode: (active, sessionId) => {
-        // Recorded per session, because under tmux this arrives from a poll
-        // that runs for background panes too — attributing it to whichever tab
-        // is on screen would flip the wrong pane into grid mode.
-        reportedTuiState.set(sessionId, active);
-        setWorkspace((prev) => {
-          const target = prev.nodes[sessionId];
-          if (!target) return prev;
-
-          return {
-            ...prev,
-            nodes: {
-              ...prev.nodes,
-              [sessionId]: { ...target, isTuiActive: active },
-            },
-          };
-        });
-        // Only for the pane on screen. The tmux poll reports background panes
-        // too, and a sound for something the user cannot see is noise.
-        if (active && sessionId === ptyClient.getSessionId()) {
-          audioEngine.playSound('door', 2);
-        }
-      },
-
-      /**
-       * This session's process ended, per the daemon.
-       *
-       * Previously nobody subscribed to this at all: the message arrived, was
-       * fanned out to handlers that did not implement it, and the workspace
-       * kept describing an exited shell as a live terminal. A dead session must
-       * also stop asking for attention — a blocked agent that has since gone
-       * away can never clear its own prompt, and its row would sit in the queue
-       * forever. Its unacknowledged OUTPUT is left alone: a command that failed
-       * as the shell went down is exactly the row worth keeping.
-       */
       onSessionClosed: (sessionId) => {
+        reportedTuiState.delete(sessionId);
         forgetMarkingAgent(sessionId);
         setWorkspace((prev) => {
           const target = prev.nodes[sessionId];
@@ -291,23 +202,30 @@ export function usePtyEvents(setWorkspace: WorkspaceUpdater, setTelemetry: Telem
         });
       },
 
-      onAgentState: (state, sessionId) => {
-        setWorkspace((prev) => {
-          const currentNode = prev.nodes[sessionId];
-          if (!currentNode) return prev;
+    });
 
-          return {
-            ...prev,
-            nodes: {
-              ...prev.nodes,
-              [currentNode.id]: {
-                ...currentNode,
-                agentState: state as SessionNode['agentState'],
-              },
-            },
-          };
-        });
-      },
+    const unbindHistory = ptyClient.onHistory((sessionId, history) => {
+      setWorkspace(previous => {
+        const target = previous.nodes[sessionId];
+        if (!target) return previous;
+        const cache = target.recoveryCacheLines
+          ? { lines: target.recoveryCacheLines, truncated: target.recoveryCacheTruncated === true }
+          : boundCachedLines(target.tuiLines);
+        // Once a rebuild exists, its original cached screen remains the first
+        // half of the combined 8 MiB / 5,000-line budget. Later live frames
+        // must not silently enlarge that historical half before another rebuild.
+        ptyClient.setCachedHistoryBudget(sessionId, cache.lines);
+        const metadata = history.metadata;
+        const recoveredHistory = {
+          status: history.status, data: history.data, reason: history.reason,
+          ...(metadata ? { captureId: metadata.capture_id, historyAtLimit: metadata.history_at_limit } : {}),
+          potentiallyOverlapping: true as const, potentiallyIncomplete: true as const,
+        };
+        return { ...previous, nodes: { ...previous.nodes, [sessionId]: { ...target,
+          recoveryCacheLines: cache.lines, recoveryCacheTruncated: cache.truncated,
+          recoveredHistory,
+        } } };
+      });
     });
 
     // One render per frame per session, however many chunks arrived in it. The
@@ -315,7 +233,9 @@ export function usePtyEvents(setWorkspace: WorkspaceUpdater, setTelemetry: Telem
     // every 8KB chunk the daemon delivered.
     const unbindParsed = onScreenParsed((sessionId) => {
       const emu = getEmulator(sessionId);
-      const inAltScreen = resolveTuiState(emu.isAltScreen(), reportedTuiState.get(sessionId));
+      const lines = emu.getLines();
+      if (ptyClient.getHistory(sessionId) === null) ptyClient.setCachedHistoryBudget(sessionId, lines);
+      const inAltScreen = resolveTuiState(emu.isAltScreen(), reportedTuiState.get(sessionId)?.active);
 
       setWorkspace((prev) => {
         const target = prev.nodes[sessionId];
@@ -323,7 +243,7 @@ export function usePtyEvents(setWorkspace: WorkspaceUpdater, setTelemetry: Telem
 
         const updatedNode = applyScreenToNode(
           target,
-          emu.getLines(),
+          lines,
           inAltScreen,
           emu.getCursor(),
         );
@@ -377,10 +297,17 @@ export function usePtyEvents(setWorkspace: WorkspaceUpdater, setTelemetry: Telem
       }));
     });
 
+    const unbindTeleUnavailable = ptyClient.onTelemetryUnavailable((sessionId) => {
+      if (sessionId !== ptyClient.getSessionId()) return;
+      setTelemetry(previous => clearObservedTelemetry(previous, sessionId));
+    });
+
     return () => {
       unbindPty();
+      unbindHistory();
       unbindParsed();
       unbindTele();
+      unbindTeleUnavailable();
     };
   }, []);
 

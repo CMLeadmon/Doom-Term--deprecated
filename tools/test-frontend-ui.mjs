@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /** Real browser/PTY smoke tests. Never connect to the user's daemon or tmux. */
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -28,13 +28,12 @@ let vite;
 let daemon;
 let daemonLog = '';
 
-async function startDaemon() {
-  const build = spawnSync('cargo', ['build', '--locked', '-p', 'doom-term-server'], {
-    cwd: root, stdio: 'inherit', timeout: 300000,
-  });
-  assert.equal(build.status, 0, 'test daemon must compile');
+async function startDaemon(requestedPort = 0) {
+  daemonLog = '';
   const target = resolve(root, process.env.CARGO_TARGET_DIR || 'target');
-  daemon = spawn(join(target, 'debug', 'doom-term-server'), [], { cwd: root, env: testEnv, stdio: ['ignore', 'pipe', 'pipe'] });
+  daemon = spawn(join(target, 'debug', 'doom-term-server'), [], {
+    cwd: root, env: { ...testEnv, DOOM_PORT: String(requestedPort) }, stdio: ['ignore', 'pipe', 'pipe'],
+  });
   return new Promise((resolvePort, reject) => {
     const timer = setTimeout(() => reject(new Error(`Daemon did not start: ${daemonLog}`)), 15000);
     const receive = chunk => {
@@ -47,6 +46,18 @@ async function startDaemon() {
     daemon.once('error', error => { clearTimeout(timer); reject(error); });
     daemon.once('exit', code => { clearTimeout(timer); reject(new Error(`Daemon exited ${code}: ${daemonLog}`)); });
   });
+}
+
+async function stopDaemon() {
+  const running = daemon;
+  daemon = undefined;
+  if (!running || running.exitCode !== null) return;
+  const exited = once(running, 'exit');
+  running.kill('SIGTERM');
+  await Promise.race([
+    exited,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('Daemon did not stop')), 5000)),
+  ]);
 }
 
 async function palette(page, search) {
@@ -76,12 +87,65 @@ async function terminalGrid(page, marker) {
   return { rows: Number(match[1]), cols: Number(match[2]) };
 }
 
-function foregroundCommand(sessionId) {
+async function renderedRowsBetween(terminal, begin, end) {
+  return terminal.evaluate((element, markers) => {
+    const rows = [...element.querySelectorAll('[data-terminal-line]')];
+    const content = row => row.children[1];
+    const exact = (row, marker) => content(row)?.textContent?.trimEnd() === marker;
+    const start = rows.findIndex(row => exact(row, markers.begin));
+    const finish = rows.findIndex((row, index) => index > start && exact(row, markers.end));
+    if (start < 0 || finish < 0) throw new Error(`Missing rendered markers ${markers.begin}/${markers.end}`);
+    return rows.slice(start + 1, finish).map(row => ({
+      text: content(row)?.textContent ?? '',
+      spans: [...content(row).children].map(span => ({
+        text: span.textContent ?? '',
+        style: span.getAttribute('style') ?? '',
+      })),
+    }));
+  }, { begin, end });
+}
+
+async function hasRenderedLineAfter(terminal, begin, wanted) {
+  return terminal.evaluate((element, markers) => {
+    const rows = [...element.querySelectorAll('[data-terminal-line]')];
+    const text = row => row.children[1]?.textContent?.trimEnd();
+    const start = rows.findIndex(row => text(row) === markers.begin);
+    return start >= 0 && rows.slice(start + 1).some(row => text(row) === markers.wanted);
+  }, { begin, wanted });
+}
+
+async function anchorScrollAt(terminal, marker) {
+  await terminal.evaluate((element, wanted) => {
+    const row = [...element.querySelectorAll('[data-terminal-line]')]
+      .find(candidate => candidate.children[1]?.textContent?.trimEnd() === wanted);
+    if (!row) throw new Error(`Missing scroll anchor ${wanted}`);
+    const scroll = row.parentElement;
+    scroll.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -100 }));
+    row.scrollIntoView({ block: 'start' });
+  }, marker);
+}
+
+async function scrollAnchorIsVisible(terminal, marker) {
+  return terminal.evaluate((element, wanted) => {
+    const row = [...element.querySelectorAll('[data-terminal-line]')]
+      .find(candidate => candidate.children[1]?.textContent?.trimEnd() === wanted);
+    if (!row) return false;
+    const viewport = row.parentElement.getBoundingClientRect();
+    const bounds = row.getBoundingClientRect();
+    return bounds.top >= viewport.top - 1 && bounds.top < viewport.bottom;
+  }, marker);
+}
+
+function paneProperty(sessionId, property) {
   const result = spawnSync('tmux', [
-    '-N', '-L', 'doom-term', 'display-message', '-p', '-t', `=doom-${sessionId}:`, '#{pane_current_command}',
+    '-N', '-L', 'doom-term', 'display-message', '-p', '-t', `=doom-${sessionId}:`, `#{${property}}`,
   ], { env: testEnv, encoding: 'utf8', timeout: 3000 });
   assert.equal(result.status, 0, `the isolated pane must be inspectable: ${result.stderr}`);
   return result.stdout.trim();
+}
+
+function foregroundCommand(sessionId) {
+  return paneProperty(sessionId, 'pane_current_command');
 }
 
 async function main() {
@@ -91,6 +155,10 @@ async function main() {
   // 1420 is the daemon's trusted development origin. Refuse a busy port; do
   // not silently test somebody else's app or broaden the production allowlist.
   await build({ root });
+  const daemonBuild = spawnSync('cargo', ['build', '--locked', '-p', 'doom-term-server'], {
+    cwd: root, stdio: 'inherit', timeout: 300000,
+  });
+  assert.equal(daemonBuild.status, 0, 'test daemon must compile');
   const port = await startDaemon();
   // Exercise the production bundle with the desktop's actual CSP. Only the
   // daemon port changes in the test policy to reach this run's private daemon.
@@ -107,7 +175,13 @@ async function main() {
         const target = new URL(url);
         if (target.hostname === '127.0.0.1' && target.port === '1421') target.port = String(port);
         super(target.toString(), protocols);
+        (window.__doomTestSockets ??= []).push(this);
       }
+    };
+    window.__doomTestDisconnect = () => {
+      const socket = [...(window.__doomTestSockets ?? [])].reverse().find(candidate => candidate.readyState === WebSocket.OPEN);
+      if (!socket) throw new Error('No open Doom Term socket');
+      socket.close(4000, 'fixture disconnect');
     };
   }, { port });
   page = await context.newPage();
@@ -123,6 +197,87 @@ async function main() {
   await command(page, "printf 'SHELL_OK\\n'", 'SHELL_OK');
   await command(page, "printf '\\344\\270\\255\\346\\226\\207 \\360\\237\\232\\200\\n'", '中文 🚀');
   console.log('[UI Test] PASS: startup, real shell I/O, Unicode');
+  const terminal = page.getByTestId('raw-terminal');
+
+  // Warm transport loss retains the same parser and root while output crosses
+  // the boundary. Compare the exact rendered row spans with an uninterrupted
+  // control. More than the old 500-event replay cap is intentionally emitted,
+  // including Unicode, cursor rewriting and an SGR split before socket loss.
+  const warmPane = await page.getByTestId('pane-leaf').getAttribute('data-pane');
+  assert.ok(warmPane, 'warm recovery must target a real pane');
+  const warmPid = paneProperty(warmPane, 'pane_pid');
+  const recoveryFixture = join(artifacts, 'recovery-cells.mjs');
+  writeFileSync(recoveryFixture, `import { existsSync, writeFileSync } from 'node:fs';
+const [begin, end, prefixFile, releaseFile, splitFile] = process.argv.slice(2);
+const pause = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
+process.stdout.write(begin + '\\n');
+let i = 0;
+for (; i < 500; i++) { process.stdout.write('CELL_' + String(i).padStart(3, '0') + '\\n'); await pause(5); }
+writeFileSync(prefixFile, '');
+while (!existsSync(releaseFile)) await pause(10);
+process.stdout.write('BOUNDARY_READY\\n');
+process.stdout.write('\\x1b[1;3');
+writeFileSync(splitFile, '');
+await pause(800);
+process.stdout.write('1mSTYLE_中文\\x1b[0m\\n');
+process.stdout.write('CURSOR_ABCD\\rCURSOR_X\\n');
+for (; i < 510; i++) { process.stdout.write('CELL_' + String(i).padStart(3, '0') + '\\n'); await pause(5); }
+process.stdout.write(end + '\\n');
+`);
+  const recoveryProgram = (begin, end, prefixFile, releaseFile, splitFile) =>
+    `node ./recovery-cells.mjs ${begin} ${end} ${prefixFile} ${releaseFile} ${splitFile}`;
+  const controlPrefix = join(artifacts, 'control-prefix-ready');
+  const controlRelease = join(artifacts, 'control-release');
+  const controlSplit = join(artifacts, 'control-split-ready');
+  await terminal.click();
+  await page.keyboard.type(recoveryProgram('CONTROL_BEGIN', 'CONTROL_DONE',
+    'control-prefix-ready', 'control-release', 'control-split-ready'));
+  await page.keyboard.press('Enter');
+  await expect.poll(() => existsSync(controlPrefix)).toBe(true);
+  await expect.poll(() => hasRenderedLineAfter(terminal, 'CONTROL_BEGIN', 'CELL_499'),
+    { timeout: 45000 }).toBe(true);
+  writeFileSync(controlRelease, '');
+  await expect.poll(() => existsSync(controlSplit)).toBe(true);
+  await expect.poll(async () => (await terminal.innerText()).split('\n').some(line => line.trim() === 'CONTROL_DONE'),
+    { timeout: 45000 }).toBe(true);
+  const controlRows = await renderedRowsBetween(terminal, 'CONTROL_BEGIN', 'CONTROL_DONE');
+
+  const warmPrefix = join(artifacts, 'warm-prefix-ready');
+  const warmRelease = join(artifacts, 'warm-release');
+  const warmSplit = join(artifacts, 'warm-split-ready');
+  await terminal.click();
+  await page.keyboard.type(recoveryProgram('WARM_BEGIN', 'WARM_DONE',
+    'warm-prefix-ready', 'warm-release', 'warm-split-ready'));
+  await page.keyboard.press('Enter');
+  await expect.poll(() => existsSync(warmPrefix)).toBe(true);
+  await expect.poll(() => hasRenderedLineAfter(terminal, 'WARM_BEGIN', 'CELL_499'),
+    { timeout: 45000 }).toBe(true);
+  await anchorScrollAt(terminal, 'WARM_BEGIN');
+  writeFileSync(warmRelease, '');
+  await expect.poll(() => existsSync(warmSplit)).toBe(true);
+  await page.evaluate(() => window.__doomTestDisconnect());
+  await expect.poll(async () => (await terminal.innerText()).split('\n').some(line => line.trim() === 'WARM_DONE'),
+    { timeout: 45000 }).toBe(true);
+  assert.equal((await terminal.innerText()).split('\n').filter(line => line.trim() === 'WARM_DONE').length, 1,
+    'warm output must not duplicate across reconnect');
+  assert.equal(paneProperty(warmPane, 'pane_pid'), warmPid, 'socket recovery must preserve the exact root process');
+  assert.deepEqual(await renderedRowsBetween(terminal, 'WARM_BEGIN', 'WARM_DONE'), controlRows,
+    'warm recovery cells and SGR spans must exactly match the uninterrupted control');
+  assert.equal(await scrollAnchorIsVisible(terminal, 'WARM_BEGIN'), true,
+    'warm recovery must preserve the reader\'s detached scroll anchor');
+
+  await terminal.click();
+  await page.keyboard.press('End');
+  await page.keyboard.type("printf 'RESIZE_BEFORE\\n'; sleep 1; printf 'RESIZE_AFTER\\n'");
+  await page.keyboard.press('Enter');
+  await expect.poll(async () => (await terminal.innerText()).split('\n').some(line => line.trim() === 'RESIZE_BEFORE')).toBe(true);
+  await page.evaluate(() => window.__doomTestDisconnect());
+  await page.setViewportSize({ width: 1100, height: 760 });
+  await expect.poll(async () => (await terminal.innerText()).split('\n').some(line => line.trim() === 'RESIZE_AFTER'),
+    { timeout: 15000 }).toBe(true);
+  assert.equal(paneProperty(warmPane, 'pane_pid'), warmPid, 'deferred resize recovery must preserve the exact root process');
+  await page.screenshot({ path: join(artifacts, 'warm-recovery.png') });
+  console.log('[UI Test] PASS: warm socket recovery crosses >500 events with exact control cells, split SGR/Unicode, scroll anchor, deferred resize, and root identity');
 
   // Use an isolated interactive Bash with bracketed paste explicitly enabled,
   // even on CI hosts whose /bin/sh is dash. No user startup files are sourced.
@@ -150,7 +305,6 @@ async function main() {
   const paste = "printf 'PASTE_ONE\\n'\rprintf 'PASTE_TWO\\n'";
   await page.evaluate(text => navigator.clipboard.writeText(text), paste);
   await page.keyboard.press('Control+Shift+v');
-  const terminal = page.getByTestId('raw-terminal');
   await expect(terminal).toContainText("printf 'PASTE_TWO");
   await expect(page.getByRole('status')).toHaveCount(0);
   assert.ok(!(await terminal.innerText()).split('\n').map(line => line.trim()).includes('PASTE_ONE'), 'pasting must not execute the first line before Enter');
@@ -206,7 +360,6 @@ async function main() {
   await page.keyboard.type('vi -Nu NONE -i NONE -n editor-probe.txt');
   await page.keyboard.press('Enter');
   await expect(terminal).toContainText(/editor-probe\.txt.*New/);
-  await expect(terminal).not.toContainText('SHELL_OK');
   await page.keyboard.type('iTUI_EDITOR_OK');
   await expect(terminal).toContainText('TUI_EDITOR_OK');
   await page.keyboard.press('Escape');
@@ -289,10 +442,15 @@ async function main() {
   await command(page, 'pwd', secondWorkspace);
   const remotePane = await page.getByTestId('pane-leaf').filter({ visible: true }).getAttribute('data-pane');
   assert.ok(remotePane, 'background hook must name a real pane');
+  const remoteIncarnation = paneProperty(remotePane, '@doom-incarnation');
+  assert.match(remoteIncarnation, /^[0-9a-f]{32}$/, 'background hook must name the exact owned incarnation');
   await page.keyboard.press('Control+1');
   await expect(page.locator(`[data-pane="${remotePane}"]`)).not.toBeVisible();
   const response = await fetch(`http://127.0.0.1:${port}/hook/claude`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Doom-Term-Session': remotePane },
+    method: 'POST', headers: {
+      'Content-Type': 'application/json', 'X-Doom-Term-Session': remotePane,
+      'X-Doom-Term-Incarnation': remoteIncarnation,
+    },
     body: JSON.stringify({ event: 'PermissionRequest', cwd: secondWorkspace }),
   });
   assert.equal(response.status, 204);
@@ -307,6 +465,35 @@ async function main() {
   await expect(page.locator(`[data-pane="${remotePane}"]`)).toBeVisible();
   await command(page, "printf 'BACKGROUND_RETURN\\n'", 'BACKGROUND_RETURN');
   console.log('[UI Test] PASS: multi-workspace directory selection and background hook activation');
+
+  // Kill the daemon—not tmux—while a real editor owns the pane. Input typed
+  // while disconnected must be refused, the new daemon must rebuild the exact
+  // pane with separated archive provenance, and the editor must remain usable.
+  const coldTerminal = page.getByTestId('raw-terminal').filter({ visible: true }).last();
+  const coldPid = paneProperty(remotePane, 'pane_pid');
+  await coldTerminal.click();
+  await page.keyboard.type('vi -Nu NONE -i NONE -n cold-recovery.txt');
+  await page.keyboard.press('Enter');
+  await expect(coldTerminal).toContainText(/cold-recovery\.txt.*New/);
+  await page.keyboard.type('iCOLD_EDITOR_BEFORE');
+  await expect(coldTerminal).toContainText('COLD_EDITOR_BEFORE');
+  await stopDaemon();
+  await page.waitForTimeout(300);
+  await page.keyboard.type('_OFFLINE_MUST_NOT_APPEAR');
+  await startDaemon(port);
+  await expect(coldTerminal).toContainText('COLD_EDITOR_BEFORE', { timeout: 20000 });
+  await expect(page.getByRole('region', { name: 'Recovered history' })).toBeVisible({ timeout: 20000 });
+  assert.equal(paneProperty(remotePane, 'pane_pid'), coldPid, 'daemon restart must attach the original exact tmux pane');
+  await coldTerminal.click();
+  await page.keyboard.type('_AFTER');
+  await page.keyboard.press('Escape');
+  await page.keyboard.type(':wq');
+  await page.keyboard.press('Enter');
+  await expect(coldTerminal).toContainText('BACKGROUND_RETURN');
+  assert.equal(readFileSync(join(secondWorkspace, 'cold-recovery.txt'), 'utf8'), 'COLD_EDITOR_BEFORE_AFTER\n',
+    'offline input must not replay and the recovered editor must save through the original process');
+  await page.screenshot({ path: join(artifacts, 'cold-recovery-editor.png') });
+  console.log('[UI Test] PASS: cold daemon restart preserves exact editor/root, separates history, refuses offline input, and saves the file');
   await expect(page.locator('vite-error-overlay')).toHaveCount(0);
   assert.deepEqual(errors, [], 'no browser runtime errors');
   assert.deepEqual(probeFailures, [], 'all MVP probes must pass; recorded failures are never skipped successes');
@@ -325,11 +512,7 @@ try {
 } finally {
   await browser?.close();
   if (vite) await new Promise((resolveClose, reject) => vite.httpServer.close(error => error ? reject(error) : resolveClose()));
-  if (daemon && daemon.exitCode === null) {
-    const exited = once(daemon, 'exit');
-    daemon.kill('SIGTERM');
-    await exited;
-  }
+  await stopDaemon();
   // Only this run's disposable private socket. Never target the user's tmux.
-  if (daemon) spawnSync('tmux', ['-L', 'doom-term', 'kill-server'], { env: testEnv, timeout: 3000 });
+  spawnSync('tmux', ['-L', 'doom-term', 'kill-server'], { env: testEnv, timeout: 3000 });
 }

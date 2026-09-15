@@ -1,363 +1,201 @@
-import { describe, it, expect, vi } from 'vitest';
-import { looksLikeAbsolutePath, ptyClient, PtyClient } from './ptyClient';
-import { BOOTSTRAP_COLS, BOOTSTRAP_ROWS, disposeEmulator, getEmulator } from './emulatorRegistry';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { looksLikeAbsolutePath, type PtyClient } from './ptyClient';
+import { getEmulator, resetAllEmulators } from './emulatorRegistry';
+import { recoveryFixture, TEST_INCARNATION } from '../test/recoveryFixture';
 
-/**
- * Drive the singleton through a stub socket and hand back what it sent.
- * `readyState: 1` is WebSocket.OPEN, which is what `send()` gates on.
- */
-function captureSends(run: () => void): unknown[] {
-  const sent: string[] = [];
-  const internals = ptyClient as unknown as {
-    ws: unknown;
-    activeSessionId: string;
-    isConnected: boolean;
-  };
-  const priorWs = internals.ws;
-  const priorId = internals.activeSessionId;
-  const priorConnected = internals.isConnected;
-  internals.ws = { readyState: 1, send: (raw: string) => sent.push(raw) };
-  // writeToSession queues instead of sending unless the client believes it is
-  // connected, so a socket stub alone captures nothing from that path.
-  internals.isConnected = true;
-  try {
-    run();
-  } finally {
-    internals.ws = priorWs;
-    internals.activeSessionId = priorId;
-    internals.isConnected = priorConnected;
-  }
-  return sent.map((raw) => JSON.parse(raw));
-}
+const clients: PtyClient[] = [];
+function fixture() { const result = recoveryFixture(); clients.push(result.client); return result; }
+afterEach(() => { clients.splice(0).forEach(client => client.dispose()); resetAllEmulators(); vi.useRealTimers(); });
 
-describe('telemetry requests', () => {
+describe('negotiated telemetry requests', () => {
   it('names the session on screen', () => {
-    // Telemetry is per-session: the foreground process, and so the agent and
-    // its rate limit, differ per tab. Without the id the daemon answered about
-    // whichever session sorted first and the plate described the wrong tab.
-    const sent = captureSends(() => {
-      (ptyClient as unknown as { activeSessionId: string }).activeSessionId = 'node-7';
-      ptyClient.requestTelemetry('/tmp/project');
-    });
-    expect(sent).toEqual([
-      { action: 'GetTelemetry', payload: { cwd: '/tmp/project', session_id: 'node-7' } },
-    ]);
+    const { client, sockets } = fixture(); sockets[0].open(); client.setActiveSession('node-7');
+    client.bindExisting('node-7', TEST_INCARNATION);
+    client.requestTelemetry('/tmp/project');
+    expect(sockets[0].sent.at(-1)).toEqual({ action: 'GetTelemetry', payload: { cwd: '/tmp/project', session_id: 'node-7', incarnation: TEST_INCARNATION } });
   });
-
   it('still names the session when no directory is given', () => {
-    const sent = captureSends(() => {
-      (ptyClient as unknown as { activeSessionId: string }).activeSessionId = 'node-2';
-      ptyClient.requestTelemetry();
-    });
-    expect(sent).toEqual([
-      { action: 'GetTelemetry', payload: { cwd: null, session_id: 'node-2' } },
-    ]);
+    const { client, sockets } = fixture(); sockets[0].open(); client.setActiveSession('node-2'); client.requestTelemetry();
+    expect(sockets[0].sent.at(-1)).toEqual({ action: 'GetTelemetry', payload: { cwd: null, session_id: 'node-2', incarnation: null } });
+  });
+  it('drops delayed telemetry for a forgotten or replaced process identity', () => {
+    const { client, sockets } = fixture(); sockets[0].open(); client.bindExisting('pane', TEST_INCARNATION);
+    const observed = vi.fn(); client.onTelemetry(observed);
+    const reply = { session_id: 'pane', incarnation: TEST_INCARNATION, current_dir: '/fixture', rate_used: 0.4 };
+    sockets[0].receive('Telemetry', reply);
+    expect(observed).toHaveBeenCalledTimes(1);
+    client.forgetSession('pane');
+    sockets[0].receive('Telemetry', reply);
+    client.bindExisting('pane', 'a'.repeat(32));
+    sockets[0].receive('Telemetry', reply);
+    sockets[0].receive('Telemetry', { ...reply, incarnation: null });
+    expect(observed).toHaveBeenCalledTimes(1);
+    sockets[0].receive('Telemetry', { ...reply, incarnation: 'a'.repeat(32) });
+    expect(observed).toHaveBeenCalledTimes(2);
+  });
+  it('fences telemetry-unavailable notices to the exact current process', () => {
+    const { client, sockets } = fixture(); sockets[0].open(); client.bindExisting('pane', TEST_INCARNATION);
+    const unavailable = vi.fn(); client.onTelemetryUnavailable(unavailable);
+    sockets[0].receive('TelemetryUnavailable', { session_id: 'pane', incarnation: null });
+    sockets[0].receive('TelemetryUnavailable', { session_id: 'pane', incarnation: 'a'.repeat(32) });
+    sockets[0].receive('TelemetryUnavailable', { session_id: 'other', incarnation: TEST_INCARNATION });
+    expect(unavailable).not.toHaveBeenCalled();
+    sockets[0].receive('TelemetryUnavailable', { session_id: 'pane', incarnation: TEST_INCARNATION });
+    expect(unavailable).toHaveBeenCalledExactlyOnceWith('pane');
   });
 });
-
-describe('global PTY routing', () => {
-  it('delivers a background execution result with its session id', () => {
-    const seen: Array<[number | null, string]> = [];
-    const remove = ptyClient.registerHandler({
-      onOutput: () => undefined,
-      onExecutionEnd: (code, sessionId) => seen.push([code, sessionId]),
-    });
-    const internals = ptyClient as unknown as {
-      activeSessionId: string;
-      handleServerMessage: (message: unknown) => void;
-    };
-    const prior = internals.activeSessionId;
-    internals.activeSessionId = 'visible';
-
-    internals.handleServerMessage({
-      event: 'PtyEvent',
-      data: { session_id: 'background', event: { type: 'ExecutionEnd', payload: { exit_code: 9 } } },
-    });
-
-    remove();
-    internals.activeSessionId = prior;
-    expect(seen).toEqual([[9, 'background']]);
+describe('global stream routing', () => {
+  it('restores a hook arriving before discovery only after its exact identity is bound', () => {
+    const { client, sockets } = fixture(); sockets[0].open();
+    const onAgentEvent = vi.fn(); client.registerHandler({ onOutput: () => undefined, onAgentEvent });
+    const hook = { agent: 'claude', event: 'PermissionRequest', cwd: '/fixture', doom_session_id: 'late',
+      incarnation: TEST_INCARNATION, event_id: 'c'.repeat(32), phase: 'catch-up' };
+    sockets[0].receive('AgentEvent', hook);
+    expect(onAgentEvent).not.toHaveBeenCalled();
+    client.bindExisting('late', TEST_INCARNATION);
+    expect(onAgentEvent).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      doomSessionId: 'late', incarnation: TEST_INCARNATION, eventId: hook.event_id, phase: 'catch-up',
+    }));
+    sockets[0].receive('AgentEvent', hook);
+    expect(onAgentEvent).toHaveBeenCalledTimes(1);
+    const mountedLater = vi.fn(); client.registerHandler({ onOutput: () => undefined, onAgentEvent: mountedLater });
+    expect(mountedLater).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ eventId: hook.event_id, phase: 'catch-up' }));
+  });
+  it('does not let an unidentified or stale-process hook clear a current ask', async () => {
+    const { client, sockets } = fixture(); client.bindExisting('pane', TEST_INCARNATION); sockets[0].open(); await sockets[0].ready('pane');
+    const onAgentEvent = vi.fn(); client.registerHandler({ onOutput: () => undefined, onAgentEvent });
+    const hook = { agent: 'claude', event: 'PermissionRequest', doom_session_id: 'pane', incarnation: TEST_INCARNATION,
+      event_id: 'c'.repeat(32), phase: 'live' };
+    sockets[0].receive('AgentEvent', hook);
+    expect(onAgentEvent).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ phase: 'live' }));
+    sockets[0].receive('AgentEvent', { ...hook, event: 'Stop', event_id: 'd'.repeat(32), incarnation: 'f'.repeat(32) });
+    sockets[0].receive('AgentEvent', { ...hook, event: 'Stop', event_id: 'e'.repeat(32), incarnation: null });
+    expect(onAgentEvent).toHaveBeenCalledTimes(1);
+  });
+  it('delivers a parsed background execution result with exact source identity', async () => {
+    const { client, sockets } = fixture(); client.bindExisting('background', TEST_INCARNATION); client.setActiveSession('visible');
+    sockets[0].open(); await sockets[0].ready('background');
+    const seen: unknown[] = [];
+    client.registerHandler({ onOutput: () => undefined, onStreamRecord: (record, context) => seen.push({ record, context }) });
+    sockets[0].record('background', { type: 'Event', payload: { type: 'ExecutionEnd', payload: { exit_code: 9 } } });
+    await vi.waitFor(() => expect(seen).toHaveLength(1));
+    expect(seen[0]).toMatchObject({ record: { session_id: 'background', incarnation: TEST_INCARNATION },
+      context: { phase: 'live', state: { lastExitCode: 9, lastExecutionDurationMs: null } } });
+    expect(client.getSessionId()).toBe('visible');
   });
 });
-
-describe('selecting an already-bound session', () => {
-  /** Forget what the singleton thinks it spawned, so ids start clean. */
-  function resetSpawned(): void {
-    (ptyClient as unknown as { spawnedSessions: Set<string> }).spawnedSessions.clear();
+describe('selection is separate from creation and attachment', () => {
+  it('uses a pane size measured before explicit creation', () => {
+    const { client, sockets } = fixture();
+    client.resizeSession('measured', 164, 43); client.ensureSession('measured', '/tmp/probe'); sockets[0].open();
+    expect(sockets[0].actions('Create')[0]).toMatchObject({ payload: { id: 'measured', cols: 164, rows: 43, cwd: '/tmp/probe' } });
+  });
+  it('creates each new intent once and does not replay on selection', () => {
+    const { client, sockets } = fixture(); sockets[0].open();
+    client.ensureSession('A', '/repo/a'); client.ensureSession('B', '/repo/b'); client.ensureSession('A', '/repo/a');
+    client.setActiveSession('A');
+    expect(sockets[0].actions('Create').map(request => request.payload.id)).toEqual(['A', 'B']);
+    expect(sockets[0].actions('Attach')).toEqual([]);
+    expect(sockets[0].actions('Spawn')).toEqual([]);
+  });
+  it('does not move keyboard focus when binding a background identity', () => {
+    const { client } = fixture(); client.setActiveSession('A');
+    client.bindExisting('B', TEST_INCARNATION); client.ensureSession('C');
+    expect(client.getSessionId()).toBe('A');
+  });
+  it('reattaches known identities after reconnect without creating or flushing input', async () => {
+    const { client, sockets } = fixture();
+    for (const id of ['background', 'parked', 'active']) client.bindExisting(id, TEST_INCARNATION);
+    client.setActiveSession('active'); sockets[0].open();
+    for (const id of ['background', 'parked', 'active']) await sockets[0].ready(id);
+    vi.useFakeTimers(); sockets[0].drop();
+    expect(client.writeToSession('background', 'OFFLINE')).toBe(false);
+    await vi.advanceTimersByTimeAsync(2000); sockets[1].open();
+    await vi.waitFor(() => expect(sockets[1].actions('Attach')).toHaveLength(3));
+    expect(sockets[1].actions('Attach').map(request => request.payload.id)).toEqual(['background', 'parked', 'active']);
+    expect(sockets[1].actions('Create')).toEqual([]); expect(sockets[1].actions('Write')).toEqual([]);
+    expect(client.getSessionId()).toBe('active');
+  });
+});
+describe('session inventory correlation', () => {
+  it('rejects a correlated directory failure instead of exposing an empty success', async () => {
+    const { client, sockets } = fixture(); sockets[0].open();
+    const pending = client.browseDirectory('/fixture');
+    const check = expect(pending).rejects.toThrow('Directory unavailable');
+    const request = sockets[0].actions('BrowseDirectory')[0];
+    sockets[0].receive('DirectoryListing', { request_id: request.payload.request_id, current_path: '/fixture', entries: [], error: 'Directory unavailable', truncated: true });
+    await check;
+  });
+  it('correlates a listing by request id without executing its reported command', async () => {
+    const { client, sockets } = fixture(); sockets[0].open();
+    const pending = client.listSessions(); const request = sockets[0].actions('ListSessions')[0];
+    sockets[0].receive('SessionListing', { request_id: 'wrong', sessions: [] });
+    sockets[0].receive('SessionListing', { request_id: request.payload.request_id,
+      sessions: [{ id: 'orphan', incarnation: TEST_INCARNATION, cwd: '/repo', command: 'codex', durable: true }] });
+    await expect(pending).resolves.toMatchObject({ sessions: [{ id: 'orphan' }] });
+    expect(sockets[0].actions('Create')).toEqual([]); expect(sockets[0].actions('Attach')).toEqual([]);
+  });
+});
+describe('explicit command submission', () => {
+  async function ready() {
+    const f = fixture(); f.client.bindExisting('pane', TEST_INCARNATION); f.sockets[0].open(); await f.sockets[0].ready('pane'); return f;
   }
-
-  it('uses a pane size measured before its first spawn instead of overwriting it with bootstrap dimensions', () => {
-    const id = 'measured-before-spawn';
-    const sent = captureSends(() => {
-      ptyClient.resizeSession(id, 164, 43);
-      ptyClient.ensureSession(id, '/tmp/probe');
-    });
-    captureSends(() => ptyClient.killSession(id));
-    expect(sent).toContainEqual({
-      action: 'Spawn', payload: { id, cols: 164, rows: 43, cwd: '/tmp/probe' },
-    });
+  it('submits a single-line explicit command once without an echo retry timer', async () => {
+    const { client, sockets } = await ready();
+    expect(client.submitCommandToSession('pane', 'echo hi')).toBe(true);
+    expect(sockets[0].actions('Write').map(request => request.payload.data)).toEqual(['echo hi\r']);
   });
-
-  it('spawns each session once and replays neither on the way back', () => {
-    // A -> B -> A. The daemon answers Reattach by replaying its entire 500-event
-    // ring, so sending one merely because a pane became visible re-applied
-    // Output, ExecutionStart and ExecutionEnd that had already been consumed:
-    // doubled scrollback, doubled execution serials, doubled notifications.
-    resetSpawned();
-    const sent = captureSends(() => {
-      ptyClient.ensureSession('A', '/repo/a');
-      ptyClient.ensureSession('B', '/repo/b');
-      ptyClient.ensureSession('A', '/repo/a');
-    });
-
-    const actions = (sent as { action: string; payload: { id: string } }[]).map(
-      (m) => [m.action, m.payload.id] as const
-    );
-    expect(actions).toEqual([
-      ['Spawn', 'A'],
-      ['Spawn', 'B'],
-    ]);
-    expect(actions.some(([action]) => action === 'Reattach')).toBe(false);
-    resetSpawned();
+  it('does not hold keystrokes behind a command delivery window', async () => {
+    const { client, sockets } = await ready();
+    client.submitCommandToSession('pane', 'ls'); client.writeToSession('pane', 'x'); client.writeToSession('pane', 'y');
+    expect(sockets[0].actions('Write').map(request => request.payload.data)).toEqual(['ls\r', 'x', 'y']);
   });
-
-  it('still binds the session the keyboard belongs to', () => {
-    // Returning early must not skip the part that makes writes go to A.
-    resetSpawned();
-    // Read inside the window: captureSends restores activeSessionId on the way out.
-    let bound = '';
-    captureSends(() => {
-      ptyClient.ensureSession('A', '/repo/a');
-      ptyClient.ensureSession('B', '/repo/b');
-      ptyClient.ensureSession('A', '/repo/a');
-      bound = ptyClient.getSessionId();
-    });
-    expect(bound).toBe('A');
-    resetSpawned();
+  it('passes raw typing through a ready ownership fence', async () => {
+    const { client, sockets } = await ready(); client.writeToSession('pane', 'plain');
+    expect(sockets[0].actions('Write')[0]).toMatchObject({ payload: { data: 'plain', incarnation: TEST_INCARNATION, attachment_id: expect.any(String) } });
   });
-
-  it('re-establishes every id after the socket opens again', () => {
-    // A new socket generation IS a real gap: the daemon has been emitting into
-    // a channel nobody was reading. Spawn is the daemon's rebind-and-replay
-    // path, so the catch-up survives — it is only the same-generation replay
-    // that was wrong.
-    resetSpawned();
-    captureSends(() => ptyClient.ensureSession('A', '/repo/a'));
-    resetSpawned(); // what ws.onopen does
-
-    const sent = captureSends(() => ptyClient.ensureSession('A', '/repo/a'));
-    expect(sent).toEqual([
-      {
-        action: 'Spawn',
-        payload: { id: 'A', cols: BOOTSTRAP_COLS, rows: BOOTSTRAP_ROWS, cwd: '/repo/a' },
-      },
-    ]);
-    resetSpawned();
+  it('refuses multiline automatic submission instead of inventing a paste wrapper', async () => {
+    const { client, sockets } = await ready();
+    expect(client.submitCommandToSession('pane', 'one\ntwo')).toBe(false);
+    expect(sockets[0].actions('Write')).toEqual([]); expect(sockets[0].actions('Paste')).toEqual([]);
   });
 });
-
-describe('socket reconnection', () => {
-  it('rebinds background and parked sessions with their cwd before flushing input', () => {
-    const sockets: FakeSocket[] = [];
-    class FakeSocket {
-      static OPEN = 1;
-      static CONNECTING = 0;
-      readyState = 0;
-      onopen = () => {};
-      sent: Array<{ action: string; payload: { id?: string; cwd?: string } }> = [];
-      constructor() { sockets.push(this); }
-      send(raw: string) { this.sent.push(JSON.parse(raw)); }
-    }
-    vi.stubGlobal('WebSocket', FakeSocket);
-    try {
-      const client = new (PtyClient as unknown as { new(): PtyClient })();
-      client.ensureSession('background', '/repo/background');
-      client.ensureSession('parked', '/repo/parked');
-      client.ensureSession('active', '/repo/active');
-      sockets[0].readyState = 1;
-      sockets[0].onopen();
-      const receive = (data: unknown) => (client as unknown as { handleServerMessage: (m: unknown) => void }).handleServerMessage(data);
-      expect(client.getIsConnected()).toBe(false);
-      expect(sockets[0].sent.map((m) => m.action)).toEqual(['Auth']);
-      receive({ event: 'AuthResult', data: { success: false, message: 'Authentication required' } });
-      expect(client.getIsConnected()).toBe(false);
-      client.authenticate('fixture');
-      receive({ event: 'AuthResult', data: { success: true, message: 'Authenticated' } });
-      sockets[0].readyState = 3;
-      client.connect();
-      client.writeToSession('background', 'x');
-      sockets[1].readyState = 1;
-      sockets[1].onopen();
-      receive({ event: 'AuthResult', data: { success: true, message: 'Authenticated' } });
-      expect(sockets[1].sent.filter((m) => m.action === 'Spawn').map((m) => [m.payload.id, m.payload.cwd])).toEqual([
-        ['background', '/repo/background'], ['parked', '/repo/parked'], ['active', '/repo/active'],
-      ]);
-      expect(sockets[1].sent.findIndex((m) => m.action === 'Write')).toBeGreaterThan(
-        sockets[1].sent.findIndex((m) => m.action === 'Spawn' && m.payload.id === 'background'),
-      );
-      expect(client.getSessionId()).toBe('active');
-    } finally {
-      vi.unstubAllGlobals();
-    }
-  });
-});
-
-describe('session recovery protocol', () => {
-  it('correlates a listing reply by request id', async () => {
-    let pending!: ReturnType<typeof ptyClient.listSessions>;
-    const sent = captureSends(() => { pending = ptyClient.listSessions(); });
-    const request = sent[0] as { action: string; payload: { request_id: string } };
-    expect(request.action).toBe('ListSessions');
-
-    (ptyClient as unknown as { handleServerMessage: (message: unknown) => void }).handleServerMessage({
-      event: 'SessionListing',
-      data: {
-        request_id: request.payload.request_id,
-        sessions: [{ id: 'orphan', cwd: '/repo', command: 'codex', durable: true }],
-      },
-    });
-
-    await expect(pending).resolves.toMatchObject({
-      request_id: request.payload.request_id,
-      sessions: [{ id: 'orphan' }],
-    });
-  });
-});
-
-/** Feed a chunk to whatever handlers a delivery registered for a session. */
-function echoTo(sessionId: string, chunk: string): void {
-  const handlers = (
-    ptyClient as unknown as {
-      sessionHandlers: Map<string, Set<{ onOutput: (d: string, s: string) => void }>>;
-    }
-  ).sessionHandlers.get(sessionId);
-  handlers?.forEach((h) => h.onOutput(chunk, sessionId));
-}
-
-const payloads = (sent: unknown[]): string[] =>
-  sent
-    .filter((m): m is { action: string; payload: { data: string } } => {
-      return (m as { action?: string }).action === 'Write';
-    })
-    .map((m) => m.payload.data);
-
-describe('command delivery', () => {
-  it('writes the line first and submits only once the shell echoes it', () => {
-    const sent = captureSends(() => {
-      ptyClient.submitCommandToSession('d1', 'echo hi');
-      echoTo('d1', 'user@host:~$ echo hi');
-    });
-    expect(payloads(sent)).toEqual(['echo hi', '\r']);
-  });
-
-  it('holds what is typed during the window and releases it after the line', () => {
-    // Typed inside the delivery window, these used to land INSIDE the command.
-    const sent = captureSends(() => {
-      ptyClient.submitCommandToSession('d2', 'ls');
-      ptyClient.writeToSession('d2', 'x');
-      ptyClient.writeToSession('d2', 'y');
-      echoTo('d2', '$ ls');
-    });
-    expect(payloads(sent)).toEqual(['ls', '\r', 'x', 'y']);
-  });
-
-  it('passes typing straight through when no delivery is in flight', () => {
-    const sent = captureSends(() => {
-      ptyClient.writeToSession('d3', 'plain');
-    });
-    expect(payloads(sent)).toEqual(['plain']);
-  });
-
-  it('sends a multi-line command as one bracketed paste, unverified', () => {
-    const sent = captureSends(() => {
-      ptyClient.submitCommandToSession('d4', 'one\ntwo');
-    });
-    expect(payloads(sent)).toEqual(['\x1b[200~one\ntwo\x1b[201~\n']);
-  });
-});
-
 describe('looksLikeAbsolutePath', () => {
-  it('recognises the paths a user actually types', () => {
-    expect(looksLikeAbsolutePath('/var/home/cleadmon/Projects/Doom Term')).toBe(true);
-    expect(looksLikeAbsolutePath('~/Projects')).toBe(true);
-    expect(looksLikeAbsolutePath('~')).toBe(true);
+  it('recognises absolute and home-relative paths', () => {
+    for (const path of ['/var/home/cleadmon/Projects/Doom Term', '~/Projects', '~']) expect(looksLikeAbsolutePath(path)).toBe(true);
   });
-
-  it('treats a bare word as a filter, not a path', () => {
-    expect(looksLikeAbsolutePath('doom')).toBe(false);
-    expect(looksLikeAbsolutePath('')).toBe(false);
-    expect(looksLikeAbsolutePath('Doom Term')).toBe(false);
+  it('treats bare words as filters', () => {
+    for (const path of ['doom', '', 'Doom Term']) expect(looksLikeAbsolutePath(path)).toBe(false);
   });
-
-  it('tolerates the whitespace typing leaves behind', () => {
-    expect(looksLikeAbsolutePath('  /etc  ')).toBe(true);
-    expect(looksLikeAbsolutePath('   ')).toBe(false);
+  it('tolerates surrounding whitespace', () => {
+    expect(looksLikeAbsolutePath('  /etc  ')).toBe(true); expect(looksLikeAbsolutePath('   ')).toBe(false);
   });
 });
-
-describe('resize across a connection that is not open yet', () => {
-  it('restates the size once the socket opens', () => {
-    // The pane measures itself once on mount. Under Tauri the daemon starts
-    // alongside the webview, so that single Resize is sent into a socket that
-    // is still connecting — and `send` drops it. Without a replay the shell
-    // keeps the 120x30 bootstrap for its whole life: observed on macOS as a
-    // pane stuck at 120x30 while Linux, where the daemon was already up,
-    // negotiated 114x50 from the same code.
-    const internals = ptyClient as unknown as {
-      ws: unknown;
-      isConnected: boolean;
-      flushSizes: () => void;
-    };
-    const priorWs = internals.ws;
-    const priorConnected = internals.isConnected;
-
-    // Socket still CONNECTING: the Resize goes nowhere.
-    const dropped: string[] = [];
-    internals.ws = { readyState: 0, send: (raw: string) => dropped.push(raw) };
-    ptyClient.resizeSession('r1', 114, 50);
-    expect(dropped).toEqual([]);
-
-    // Now it is open and authenticated.
-    const sent: string[] = [];
-    internals.ws = { readyState: 1, send: (raw: string) => sent.push(raw) };
-    internals.isConnected = true;
-    internals.flushSizes();
-
-    expect(sent.map((r) => JSON.parse(r))).toEqual([
-      { action: 'Resize', payload: { id: 'r1', cols: 114, rows: 50 } },
-    ]);
-
-    internals.ws = priorWs;
-    internals.isConnected = priorConnected;
+describe('screen lifetime and delayed sizing', () => {
+  it('coalesces offline sizing and sends the latest only after readiness', async () => {
+    const { client, sockets } = fixture(); client.bindExisting('pane', TEST_INCARNATION);
+    client.resizeSession('pane', 114, 50); client.resizeSession('pane', 100, 40);
+    expect(sockets[0].sent).toEqual([]); sockets[0].open(); await sockets[0].offer('pane');
+    expect(sockets[0].actions('Resize')).toEqual([]); await sockets[0].caughtUp('pane');
+    expect(sockets[0].actions('Resize')).toHaveLength(1);
+    expect(sockets[0].actions('Resize')[0]).toMatchObject({ payload: { cols: 100, rows: 40 } });
   });
-
-  it('does not erase parsed or queued startup output when SessionMode arrives late', async () => {
-    const internals = ptyClient as unknown as {
-      handleServerMessage: (msg: unknown) => void;
-    };
-    const id = 'late-mode-session';
-    const emu = getEmulator(id);
-    try {
-      await emu.writeAndWait('startup banner\r\n');
-      emu.write('$ ');
-      internals.handleServerMessage({
-        event: 'SessionMode',
-        data: { session_id: id, durable: true, detail: null },
-      });
-      await emu.drain();
-      const lines = emu.getLines().map((l) => l.spans.map((s) => s.text).join('').trim());
-      expect(lines.slice(0, 2)).toEqual(['startup banner', '$']);
-    } finally { disposeEmulator(id); }
+  it('rejects legacy metadata without erasing already-parsed startup output', async () => {
+    const { client, sockets } = fixture(); client.bindExisting('pane', TEST_INCARNATION); sockets[0].open(); await sockets[0].ready('pane');
+    sockets[0].record('pane', { type: 'Event', payload: { type: 'Output', payload: { data: 'startup banner\r\n$ ' } } });
+    await vi.waitFor(() => expect(getEmulator('pane').getLines()[0].spans[0].text).toContain('startup banner'));
+    sockets[0].receive('SessionMode', { session_id: 'pane', durable: true });
+    expect(client.getIsConnected()).toBe(false);
+    expect(getEmulator('pane').getLines()[0].spans[0].text).toContain('startup banner');
   });
-
-  it('resets the legacy replay screen before requesting Spawn, never after its output', async () => {
-    const id = 'legacy-spawn-boundary';
-    const emu = getEmulator(id);
-    try {
-      await emu.writeAndWait('stale line\r\n');
-      captureSends(() => ptyClient.spawnSession(id, 80, 24));
-      const lines = emu.getLines().map((l) => l.spans.map((s) => s.text).join('').trim());
-      expect(lines).toEqual(['']);
-    } finally { disposeEmulator(id); }
+  it('does not clear a cached screen merely because creation was requested or offered', async () => {
+    const { client, sockets } = fixture(); const old = getEmulator('new');
+    await old.writeAndWait('cached lines'); sockets[0].open();
+    const creating = client.createSession('new', 80, 24);
+    expect(getEmulator('new')).toBe(old); sockets[0].created('new'); await creating;
+    expect(getEmulator('new')).toBe(old);
+    await sockets[0].offer('new');
+    expect(getEmulator('new')).not.toBe(old);
+    expect(getEmulator('new').getLines()[0].spans.map(span => span.text).join('').trimEnd()).toBe('');
   });
 });
