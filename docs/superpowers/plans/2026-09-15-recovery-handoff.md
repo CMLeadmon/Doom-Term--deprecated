@@ -199,3 +199,41 @@ with no `role`, so a `[role="status"]` probe silently finds nothing. Screenshots
 land in a `mktemp -d` directory named in the log; `failure.png` is written on
 abort and is worth opening.
 
+### Update — blocking defect fixed, browser suite reached full green once
+
+The `incompatible`-misclassification described above is **fixed**. The consumer
+boundary is isolated behind a `ConsumerFault` marker in `recoveryConnection.ts`:
+a consumer fault restarts and reconnects, while malformed frames and
+unnegotiated events still fail closed with no retry. Two guard tests hold both
+sides of that line.
+
+The browser harness also now retypes a line instead of sending it once. Input is
+deliberately never queued or replayed, so a keystroke typed during a reconnect is
+dropped by contract; retyping is what a user does, and it proves the terminal
+comes back rather than going quietly read-only.
+
+With both changes, `npm run test:ui` reached `EXIT=0` with every scenario
+passing, including `cold daemon restart preserves exact editor/root, separates
+history, refuses offline input, and saves the file` — gates 5, 7, 9 and 11's
+browser leg, none of which had ever executed before, because the harness aborts
+on the first hard assertion and one broken scenario hid eight later ones.
+
+Also fixed the PTY-side twin of the durable-exit flake
+(`session::tests::a_natural_durable_pane_exit_is_observed_as_process_closure`),
+which used `/bin/false` and eventually lost the same handshake race. 12/12 now.
+
+**The one remaining blocker is the warm-recovery cell-comparison flake**
+(roughly half of runs). Do not start from scratch on it — the useful facts are:
+
+- Both sides render 510 rows. In a *passing* run both are missing exactly
+  `CELL_458`, `CELL_459`, `CELL_460`. The assertion compares warm against
+  control, so anything wrong in both is invisible to it.
+- Failing runs are the ones where the two sides drop *different* cells.
+- Not scrollback: `xtermScreen` keeps 5,000 lines; the fixture emits ~1,030.
+
+Next step: make the fixture append each cell to a file as well as stdout, and
+diff that file against the rendered rows. That separates "the child never wrote
+it" from "we wrote it and the pipeline lost it". If it is the latter, a terminal
+dropping ~3 lines in 510 under 5 ms output is a rendering defect in its own
+right, well beyond a flaky test.
+

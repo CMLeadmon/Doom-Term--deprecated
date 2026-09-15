@@ -582,3 +582,15 @@ and silently refuses all input. Left unfixed on purpose — the correct split
 between "malformed frame" and "consumer fault" is a contract decision.
 
 This section does not mark the broader beta-readiness goal complete.
+
+**Update, same day.** The blocking defect above is fixed: a `SessionAttachment`
+continuity assertion no longer becomes a permanent `incompatible` disconnect.
+With that and a harness that retypes rather than sending a line once,
+`npm run test:ui` reached `EXIT=0` with every scenario passing for the first
+time, including cold daemon restart, multi-workspace recovery and the offline
+input refusal — legs that had never executed, because the harness aborts on the
+first hard assertion.
+
+Recovery is still not certified: the warm-recovery cell comparison fails about
+half the time, so gates 1-3 cannot be claimed. The remaining evidence and the
+next diagnostic step are recorded in the plan and the handoff log.
