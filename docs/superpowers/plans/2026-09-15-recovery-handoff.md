@@ -24,6 +24,16 @@ toolbox run -c doom-tauri bash -lc 'cd "$PWD" && npm run check:tauri'
 webkit2gtk) and makes `agent:verify` exit `2`. That is not a failure. The
 `doom-tauri` toolbox container has the packages; run it there for real evidence.
 
+> **Caution — the host result goes stale-green.** `check:tauri` shells out to
+> `cargo check --manifest-path src-tauri/Cargo.toml`, and the toolbox shares the
+> home directory, so once a toolbox run populates
+> `src-tauri/target/*/build/libdbus-sys-*/output` the host reuses that cached
+> build-script result and never re-probes for `dbus-1`. The host then prints
+> `tauri shell: checked` — observed on 2026-09-15, in the same tree that had
+> printed ENVIRONMENT BLOCK an hour earlier. Treat a host pass as "the code
+> compiles", never as "this machine has the packages". The toolbox run is the
+> authoritative one.
+
 ### Verified 2026-09-15 (Claude, at working tree on top of `de3edec`)
 
 | Gate | Result |
@@ -34,7 +44,7 @@ webkit2gtk) and makes `agent:verify` exit `2`. That is not a failure. The
 | `npm run hud:check` | pixel-exact against `docs/design/reference/plate-480@1x.png` |
 | `cargo check` | pass |
 | `cargo test` | 0 failed. doom-term-pty 82 + attachment 10; backend 103 passed, 3 ignored |
-| `npm run check:tauri` (host) | ENVIRONMENT BLOCK — missing `dbus-1` |
+| `npm run check:tauri` (host) | ENVIRONMENT BLOCK — missing `dbus-1` (see caution above) |
 | `npm run check:tauri` (doom-tauri toolbox) | `tauri shell: checked` |
 
 The 3 ignored tests are live-account only and are intended to stay ignored:
@@ -103,3 +113,28 @@ The plan's Task 4 notes carried summaries that did not hold when re-run:
 - Recorded findings (1) and (3) above.
 - Ran `check:tauri` in the `doom-tauri` toolbox, converting a standing
   environment block into real evidence for the first time.
+
+**Task 3 closed.** Deleted the three `#[cfg(any())]` blocks in
+`backend/src/main.rs` (legacy `ClientMessage`, `handle_client_msg`, legacy
+`mod tests`) — 749 lines, file 1266 → 514. No wire behaviour changed; the public
+listener already bypassed them.
+
+Before deleting, audited what the disabled tests actually covered, because
+blanket-deleting them would have dropped coverage of *live* code. Restored into
+`security_tests.rs`:
+
+- `defaults_to_loopback_so_the_bundled_daemon_is_not_a_network_shell`
+- `ipv6_loopback_is_a_valid_socket_address`
+- `a_non_loopback_doom_host_is_refused_before_it_can_bind` (new — `loopback_host`
+  had no test at all, despite guarding `DOOM_HOST` against remote binding)
+
+Each was proven to fail against a deliberately broken `listen_addr` default
+before being kept. The remaining legacy tests encode pre-v2 semantics that were
+deliberately replaced (e.g. directory-fallback hook attribution, now forbidden
+by `an_unattributed_hook_cannot_describe_a_pane`), so they were not carried
+over. Backend suite 103 → 106 passing.
+
+Also verified the deletion of `backend/src/paste_tests.rs` was a real migration,
+not coverage loss: `PasteResult` request_id/session_id correlation, the
+no-secret-echo property and multiline refusal are all still asserted, in
+`recovery_tests.rs`, `protocol.rs` and `crates/doom-term-pty/tests/paste.rs`.

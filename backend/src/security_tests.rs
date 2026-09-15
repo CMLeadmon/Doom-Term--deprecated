@@ -169,3 +169,41 @@ async fn security_accepts_fragmented_trusted_upgrade() {
     task.abort();
     assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 101"));
 }
+
+// Bind-address coverage. These assert the daemon's production defaults, which a
+// fixture binding to 127.0.0.1:0 does not exercise. They were lost when the
+// legacy `mod tests` was disabled behind `#[cfg(any())]`; `listen_addr` and
+// `loopback_host` are both still live code.
+
+#[test]
+fn defaults_to_loopback_so_the_bundled_daemon_is_not_a_network_shell() {
+    assert_eq!(listen_addr(None, None), "127.0.0.1:1421");
+}
+
+#[test]
+fn ipv6_loopback_is_a_valid_socket_address() {
+    assert_eq!(
+        listen_addr(Some("::1".to_string()), Some("9000".to_string())),
+        "[::1]:9000"
+    );
+}
+
+#[test]
+fn a_non_loopback_doom_host_is_refused_before_it_can_bind() {
+    for remote in [
+        "0.0.0.0",
+        "::",
+        "192.168.1.10",
+        "example.com",
+        "10.0.0.1",
+        "169.254.169.254",
+    ] {
+        assert!(
+            !security::loopback_host(remote),
+            "{remote} must not be accepted as a loopback bind host"
+        );
+    }
+    for local in ["localhost", "127.0.0.1", "::1", "[::1]"] {
+        assert!(security::loopback_host(local), "{local} is loopback");
+    }
+}
