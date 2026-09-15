@@ -132,3 +132,41 @@ describe('negotiated recovery connection', () => {
     expect(vi.getTimerCount()).toBe(1); // Only the bounded reconnect timer.
   });
 });
+
+describe('stream faults are not protocol incompatibilities', () => {
+  // The attachment state machine throws for ordinary stream-state assertions
+  // ("Record outside its captured phase", "Unacknowledged readiness",
+  // "Record identity changed"). Those ran inside the frame-decoding try, so one
+  // of them permanently marked the daemon incompatible with retry disabled:
+  // output kept rendering while every keystroke was refused forever.
+  it('restarts and reconnects when the consumer rejects a record', () => {
+    vi.useFakeTimers();
+    const f = fixture(); const socket = f.sockets[0]; socket.open(); socket.negotiate();
+    expect(f.connection.state.status).toBe('ready');
+    f.events.mockImplementationOnce(() => { throw new Error('Record outside its captured phase'); });
+    socket.receive('StreamRecord', { record: { session_id: 'pane' } });
+    expect(f.connection.state.status).toBe('disconnected');
+    expect(f.connection.state.message ?? '').not.toMatch(/update both shells/);
+    expect(f.disconnected).toHaveBeenCalled();
+    vi.advanceTimersByTime(2000);
+    expect(f.sockets).toHaveLength(2);
+  });
+
+  it('still refuses a malformed frame permanently and never retries it', () => {
+    vi.useFakeTimers();
+    const f = fixture(); const socket = f.sockets[0]; socket.open(); socket.negotiate();
+    socket.onmessage?.({ data: 'not json at all' });
+    expect(f.connection.state.status).toBe('incompatible');
+    vi.advanceTimersByTime(30000);
+    expect(f.sockets).toHaveLength(1);
+  });
+
+  it('still refuses an unnegotiated event permanently, since that is a real version fault', () => {
+    vi.useFakeTimers();
+    const f = fixture(); const socket = f.sockets[0]; socket.open();
+    socket.receive('StreamRecord', { record: { session_id: 'pane' } });
+    expect(f.connection.state.status).toBe('incompatible');
+    vi.advanceTimersByTime(30000);
+    expect(f.sockets).toHaveLength(1);
+  });
+});

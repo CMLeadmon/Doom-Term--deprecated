@@ -60,6 +60,24 @@ async function stopDaemon() {
   ]);
 }
 
+/** Type a line and submit it, retrying while the attachment is still coming back.
+ * Never queues on the app's behalf: each attempt is a fresh, complete line. */
+async function typeUntilEchoed(page, text, expected, attempts = 10) {
+  const terminal = page.getByTestId('raw-terminal');
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    await terminal.click();
+    await page.keyboard.press('End');
+    await page.keyboard.type(text);
+    await page.keyboard.press('Enter');
+    try {
+      await expect(terminal).toContainText(expected, { timeout: 3000 });
+      return;
+    } catch (error) {
+      if (attempt === attempts - 1) throw error;
+    }
+  }
+}
+
 async function palette(page, search) {
   await page.keyboard.press('Control+Shift+p');
   await page.getByRole('combobox').fill(search);
@@ -281,9 +299,11 @@ process.stdout.write(end + '\\n');
 
   // Use an isolated interactive Bash with bracketed paste explicitly enabled,
   // even on CI hosts whose /bin/sh is dash. No user startup files are sourced.
-  await page.keyboard.type('/bin/bash --noprofile --norc');
-  await page.keyboard.press('Enter');
-  await expect(page.getByTestId('raw-terminal')).toContainText(/bash-[\d.]+[$#]/);
+  // Input is deliberately never queued or replayed, so a keystroke typed during
+  // a reconnect is dropped by contract. Retype until it lands: that is what a
+  // user does, and it proves the terminal actually recovers rather than going
+  // quietly read-only.
+  await typeUntilEchoed(page, '/bin/bash --noprofile --norc', /bash-[\d.]+[$#]/);
   await command(page, "bind 'set enable-bracketed-paste off'; printf 'BRACKET_OFF\\n'", 'BRACKET_OFF');
   await context.grantPermissions(['clipboard-read', 'clipboard-write']);
   for (const newline of ['\r', '\n']) {

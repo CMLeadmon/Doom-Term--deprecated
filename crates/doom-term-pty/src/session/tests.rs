@@ -79,16 +79,35 @@ fn a_natural_durable_pane_exit_is_observed_as_process_closure() {
         );
         return;
     }
+    // The root must outlive its own bootstrap. `/bin/false` exits in
+    // milliseconds and races the display-client handshake in
+    // open_durable_adapter, so creation itself intermittently failed with
+    // "Durable display attachment failed" - the adapter-loss case this test
+    // exists to stay distinct from.
+    use std::os::unix::fs::PermissionsExt;
+    let script_dir = tempfile::tempdir().unwrap();
+    let script = script_dir.path().join("exit-when-told.sh");
+    let finish = script_dir.path().join("finish");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nwhile ! test -e '{}'; do sleep 0.01; done\nexit 0\n",
+            finish.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
     let session = PtySession::create(
         "durable-exit".into(),
         80,
         24,
         None,
-        Some("/bin/false".into()),
+        Some(script.to_string_lossy().into_owned()),
     )
     .unwrap();
     assert!(session.is_durable());
-    let deadline = Instant::now() + Duration::from_secs(3);
+    std::fs::write(&finish, []).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
     while session.stream().snapshot().process_exit.is_none() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(5));
     }

@@ -28,6 +28,13 @@ const legacyEvents = new Set(['PtyEvent', 'SessionMode', 'SessionClosed']);
 
 /** One negotiated socket generation. This layer never stores commands for
  * reconnection. WebSocket ping/pong is handled by the browser implementation. */
+/** Raised when the stream consumer rejects a record, never by frame decoding.
+ * The attachment state machine throws for ordinary continuity assertions, which
+ * is a reason to drop this attachment and reattach - not to declare the daemon
+ * incompatible and stop retrying. Carries no cause: the original can quote
+ * terminal contents. */
+class ConsumerFault extends Error {}
+
 export class RecoveryConnection {
   private current: Readonly<ConnectionState> = Object.freeze({ status: 'disconnected', daemonEpoch: null, message: null });
   private socket: RecoverySocket | null = null;
@@ -115,9 +122,13 @@ export class RecoveryConnection {
           if (typeof name !== 'string') throw new Error('Invalid event');
           this.receive(name, data);
           this.observedFrame();
-        } catch {
+        } catch (error) {
           // Never log raw messages or exceptions containing terminal contents.
-          this.disconnect('incompatible', 'Invalid or incompatible recovery protocol; update both shells together', false);
+          // A malformed frame or an unnegotiated event really is incompatible
+          // and must not retry. A consumer fault is a lost attachment: retrying
+          // is how the terminal comes back instead of silently going read-only.
+          if (error instanceof ConsumerFault) this.restart('Stream continuity fault; reattaching');
+          else this.disconnect('incompatible', 'Invalid or incompatible recovery protocol; update both shells together', false);
         }
       };
       socket.onclose = () => { if (current()) this.restart(); };
@@ -162,7 +173,11 @@ export class RecoveryConnection {
       return;
     }
     if (this.current.status !== 'ready' || event === 'Incompatible' || legacyEvents.has(event)) throw new Error('Unnegotiated event');
-    this.options.onMessage(event, value);
+    try {
+      this.options.onMessage(event, value);
+    } catch {
+      throw new ConsumerFault('Stream consumer rejected a record');
+    }
   }
   authenticate(token: string): void {
     if (encoder.encode(token).length > 4096) throw new Error('Authentication token is too large');
