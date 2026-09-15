@@ -1341,3 +1341,208 @@ async fn recovery_transport_pings_and_expires_a_peer_that_stops_responding() {
     assert!(closed.unwrap().contains("Liveness"));
     assert!(started.elapsed() < Duration::from_secs(33));
 }
+
+/// Concurrent creation of one id, and reservation release.
+///
+/// The existing two-controller test only sends its duplicate *after* the first
+/// create has replied, so it is rejected by the finished sessions map and never
+/// reaches `catalog.creating`. That reservation is what makes creation safe
+/// while a spawn is still in flight, and it had no coverage.
+#[cfg(unix)]
+#[tokio::test]
+async fn recovery_concurrent_creates_reserve_one_id_and_a_failed_create_releases_it() {
+    if isolated("recovery_concurrent_creates_reserve_one_id_and_a_failed_create_releases_it") {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = fixture().await;
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("idle.sh");
+    let finish = dir.path().join("finish");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nwhile ! test -e '{}'; do sleep 0.01; done\n",
+            finish.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    // Every request is in flight before any reply is read, so the losers race
+    // the winner's spawn rather than observing a finished session.
+    let mut sockets = Vec::new();
+    for _ in 0..4 {
+        sockets.push(connect(&fixture).await);
+    }
+    let create = json!({"action":"Create","payload":{
+        "request_id":"create","id":"reserved","cols":80,"rows":24,"shell":script,"cwd":null
+    }});
+    for ws in sockets.iter_mut() {
+        send(ws, create.clone()).await;
+    }
+
+    let mut winners = Vec::new();
+    let mut conflicts = 0;
+    for ws in sockets.iter_mut() {
+        let reply = event(ws, "CreateResult").await;
+        if reply["error"].is_null() {
+            winners.push(reply["incarnation"].clone());
+        } else {
+            assert_eq!(reply["error"]["code"], "conflict", "{reply}");
+            conflicts += 1;
+        }
+    }
+    assert_eq!(winners.len(), 1, "exactly one creator may win an id");
+    assert_eq!(conflicts, 3, "every loser must be told conflict");
+    assert_eq!(
+        fixture.server.sessions.read().len(),
+        1,
+        "a lost race must not leave a second process behind"
+    );
+    // The surviving process is the winner's, not a loser's replacement.
+    let live = fixture
+        .server
+        .sessions
+        .read()
+        .get("reserved")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        json!(live.stream().snapshot().metadata.incarnation),
+        winners[0],
+        "the live pane must be the one whose create succeeded"
+    );
+
+    // A create that fails must release its reservation, or the id is poisoned
+    // for the rest of the daemon's life.
+    let failing = json!({"action":"Create","payload":{
+        "request_id":"bad","id":"retry","cols":80,"rows":24,
+        "shell":dir.path().join("does-not-exist"),"cwd":null
+    }});
+    send(&mut sockets[0], failing).await;
+    let refused = event(&mut sockets[0], "CreateResult").await;
+    assert!(
+        !refused["error"].is_null(),
+        "a missing shell cannot be created: {refused}"
+    );
+    assert!(
+        !fixture.server.sessions.read().contains_key("retry"),
+        "a failed create must not register a session"
+    );
+    let retry = json!({"action":"Create","payload":{
+        "request_id":"retry","id":"retry","cols":80,"rows":24,"shell":script,"cwd":null
+    }});
+    send(&mut sockets[0], retry).await;
+    let created = event(&mut sockets[0], "CreateResult").await;
+    assert!(
+        created["error"].is_null(),
+        "a failed create must release its reservation: {created}"
+    );
+    std::fs::write(&finish, []).unwrap();
+}
+
+/// An evicted resume cursor must be an explicit refusal, never a silent skip.
+///
+/// Spec gate 4 requires bounded retention to produce *explicit* gaps while the
+/// child keeps running. The journal reports `StreamError::Gap` below its
+/// retained window, but nothing asserted what the daemon does with it: a
+/// resume that silently continued from the wrong place would hand the frontend
+/// a transcript with a hole in it and no way to know.
+#[cfg(unix)]
+#[tokio::test]
+async fn recovery_an_evicted_resume_cursor_is_an_explicit_gap_not_a_silent_skip() {
+    if isolated("recovery_an_evicted_resume_cursor_is_an_explicit_gap_not_a_silent_skip") {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = fixture().await;
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("idle.sh");
+    let finish = dir.path().join("finish");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nwhile ! test -e '{}'; do sleep 0.01; done\n",
+            finish.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut ws = connect(&fixture).await;
+    send(
+        &mut ws,
+        json!({"action":"Create","payload":{
+            "request_id":"create","id":"gapped","cols":80,"rows":24,"shell":script,"cwd":null
+        }}),
+    )
+    .await;
+    let created = event(&mut ws, "CreateResult").await;
+    assert!(created["error"].is_null(), "{created}");
+    let incarnation = created["incarnation"].clone();
+    send(
+        &mut ws,
+        json!({"action":"Attach","payload":{
+            "request_id":"attach","id":"gapped","incarnation":incarnation,"resume":null
+        }}),
+    )
+    .await;
+    let attached = event(&mut ws, "AttachResult").await;
+    let epoch = attached["descriptor"]["stream_epoch"].clone();
+    assert!(!epoch.is_null(), "attach must describe its stream: {attached}");
+
+    let child = fixture
+        .server
+        .sessions
+        .read()
+        .get("gapped")
+        .unwrap()
+        .clone();
+    // Push the retained window past sequence 1 using the production record
+    // bound, so the cursor below is genuinely evicted rather than merely old.
+    for i in 0..9_000u32 {
+        child
+            .stream()
+            .append(doom_term_pty::stream::StreamPayload::Event(
+                doom_term_pty::demuxer::DemuxEvent::Output {
+                    data: format!("line {i}\n"),
+                },
+            ))
+            .unwrap();
+    }
+    assert!(
+        child
+            .stream()
+            .read_after(doom_term_pty::stream::Sequence::new(1))
+            .is_err(),
+        "the fixture must actually evict sequence 1"
+    );
+
+    ws.close(None).await.unwrap();
+    let mut next = connect(&fixture).await;
+    let resume = json!({"action":"Attach","payload":{
+        "request_id":"resume","id":"gapped","incarnation":incarnation,
+        "resume":{"stream_epoch":epoch,"after_sequence":"1"}
+    }});
+    let outcome = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            send(&mut next, resume.clone()).await;
+            let reply = event(&mut next, "AttachResult").await;
+            if reply["outcome"] != "busy" {
+                break reply;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the released lease must become attachable");
+    assert_eq!(
+        outcome["outcome"], "unreconstructable",
+        "an evicted cursor must be refused explicitly, not resumed: {outcome}"
+    );
+    assert!(
+        child.is_alive(),
+        "a lost transcript is not a reason to end the child"
+    );
+    std::fs::write(&finish, []).unwrap();
+}

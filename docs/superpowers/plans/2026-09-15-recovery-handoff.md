@@ -138,3 +138,25 @@ Also verified the deletion of `backend/src/paste_tests.rs` was a real migration,
 not coverage loss: `PasteResult` request_id/session_id correlation, the
 no-secret-echo property and multiline refusal are all still asserted, in
 `recovery_tests.rs`, `protocol.rs` and `crates/doom-term-pty/tests/paste.rs`.
+
+**Task 4 closed except its joint-publish box.** Boxes 1-4 verified by re-running
+their named tests; box 5 stays open because it also requires publishing together
+with frontend Task 6.
+
+Two genuine coverage gaps were found and closed, both proven load-bearing by
+breaking the production code and watching the new test catch it:
+
+- `recovery_concurrent_creates_reserve_one_id_and_a_failed_create_releases_it`.
+  The `catalog.creating` reservation had *no* coverage — the existing
+  duplicate-create test sent its second request after the first had replied, so
+  it was rejected by the finished sessions map and never reached the
+  reservation. With the `creating` check removed, all four racing creates win
+  and four real shells are spawned over one id.
+- `recovery_an_evicted_resume_cursor_is_an_explicit_gap_not_a_silent_skip`.
+  The journal reported `StreamError::Gap`, but nothing asserted what the daemon
+  did with it. With the check removed the daemon answers `outcome: "resume"` for
+  a cursor whose records are gone, handing the frontend a transcript with a hole
+  in it and no way to know. This is spec gate 4's "explicit gaps".
+
+Both are deterministic (12/12 and 10/10). Full `agent:verify` exits 0.
+
