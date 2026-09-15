@@ -260,3 +260,77 @@ exec sleep 30
         std::panic::resume_unwind(panic);
     }
 }
+
+/// Fast line output must not lose lines between the child and the journal.
+///
+/// The browser recovery fixture writes 510 numbered lines at 5 ms intervals and
+/// two or three of them, always around CELL_458, never reach the rendered rows -
+/// in the uninterrupted control run, with no disconnect involved. This pins
+/// which side of the socket loses them.
+#[cfg(unix)]
+#[test]
+fn rapid_numbered_lines_all_reach_the_journal() {
+    if std::env::var_os("DOOM_RAPID_LINES_CHILD").is_none() {
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "rapid_numbered_lines_all_reach_the_journal",
+                "--nocapture",
+            ])
+            .env("DOOM_RAPID_LINES_CHILD", "1")
+            .env("DOOM_TERM_NO_TMUX", "1")
+            .env("DOOM_TERM_NO_SHELL_INTEGRATION", "1")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("cells.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\ni=0\nwhile [ $i -lt 510 ]; do printf 'CELL_%03d\\n' $i; i=$((i+1)); done\nprintf 'CELLS_DONE\\n'\nsleep 5\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let session = doom_term_pty::session::PtySession::create(
+        "rapid".into(),
+        80,
+        24,
+        None,
+        Some(script.to_string_lossy().into_owned()),
+    )
+    .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut text = String::new();
+    let mut cursor = doom_term_pty::stream::Sequence::default();
+    while std::time::Instant::now() < deadline && !text.contains("CELLS_DONE") {
+        while let Ok(Some(record)) = session.stream().read_after(cursor) {
+            cursor = record.sequence;
+            if let doom_term_pty::stream::StreamPayload::Event(
+                doom_term_pty::demuxer::DemuxEvent::Output { data },
+            ) = &record.payload
+            {
+                text.push_str(data);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let missing: Vec<String> = (0..510)
+        .map(|i| format!("CELL_{i:03}"))
+        .filter(|cell| !text.contains(cell.as_str()))
+        .collect();
+    let _ = session.kill();
+    assert!(
+        missing.is_empty(),
+        "the journal lost {} of 510 lines: {:?}",
+        missing.len(),
+        missing
+    );
+}

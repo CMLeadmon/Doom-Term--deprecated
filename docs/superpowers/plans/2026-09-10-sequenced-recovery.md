@@ -249,11 +249,27 @@ uninterrupted control`. Diagnosed far enough to hand over precisely:
 - Scrollback is not the cause: `xtermScreen` retains 5,000 lines and the fixture
   emits about 1,030.
 
-So the real question is upstream of the comparison: does the child ever write
-those lines, or does the pipeline lose them? The next step is to have the
-fixture also append each cell to a file and diff that against the rendered rows,
-which separates "never written" from "written and lost". Until that is answered,
-gates 1-3 cannot be claimed, and a terminal that drops about three lines in 510
-under 5 ms output would be a rendering defect worth its own fix.
+That question is now answered, and the answer is worse than a flaky test: the
+lines are **written and then lost**. Having the fixture append each cell to a
+file as well as stdout showed the child wrote all 510 while only 511 of the
+expected 513 rows rendered, with `CELL_458` and `CELL_459` written-but-not-
+rendered and no merged or malformed row anywhere near them - they are simply
+gone, in the uninterrupted control run, with no disconnect involved.
+
+Two new regression tests bound where the loss is *not*:
+
+- `rapid_numbered_lines_all_reach_the_journal` (crates/doom-term-pty) writes 510
+  numbered lines through a real PTY and asserts every one reaches the journal.
+  It passes, so the child and the whole Rust side are exonerated.
+- `xtermScreen.lineloss.test.ts` writes the same 510 lines into the real
+  emulator and asserts `getLines()` keeps them all. It passes, so the emulator,
+  `linesFrom` and the buffer read are exonerated. `getLines()` reads from
+  absolute row 0 and `RawTerminalView` maps every line with no windowing.
+
+So the loss sits in the remaining frontend segment: record delivery and
+`StreamApplication` between the socket and the screen. That is where to look
+next. Until it is found, gates 1-3 cannot be claimed, and note that this is not
+a recovery defect at all - it reproduces on the control run - so it is a
+streaming bug that the recovery comparison merely happened to expose.
 
 `push` and CI inspection are not done.

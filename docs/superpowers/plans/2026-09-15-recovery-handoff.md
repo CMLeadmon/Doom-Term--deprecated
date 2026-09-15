@@ -237,3 +237,23 @@ it" from "we wrote it and the pipeline lost it". If it is the latter, a terminal
 dropping ~3 lines in 510 under 5 ms output is a rendering defect in its own
 right, well beyond a flaky test.
 
+### Update — the flake is a real streaming bug, and it is not about recovery
+
+The documented next step was taken. The child writes all 510 cells; only 511 of
+the expected 513 rows render; `CELL_458` and `CELL_459` are written-but-not-
+rendered, with no merged or malformed row near them. This happens on the
+**control** run, with no disconnect, so it is a plain output-loss bug that the
+recovery comparison merely exposed.
+
+Two regression tests now bound the search, both passing, both kept:
+
+- `rapid_numbered_lines_all_reach_the_journal` - 510 lines through a real PTY all
+  reach the journal. The child and the Rust side are clean.
+- `xtermScreen.lineloss.test.ts` - the same 510 lines into the real emulator all
+  survive `getLines()`. The emulator, `linesFrom` and the buffer read are clean.
+  `getLines()` starts at absolute row 0 and `RawTerminalView` maps every line
+  with no windowing.
+
+That leaves exactly one segment: record delivery and `StreamApplication` between
+the socket and the screen. Start there, not from the beginning.
+
