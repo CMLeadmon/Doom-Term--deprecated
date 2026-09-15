@@ -544,3 +544,41 @@ Install Chromium once with `npx playwright install chromium`, then run
 `npm run test:ui` with port 1420 free. CI installs Chromium's system dependencies
 too. Browser plugin not available in this audit; regular Playwright was used.
 This is a smoke suite, not a claim that every MVP scenario has passed.
+
+### Recovery contract review (2026-09-15; NOT certified)
+
+An independent re-run of the verification gate, rather than a summary of one.
+
+Green: `npm run typecheck`, `npm test` (601 Vitest + Node), `npm run build`,
+pixel-exact `npm run hud:check`, `cargo check`, `cargo test` (0 failed, 3
+ignored live-account only). `npm run check:tauri` is an ENVIRONMENT BLOCK on
+this host and passes inside the `doom-tauri` toolbox. Note that a host
+`check:tauri` goes stale-green once a toolbox run caches the `libdbus-sys`
+build script under `src-tauri/target`; the toolbox run is the authoritative one.
+
+Red: `npm run test:ui` exits 1. Recovery therefore remains uncertified, and the
+eleven spec gates are tracked as an explicit incomplete checklist in the
+[implementation plan](superpowers/plans/2026-09-10-sequenced-recovery.md) under
+Task 7.
+
+Repairs made during the review:
+
+- A ~40% flaky backend test (`recovery_retains_a_natural_durable_pane_exit_as_unknown_status`)
+  was creating a durable session with `/bin/false`, racing the display-client
+  handshake it was supposed to stay distinct from. Now deterministic.
+- The legacy transport was deleted rather than left disabled behind
+  `#[cfg(any())]`, and the live-code coverage that would have been lost with it
+  was restored first, including new `loopback_host` coverage that never existed.
+- Two untested safety properties gained coverage, each proven load-bearing by
+  breaking the production code: the create-id reservation (without it, four
+  racing creates all win and spawn four shells over one id) and the evicted
+  resume cursor (without it, the daemon answers `resume` for a cursor whose
+  records are gone).
+
+Blocking defect for the browser gate: a `SessionAttachment` stream assertion is
+caught by `socket.onmessage` and turned into a permanent `incompatible`
+disconnect with retry disabled, leaving a terminal that renders output normally
+and silently refuses all input. Left unfixed on purpose — the correct split
+between "malformed frame" and "consumer fault" is a contract decision.
+
+This section does not mark the broader beta-readiness goal complete.

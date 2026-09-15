@@ -160,3 +160,42 @@ breaking the production code and watching the new test catch it:
 
 Both are deterministic (12/12 and 10/10). Full `agent:verify` exits 0.
 
+**Task 7 reviewed; recovery is NOT certified.** All five boxes stay open. The
+eleven-gate checklist lives in the plan under Task 7 — read it before doing
+anything else here.
+
+Headline: the browser suite (`npm run test:ui`) exits 1. It is the only thing
+that can certify recovery, and it does not pass.
+
+One blocking defect, diagnosed and reproduced three times:
+
+> `RecoveryConnection.receive` calls `options.onMessage(...)` inside
+> `socket.onmessage`'s `try`, so a `SessionAttachment` protocol assertion
+> (`Record outside its captured phase`, `Unacknowledged readiness`,
+> `Record identity changed`) lands in the catch that calls
+> `disconnect('incompatible', …, false)`. Retry is `false`, so a recoverable
+> attachment fault permanently marks the daemon incompatible.
+
+Symptom: after a second disconnect coinciding with a viewport resize, output
+keeps flowing and the screen looks healthy, but every keystroke is refused with
+`Connection disconnected or not negotiated; input was not sent`. The refusal is
+a self-clearing toast, so within a second or two the terminal simply looks live
+and is not. That is the false ready state gate 10 forbids.
+
+**Not fixed, deliberately.** Splitting that catch changes a safety contract:
+malformed frames genuinely are incompatible and must not retry, while a consumer
+exception should drop and restart only that attachment. Which exceptions land on
+which side is the owner's call. Whoever picks this up should start there.
+
+Second, independent problem: the warm-recovery cell comparison is flaky on its
+own (one failure in three runs), so gates 1-3 cannot be claimed until it is
+stabilised. Because the suite aborts on the first hard failure, gates 5, 7 and 9
+and the whole cold-daemon-restart leg have never executed at all.
+
+Method note for whoever continues: the browser harness aborts `main()` on the
+first hard assertion, so a single broken scenario hides every later one. When
+chasing a failure, instrument in place — the refusal toast is a plain `<div>`
+with no `role`, so a `[role="status"]` probe silently finds nothing. Screenshots
+land in a `mktemp -d` directory named in the log; `failure.png` is written on
+abort and is worth opening.
+
