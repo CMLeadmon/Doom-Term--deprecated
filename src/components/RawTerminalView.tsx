@@ -66,6 +66,7 @@ interface TerminalLineRowProps {
   isMarked: boolean;
   isCursorHere: boolean;
   cursorCol?: number;
+  hasFocus?: boolean;
 }
 
 const TerminalLineRow = React.memo(function TerminalLineRow({
@@ -74,6 +75,7 @@ const TerminalLineRow = React.memo(function TerminalLineRow({
   isMarked,
   isCursorHere,
   cursorCol = 0,
+  hasFocus = false,
 }: TerminalLineRowProps) {
   return (
     <div
@@ -101,8 +103,9 @@ const TerminalLineRow = React.memo(function TerminalLineRow({
               left: `${cursorCol}ch`,
               width: '1ch',
               height: '100%',
-              background: 'var(--st-live)',
-              mixBlendMode: 'difference',
+              background: hasFocus ? 'var(--st-live)' : 'transparent',
+              boxShadow: hasFocus ? 'none' : 'inset 0 0 0 1px var(--st-live)',
+              mixBlendMode: hasFocus ? 'difference' : 'normal',
             }}
           />
         )}
@@ -247,8 +250,6 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
     [lines],
   );
 
-  const [scrollTopState, setScrollTopState] = useState(0);
-
   // Take the keyboard as soon as this pane is the active one. A pass-through
   // terminal that is not focused is a terminal you cannot type into, and there
   // is nothing on screen to tell you why — which is exactly how it failed.
@@ -306,44 +307,8 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
     } else {
       detach(sessionId, Math.round((el.scrollTop / Math.max(1, el.scrollHeight)) * lines.length));
       sessionScrollPositions.set(sessionId, el.scrollTop);
-      setScrollTopState(el.scrollTop);
     }
   };
-
-  const VIRTUAL_THRESHOLD = 120;
-  const ROW_HEIGHT_PX = 17;
-  const OVERSCAN = 35;
-
-  const { startRow, endRow, topPaddingPx, bottomPaddingPx } = React.useMemo(() => {
-    const count = lines.length;
-    if (count <= VIRTUAL_THRESHOLD) {
-      return { startRow: 0, endRow: count, topPaddingPx: 0, bottomPaddingPx: 0 };
-    }
-
-    const clientH = scrollRef.current?.clientHeight || 800;
-    const visibleCount = Math.ceil(clientH / ROW_HEIGHT_PX);
-
-    if (!detachedRef.current) {
-      const start = Math.max(0, count - visibleCount - OVERSCAN);
-      return {
-        startRow: start,
-        endRow: count,
-        topPaddingPx: start * ROW_HEIGHT_PX,
-        bottomPaddingPx: 0,
-      };
-    }
-
-    const firstVisible = Math.floor(scrollTopState / ROW_HEIGHT_PX);
-    const start = Math.max(0, firstVisible - OVERSCAN);
-    const end = Math.min(count, firstVisible + visibleCount + OVERSCAN);
-
-    return {
-      startRow: start,
-      endRow: end,
-      topPaddingPx: start * ROW_HEIGHT_PX,
-      bottomPaddingPx: (count - end) * ROW_HEIGHT_PX,
-    };
-  }, [lines.length, scrollTopState]);
 
   const copyText = React.useCallback(async (text: string) => {
     try {
@@ -448,9 +413,9 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
       detachedRef.current = true;
       detach(sessionId, target);
       const row = scrollRef.current.querySelector<HTMLElement>(`[data-terminal-line="${target}"]`);
-      const offset = row ? row.offsetTop : target * 17;
-      scrollRef.current.scrollTop = Math.max(0, offset - scrollRef.current.clientHeight / 4);
-      setScrollTopState(scrollRef.current.scrollTop);
+      if (row) {
+        scrollRef.current.scrollTop = Math.max(0, row.offsetTop - scrollRef.current.clientHeight / 4);
+      }
     }
   }, [copyText, lines, marks, readClipboard, sessionId]);
 
@@ -470,10 +435,10 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
     if (!st.hits) return;
     const el = scrollRef.current;
     const row = el.querySelector<HTMLElement>(`[data-terminal-line="${st.line}"]`);
-    detachedRef.current = true;
-    const offset = row ? row.offsetTop : st.line * 17;
-    el.scrollTop = Math.max(0, offset - el.clientHeight / 2);
-    setScrollTopState(el.scrollTop);
+    if (row) {
+      detachedRef.current = true;
+      el.scrollTop = Math.max(0, row.offsetTop - el.clientHeight / 2);
+    }
   });
 
   // Size from the grid container rather than the outer box. They are nearly the
@@ -656,10 +621,8 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
       >
         {recoveredHistory && <RecoveredHistory cache={recoveryCacheLines}
           cacheTruncated={recoveryCacheTruncated} history={recoveredHistory} />}
-        {topPaddingPx > 0 && <div style={{ height: `${topPaddingPx}px` }} aria-hidden="true" />}
-        {lines.slice(startRow, endRow).map((line, offset) => {
-          const i = startRow + offset;
-          const isCursorHere = isActive && hasFocus && cursor
+        {lines.map((line, i) => {
+          const isCursorHere = isActive && cursor
             ? (line.row !== undefined ? cursor.row === line.row : cursor.row === i)
             : false;
           return (
@@ -670,10 +633,10 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
               isMarked={marks.has(i)}
               isCursorHere={isCursorHere}
               cursorCol={cursor?.col}
+              hasFocus={hasFocus}
             />
           );
         })}
-        {bottomPaddingPx > 0 && <div style={{ height: `${bottomPaddingPx}px` }} aria-hidden="true" />}
       </div>
 
       {/*

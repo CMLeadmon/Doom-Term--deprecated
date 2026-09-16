@@ -329,7 +329,25 @@ describe('RawTerminalView', () => {
     expect(line1?.contains(cursorEl)).toBe(true);
   });
 
-  it('virtualizes large scrollback buffers while maintaining full scroll height', () => {
+  it('renders a hollow cursor when active but unfocused', () => {
+    render(
+      <RawTerminalView
+        {...base}
+        isActive
+        cursor={{ row: 0, col: 2 }}
+        lines={[{ id: 'line-0', row: 0, spans: [{ text: 'hello' }], timestamp: 0 }]}
+      />,
+    );
+    const terminal = screen.getByTestId('raw-terminal');
+    fireEvent.blur(terminal);
+
+    const cursorEl = screen.getByTestId('terminal-cursor');
+    expect(cursorEl).toBeDefined();
+    expect(cursorEl.style.background).toBe('transparent');
+    expect(cursorEl.style.boxShadow).toBe('inset 0 0 0 1px var(--st-live)');
+  });
+
+  it('renders all scrollback lines maintaining complete DOM visibility', () => {
     const manyLines = Array.from({ length: 300 }, (_, idx) => ({
       id: `row-${idx}`,
       row: idx,
@@ -341,15 +359,13 @@ describe('RawTerminalView', () => {
       <RawTerminalView
         {...base}
         isActive
-        sessionId="virtual-test"
+        sessionId="scrollback-test"
         lines={manyLines}
       />,
     );
 
     const terminal = screen.getByTestId('raw-terminal');
     const renderedRows = terminal.querySelectorAll('[data-terminal-line]');
-    // Should render a windowed subset, not all 300 rows
-    expect(renderedRows.length).toBeLessThan(300);
-    expect(renderedRows.length).toBeGreaterThan(10);
+    expect(renderedRows.length).toBe(300);
   });
 });
