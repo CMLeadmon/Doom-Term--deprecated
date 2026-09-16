@@ -201,7 +201,7 @@ tests never run. See the handoff log for evidence.
 - [x] Exercise production-size retention/global/outbound limits and slow consumers; assert process continues while attachment reports gap/overflow. Verify no replayed input or restarted command.
 - [x] Verify multiple workspaces/parked sessions, daemon-only recovery choices, second controller, missing/replaced process, lost paste/create result, archive failure, auth/version refusal and helper deadlines.
 - [x] Run `npm run typecheck`, `npm test`, `npm run build`, `npm run hud:check`, `cargo check --locked`, `cargo test --locked`, native all-target check in the available container, and production-CSP browser smoke/recovery. Inspect screenshots and record exact artifacts/environment blocks.
-- [ ] Review every spec gate against evidence. Mark implemented only when all eleven gates pass; otherwise retain an explicit incomplete checklist. Commit/push and inspect CI. Do not mark the broader beta-readiness goal complete solely because recovery passes.
+- [x] Review every spec gate against evidence. Mark implemented only when all eleven gates pass; otherwise retain an explicit incomplete checklist. Commit/push and inspect CI. Do not mark the broader beta-readiness goal complete solely because recovery passes.
 
 ### Eleven-gate review, 2026-09-15 (Claude)
 
@@ -248,5 +248,13 @@ tests never run. See the handoff log for evidence.
    gates 1 and 2 require and sits inside the viewport where no repaint disturbs
    it. Three consecutive green runs.
 
-Recovery is implemented. Per the box below, this does **not** mark the broader
+**Pushed and CI inspected.** Run `35040674721` on `4f90fd7` is green. The first
+push (`55f8b1e`) went red and is worth recording: these recovery scenarios were
+uncommitted when the previous green run happened, so pushing exercised them on
+CI for the first time and the browser suite failed there while passing locally —
+that host's daemon shell is dash and cannot find `/bin/bash`, which the
+clipboard leg hard-coded. Bash is now resolved at runtime and its absence prints
+an environment block instead of failing or, worse, quietly passing.
+
+Recovery is implemented. Per this box, that does **not** mark the broader
 beta-readiness goal complete.
