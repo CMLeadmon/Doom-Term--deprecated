@@ -12,7 +12,7 @@
 #
 # Options:
 #   --title <text>    Human-readable title (default: "Artifact")
-#   --type <type>     Content type: markdown | html | diff | dashboard (default: markdown)
+#   --type <type>     Content type: markdown | html | diff | dashboard | image (default: markdown)
 #   --id <id>         Stable artifact id for updates (optional)
 #   --no-open         Do not automatically open a split pane in Doom Term
 #   --port <port>     Daemon port (defaults to $DOOM_PORT or 1421)
@@ -25,6 +25,30 @@ ID=""
 OPEN_PANE=true
 PORT="${DOOM_PORT:-1421}"
 FILE=""
+
+is_image_file() {
+  case "$1" in
+    *.png|*.PNG|*.jpg|*.JPG|*.jpeg|*.JPEG|*.gif|*.GIF|*.webp|*.WEBP|*.svg|*.SVG|*.bmp|*.BMP|*.ico|*.ICO)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+get_image_mime() {
+  case "$1" in
+    *.png|*.PNG) echo "image/png" ;;
+    *.jpg|*.JPG|*.jpeg|*.JPEG) echo "image/jpeg" ;;
+    *.gif|*.GIF) echo "image/gif" ;;
+    *.webp|*.WEBP) echo "image/webp" ;;
+    *.svg|*.SVG) echo "image/svg+xml" ;;
+    *.bmp|*.BMP) echo "image/bmp" ;;
+    *.ico|*.ICO) echo "image/x-icon" ;;
+    *) echo "image/png" ;;
+  esac
+}
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -65,7 +89,23 @@ if [ -n "$FILE" ]; then
     echo "Error: File not found: $FILE" >&2
     exit 1
   fi
-  CONTENT=$(cat "$FILE")
+  if is_image_file "$FILE" || [ "$TYPE" = "image" ]; then
+    TYPE="image"
+    MIME=$(get_image_mime "$FILE")
+    if command -v base64 >/dev/null 2>&1; then
+      B64=$(base64 "$FILE" 2>/dev/null | tr -d '\r\n')
+    elif command -v python3 >/dev/null 2>&1; then
+      B64=$(python3 -c 'import sys, base64; sys.stdout.write(base64.b64encode(open(sys.argv[1], "rb").read()).decode("ascii"))' "$FILE")
+    elif command -v node >/dev/null 2>&1; then
+      B64=$(node -e 'process.stdout.write(require("fs").readFileSync(process.argv[1]).toString("base64"))' "$FILE")
+    else
+      echo "Error: base64 utility required to encode image file" >&2
+      exit 1
+    fi
+    CONTENT="data:${MIME};base64,${B64}"
+  else
+    CONTENT=$(cat "$FILE")
+  fi
 else
   # Read from stdin
   CONTENT=$(cat)

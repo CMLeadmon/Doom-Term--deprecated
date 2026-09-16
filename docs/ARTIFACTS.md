@@ -10,8 +10,9 @@ Artifacts allow autonomous AI agents (`claude`, `codex`, `gemini`, `agy`), devel
 
 1. **Integrated In-App Split Panes (`kind: 'artifact'`)**:
    - Rendered natively in Doom Term's binary `PaneTree`.
-   - Formatted Markdown with code syntax blocks, task checkboxes, tables, and GitHub-style alerts (`[!NOTE]`, `[!TIP]`, `[!IMPORTANT]`, `[!WARNING]`, `[!CAUTION]`).
+   - Formatted Markdown with code syntax blocks, task checkboxes, tables, GitHub-style alerts (`[!NOTE]`, `[!TIP]`, `[!IMPORTANT]`, `[!WARNING]`, `[!CAUTION]`), and embedded inline images (`![alt](url)`).
    - Unified/split Git diff viewer with file summary cards, green additions (`--st-pass`), red deletions (`--st-fail`), and hunk stats.
+   - Dedicated Image Viewer (`type: 'image'`) with FIT / 1:1 original toggle, dimension readout, and transparency checkerboard.
    - HTML / Web application previews.
 2. **Local Daemon Serving & Instant Live Reload**:
    - Every artifact is hosted on loopback at `http://127.0.0.1:1421/artifact/:id`.
@@ -31,8 +32,11 @@ Artifacts allow autonomous AI agents (`claude`, `codex`, `gemini`, `agy`), devel
 Any child shell running inside Doom Term has `doom-term-artifact.sh` available in `tools/agent-hooks/`:
 
 ```bash
-# Push a Markdown PR walkthrough
+# Push a Markdown PR walkthrough (with optional inline ![Alt](url) images)
 tools/agent-hooks/doom-term-artifact.sh --title "PR Walkthrough" --type markdown report.md
+
+# Publish an image directly (auto-detects PNG/JPEG/SVG/GIF/WebP and base64 encodes)
+tools/agent-hooks/doom-term-artifact.sh --title "Architecture Diagram" architecture.png
 
 # Pipe Git diff directly to a live diff pane
 git diff | tools/agent-hooks/doom-term-artifact.sh --title "Refactor Diff" --type diff

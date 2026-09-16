@@ -131,7 +131,7 @@ export interface SessionNode {
   scratchpadContent?: string;
   artifactId?: string;
   artifactTitle?: string;
-  artifactType?: 'html' | 'markdown' | 'diff' | 'dashboard';
+  artifactType?: 'html' | 'markdown' | 'diff' | 'dashboard' | 'image';
   artifactContent?: string;
   artifactVersion?: number;
   artifactUpdatedAt?: number;

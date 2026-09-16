@@ -22,7 +22,7 @@ pub struct ArtifactRecord {
     pub id: String,
     pub title: String,
     #[serde(rename = "type")]
-    pub artifact_type: String, // "html" | "markdown" | "diff" | "dashboard"
+    pub artifact_type: String, // "html" | "markdown" | "diff" | "dashboard" | "image"
     pub content: String,
     pub version: u32,
     pub session_id: Option<String>,
@@ -262,6 +262,10 @@ impl ArtifactHub {
                 let formatted_diff = render_diff_html(&record.content);
                 format_chrome_page(&record.title, &record.id, record.version, "DIFF", &formatted_diff, &live_script)
             }
+            "image" => {
+                let formatted_img = render_image_html(&record.content, &record.title);
+                format_chrome_page(&record.title, &record.id, record.version, "IMAGE", &formatted_img, &live_script)
+            }
             _ => {
                 // Markdown or text
                 let formatted_md = render_markdown_html(&record.content);
@@ -379,6 +383,19 @@ fn render_diff_html(content: &str) -> String {
     out
 }
 
+fn render_image_html(src: &str, alt: &str) -> String {
+    let escaped_src = html_escape(src.trim());
+    let escaped_alt = html_escape(alt);
+    format!(
+        r#"<div style="display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 200px; background: #0e0d0b; box-shadow: var(--bevel-dn); padding: 16px;">
+  <img src="{src}" alt="{alt}" style="max-width: 100%; height: auto; border: 1px solid #2f2f2e; display: block;" />
+  <div style="margin-top: 8px; font-size: 11px; color: var(--ink-dim);">{alt}</div>
+</div>"#,
+        src = escaped_src,
+        alt = escaped_alt
+    )
+}
+
 fn render_markdown_html(content: &str) -> String {
     let mut out = String::new();
     let mut in_code_block = false;
@@ -399,6 +416,23 @@ fn render_markdown_html(content: &str) -> String {
             out.push_str(&html_escape(line));
             out.push('\n');
             continue;
+        }
+
+        let trimmed = line.trim();
+        if trimmed.starts_with("![") && trimmed.ends_with(')') && trimmed.contains("](") {
+            let inner = &trimmed[2..trimmed.len() - 1];
+            if let Some((alt, src)) = inner.split_once("](") {
+                out.push_str(&format!(
+                    "<div style=\"display: flex; flex-direction: column; align-items: center; margin: 12px 0; padding: 12px; background: #0e0d0b; box-shadow: var(--bevel-dn);\">\
+                     <img src=\"{}\" alt=\"{}\" style=\"max-width: 100%; height: auto; border: 1px solid #2f2f2e; display: block;\" />\
+                     <div style=\"margin-top: 6px; font-size: 10px; color: var(--ink-dim);\">{}</div>\
+                     </div>\n",
+                    html_escape(src.trim()),
+                    html_escape(alt),
+                    html_escape(alt),
+                ));
+                continue;
+            }
         }
 
         let escaped = html_escape(line);
@@ -563,5 +597,31 @@ mod tests {
         assert!(html.contains("ARTIFACT: My Doc"));
         assert!(html.contains("doc-1"));
         assert!(html.contains("WebSocket"));
+    }
+
+    #[test]
+    fn publish_image_artifact_and_render_html() {
+        let hub = ArtifactHub::new();
+        let post = ArtifactPost {
+            id: Some("img-1".into()),
+            title: "Diagram".into(),
+            artifact_type: "image".into(),
+            content: "data:image/png;base64,iVBORw0KGgo=".into(),
+            session_id: None,
+            open_pane: Some(true),
+        };
+        let (record, open_pane) = hub.publish_or_update(post, None).unwrap();
+        assert_eq!(record.artifact_type, "image");
+        assert!(open_pane);
+        let html = hub.render_standalone_page(&record);
+        assert!(html.contains("[IMAGE]"));
+        assert!(html.contains("<img src=\"data:image/png;base64,iVBORw0KGgo=\" alt=\"Diagram\""));
+    }
+
+    #[test]
+    fn render_markdown_with_embedded_images() {
+        let md = "# Title\n\n![Screenshot](https://example.com/shot.png)\n\nParagraph text";
+        let html = render_markdown_html(md);
+        assert!(html.contains("<img src=\"https://example.com/shot.png\" alt=\"Screenshot\""));
     }
 }

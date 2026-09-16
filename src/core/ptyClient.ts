@@ -22,7 +22,7 @@ export interface AgentHookEvent {
 export interface ArtifactRecord {
   id: string;
   title: string;
-  type: 'html' | 'markdown' | 'diff' | 'dashboard';
+  type: 'html' | 'markdown' | 'diff' | 'dashboard' | 'image';
   content: string;
   version: number;
   session_id?: string | null;

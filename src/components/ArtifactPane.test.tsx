@@ -110,4 +110,46 @@ describe('ArtifactPane', () => {
     fireEvent.click(closeBtn);
     expect(onClose).toHaveBeenCalled();
   });
+
+  it('renders markdown artifact with embedded image', () => {
+    const mdNode: SessionNode = {
+      ...baseNode,
+      artifactTitle: 'Architecture Plan',
+      artifactType: 'markdown',
+      artifactContent: '# Plan\n\n![System Topology](https://example.com/system.png)\n\nDetails below.',
+    };
+
+    render(<ArtifactPane node={mdNode} />);
+
+    const img = screen.getByTestId('markdown-image') as HTMLImageElement;
+    expect(img).toBeTruthy();
+    expect(img.src).toBe('https://example.com/system.png');
+    expect(img.alt).toBe('System Topology');
+    expect(screen.getByText('System Topology')).toBeTruthy();
+  });
+
+  it('renders dedicated image artifact with fit and 1:1 view toggle', () => {
+    const imageNode: SessionNode = {
+      ...baseNode,
+      artifactTitle: 'Screenshot',
+      artifactType: 'image',
+      artifactContent: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+    };
+
+    render(<ArtifactPane node={imageNode} />);
+
+    expect(screen.getByText('[IMAGE]')).toBeTruthy();
+    const imgEl = screen.getByTestId('artifact-image-element') as HTMLImageElement;
+    expect(imgEl).toBeTruthy();
+    expect(imgEl.src).toContain('data:image/png;base64');
+    expect(imgEl.alt).toBe('Screenshot');
+
+    const toggleBtn = screen.getByTestId('image-zoom-toggle');
+    expect(toggleBtn.textContent).toBe('1:1 ORIGINAL');
+    expect(imgEl.className).toContain('max-w-full');
+
+    fireEvent.click(toggleBtn);
+    expect(toggleBtn.textContent).toBe('FIT TO PANE');
+    expect(imgEl.className).not.toContain('max-w-full');
+  });
 });

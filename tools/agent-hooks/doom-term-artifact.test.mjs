@@ -107,3 +107,29 @@ test('doom-term-artifact reads content from file argument', async (t) => {
   assert.equal(parsed.open_pane, false);
   assert.equal(parsed.content, 'diff --git a/foo b/foo\n+line');
 });
+
+test('doom-term-artifact auto-detects image files and encodes as base64 data URI', async (t) => {
+  const { port, requests } = await fixture(t);
+  const tempImage = join(tmpdir(), `artifact-test-${Date.now()}.png`);
+  // Minimal 1x1 PNG transparent pixel
+  const pngBytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==', 'base64');
+  writeFileSync(tempImage, pngBytes);
+  t.after(() => {
+    try { unlinkSync(tempImage); } catch {}
+  });
+
+  const result = await runCli(
+    t,
+    ['--title', 'Test Image File', '--port', port, tempImage],
+    undefined
+  );
+
+  assert.equal(result.code, 0);
+  assert.equal(requests.length, 1);
+
+  const parsed = JSON.parse(requests[0].body);
+  assert.equal(parsed.title, 'Test Image File');
+  assert.equal(parsed.type, 'image');
+  assert.equal(parsed.open_pane, true);
+  assert.match(parsed.content, /^data:image\/png;base64,iVBOR/);
+});

@@ -116,6 +116,8 @@ export const ArtifactPane: React.FC<ArtifactPaneProps> = ({
           <DiffViewer content={content} />
         ) : type === 'html' || type === 'dashboard' ? (
           <HtmlViewer content={content} onOpenExternal={handleOpenInBrowser} />
+        ) : type === 'image' ? (
+          <ImageViewer content={content} title={title} />
         ) : (
           <MarkdownViewer content={content} />
         )}
@@ -233,6 +235,73 @@ const HtmlViewer: React.FC<HtmlViewerProps> = ({ content, onOpenExternal }) => {
   );
 };
 
+interface ImageViewerProps {
+  content: string;
+  title: string;
+}
+
+const ImageViewer: React.FC<ImageViewerProps> = ({ content, title }) => {
+  const [zoomMode, setZoomMode] = useState<'fit' | 'natural'>('fit');
+  const [naturalSize, setNaturalSize] = useState<{ width: number; height: number } | null>(null);
+
+  const src = content.trim();
+  if (!src) {
+    return <div className="text-[12px] italic text-[#8f8672]">[Empty image artifact]</div>;
+  }
+
+  return (
+    <div className="flex flex-col h-full gap-2 font-mono" data-testid="image-viewer">
+      <div
+        className="px-2 py-1 flex justify-between items-center bev-dn text-[11px]"
+        style={{ background: 'var(--ground)' }}
+      >
+        <div className="flex items-center gap-2" style={{ color: 'var(--ink-dim)' }}>
+          <span>MODE:</span>
+          <button
+            onClick={() => setZoomMode(zoomMode === 'fit' ? 'natural' : 'fit')}
+            className="px-1.5 py-0.5 text-[10px] plate bev-up font-bold cursor-pointer"
+            style={{ color: 'var(--ink-plate)' }}
+            data-testid="image-zoom-toggle"
+          >
+            {zoomMode === 'fit' ? '1:1 ORIGINAL' : 'FIT TO PANE'}
+          </button>
+        </div>
+        {naturalSize && (
+          <div className="text-[10px]" style={{ color: 'var(--ink-dim)' }} data-testid="image-dimensions">
+            {naturalSize.width} × {naturalSize.height} px
+          </div>
+        )}
+      </div>
+
+      <div
+        className="flex-1 min-h-0 flex items-center justify-center p-3 bev-dn overflow-auto"
+        style={{
+          background: '#0e0d0b',
+          backgroundImage:
+            'linear-gradient(45deg, #14120f 25%, transparent 25%), linear-gradient(-45deg, #14120f 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #14120f 75%), linear-gradient(-45deg, transparent 75%, #14120f 75%)',
+          backgroundSize: '16px 16px',
+          backgroundPosition: '0 0, 0 8px, 8px -8px, -8px 0px',
+        }}
+      >
+        <img
+          src={src}
+          alt={title}
+          data-testid="artifact-image-element"
+          onLoad={(e) => {
+            const img = e.currentTarget;
+            setNaturalSize({ width: img.naturalWidth, height: img.naturalHeight });
+          }}
+          className={zoomMode === 'fit' ? 'max-w-full max-h-full object-contain select-none' : 'select-none'}
+          style={{
+            border: '1px solid #2f2f2e',
+            display: 'block',
+          }}
+        />
+      </div>
+    </div>
+  );
+};
+
 interface MarkdownViewerProps {
   content: string;
 }
@@ -281,6 +350,39 @@ const MarkdownViewer: React.FC<MarkdownViewerProps> = ({ content }) => {
 
     if (inCodeBlock) {
       codeBuffer.push(line);
+      continue;
+    }
+
+    // Image syntax: ![alt](src)
+    const imgMatch = line.trim().match(/^!\[(.*?)\]\((.*?)\)$/);
+    if (imgMatch) {
+      const alt = imgMatch[1];
+      const src = imgMatch[2];
+      renderedElements.push(
+        <div
+          key={i}
+          className="my-2 p-2 bev-dn flex flex-col items-center max-w-full"
+          style={{ background: '#0e0d0b' }}
+          data-testid="markdown-image-container"
+        >
+          <img
+            src={src}
+            alt={alt}
+            data-testid="markdown-image"
+            className="max-w-full h-auto object-contain select-none"
+            style={{ border: '1px solid #2f2f2e' }}
+            loading="lazy"
+          />
+          {alt && (
+            <span
+              className="text-[10px] mt-1.5 select-text"
+              style={{ color: 'var(--ink-dim)' }}
+            >
+              {alt}
+            </span>
+          )}
+        </div>
+      );
       continue;
     }
 
