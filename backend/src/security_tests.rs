@@ -271,3 +271,54 @@ async fn artifact_post_and_get_endpoints_work() {
     assert!(resp_str3.contains("# Summary\nAll tests pass."));
 }
 
+#[tokio::test]
+async fn security_serves_cli_artifact_and_hook_scripts() {
+    let (addr, _, task) = server().await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(format!("GET /doom-term-artifact HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.unwrap();
+    let text = String::from_utf8_lossy(&buf);
+    assert!(text.starts_with("HTTP/1.1 200 OK"));
+    assert!(text.contains("Content-Type: text/x-shellscript"));
+    assert!(text.contains("Doom Term Artifact Publisher"));
+    task.await.unwrap();
+}
+
+#[test]
+fn provision_cli_tools_creates_executable_helpers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().to_str().unwrap().to_string();
+    let orig_home = std::env::var("HOME").ok();
+    std::env::set_var("HOME", &home);
+
+    provision_cli_tools();
+
+    if let Some(h) = orig_home {
+        std::env::set_var("HOME", h);
+    }
+
+    let artifact_bin = tmp.path().join(".local").join("bin").join("doom-term-artifact");
+    assert!(artifact_bin.exists());
+    let content = std::fs::read_to_string(&artifact_bin).unwrap();
+    assert!(content.contains("Doom Term Artifact Publisher"));
+
+    let doom_bin = tmp.path().join(".doom-term").join("bin").join("doom-term-artifact");
+    assert!(doom_bin.exists());
+
+    let hook_file = tmp.path().join(".doom-term").join("agent-hooks").join("doom-term-hook.sh");
+    assert!(hook_file.exists());
+    let hook_content = std::fs::read_to_string(&hook_file).unwrap();
+    assert!(hook_content.contains("Doom Term agent hook"));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&artifact_bin).unwrap().permissions().mode();
+        assert_eq!(mode & 0o111, 0o111);
+    }
+}
+

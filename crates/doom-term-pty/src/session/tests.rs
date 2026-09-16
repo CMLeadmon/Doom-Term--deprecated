@@ -187,3 +187,26 @@ fn a_reaped_direct_handle_cannot_signal_a_reused_numeric_pid() {
     }
     panic!("the second real process did not survive the stale kill attempt");
 }
+
+#[test]
+fn augmented_path_prepends_user_bins_when_missing() {
+    let orig_home = std::env::var("HOME").ok();
+    let orig_path = std::env::var("PATH").ok();
+
+    std::env::set_var("HOME", "/custom/user");
+    std::env::set_var("PATH", "/usr/bin:/bin");
+
+    let aug = augmented_path().unwrap();
+    assert!(aug.starts_with("/custom/user/.local/bin:/custom/user/.doom-term/bin:/usr/bin:/bin"));
+
+    // When already in PATH, returns None
+    std::env::set_var("PATH", aug);
+    assert!(augmented_path().is_none());
+
+    if let Some(h) = orig_home {
+        std::env::set_var("HOME", h);
+    }
+    if let Some(p) = orig_path {
+        std::env::set_var("PATH", p);
+    }
+}

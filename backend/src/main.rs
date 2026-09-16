@@ -183,6 +183,67 @@ fn listen_addr(host: Option<String>, port: Option<String>) -> String {
     format!("{}:{}", host, port.unwrap_or_else(|| "1421".to_string()))
 }
 
+const CLI_ARTIFACT_SCRIPT: &str = include_str!("../../tools/agent-hooks/doom-term-artifact.sh");
+const HOOK_SCRIPT: &str = include_str!("../../tools/agent-hooks/doom-term-hook.sh");
+
+fn provision_cli_tools() {
+    let home = match std::env::var("HOME") {
+        Ok(h) if !h.is_empty() => std::path::PathBuf::from(h),
+        _ => return,
+    };
+
+    let targets = [
+        home.join(".local").join("bin").join("doom-term-artifact"),
+        home.join(".doom-term").join("bin").join("doom-term-artifact"),
+        home.join(".doom-term").join("agent-hooks").join("doom-term-artifact.sh"),
+    ];
+
+    for target in &targets {
+        if let Some(parent) = target.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(existing) = std::fs::read_to_string(target) {
+            if existing == CLI_ARTIFACT_SCRIPT {
+                continue;
+            }
+        }
+        let tmp = target.with_extension(format!("tmp-{}", std::process::id()));
+        if std::fs::write(&tmp, CLI_ARTIFACT_SCRIPT).is_ok() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755));
+            }
+            let _ = std::fs::rename(&tmp, target);
+            log::info!("Provisioned CLI artifact helper at {:?}", target);
+        }
+    }
+
+    let hook_targets = [
+        home.join(".doom-term").join("agent-hooks").join("doom-term-hook.sh"),
+    ];
+    for target in &hook_targets {
+        if let Some(parent) = target.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(existing) = std::fs::read_to_string(target) {
+            if existing == HOOK_SCRIPT {
+                continue;
+            }
+        }
+        let tmp = target.with_extension(format!("tmp-{}", std::process::id()));
+        if std::fs::write(&tmp, HOOK_SCRIPT).is_ok() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755));
+            }
+            let _ = std::fs::rename(&tmp, target);
+            log::info!("Provisioned agent hook at {:?}", target);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
@@ -201,6 +262,7 @@ async fn main() -> Result<()> {
         "⚡ Doom Term PTY WebSocket Server listening on ws://{}",
         listener.local_addr()?
     );
+    provision_cli_tools();
 
     let server = Arc::new(recovery::RecoveryServer::new()?);
     let sessions = server.sessions.clone();
@@ -607,6 +669,32 @@ async fn serve_artifact_get(
     }
 }
 
+async fn serve_cli_artifact_script(mut stream: TcpStream) {
+    let mut drain = [0u8; 4096];
+    let _ = stream.read(&mut drain).await;
+    let bytes = CLI_ARTIFACT_SCRIPT.as_bytes();
+    let header = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/x-shellscript; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        bytes.len()
+    );
+    let _ = stream.write_all(header.as_bytes()).await;
+    let _ = stream.write_all(bytes).await;
+    let _ = stream.flush().await;
+}
+
+async fn serve_cli_hook_script(mut stream: TcpStream) {
+    let mut drain = [0u8; 4096];
+    let _ = stream.read(&mut drain).await;
+    let bytes = HOOK_SCRIPT.as_bytes();
+    let header = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/x-shellscript; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        bytes.len()
+    );
+    let _ = stream.write_all(header.as_bytes()).await;
+    let _ = stream.write_all(bytes).await;
+    let _ = stream.flush().await;
+}
+
 async fn handle_connection(
     stream: TcpStream,
     client_addr: SocketAddr,
@@ -651,6 +739,16 @@ async fn handle_connection_authenticated(
 
     if peek_str.starts_with("get /artifact/") {
         serve_artifact_get(stream, &server.artifacts, &head).await;
+        return;
+    }
+
+    if peek_str.starts_with("get /doom-term-artifact") || peek_str.starts_with("get /cli/doom-term-artifact") {
+        serve_cli_artifact_script(stream).await;
+        return;
+    }
+
+    if peek_str.starts_with("get /doom-term-hook") || peek_str.starts_with("get /cli/doom-term-hook") {
+        serve_cli_hook_script(stream).await;
         return;
     }
 

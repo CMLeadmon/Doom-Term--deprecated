@@ -118,6 +118,30 @@ fn default_shell() -> String {
     })
 }
 
+fn augmented_path() -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let local_bin = format!("{}/.local/bin", home);
+    let doom_bin = format!("{}/.doom-term/bin", home);
+    let current_path = std::env::var("PATH").unwrap_or_default();
+    let parts: Vec<&str> = current_path.split(':').filter(|s| !s.is_empty()).collect();
+
+    let mut prepend = Vec::new();
+    if !parts.contains(&local_bin.as_str()) {
+        prepend.push(local_bin);
+    }
+    if !parts.contains(&doom_bin.as_str()) {
+        prepend.push(doom_bin);
+    }
+
+    if prepend.is_empty() {
+        None
+    } else {
+        let mut all = prepend;
+        all.extend(parts.into_iter().map(String::from));
+        Some(all.join(":"))
+    }
+}
+
 fn prepare_command(cmd: &mut CommandBuilder, id: &str) {
     cmd.env_remove("TMUX");
     cmd.env_remove("TMUX_PANE");
@@ -125,6 +149,9 @@ fn prepare_command(cmd: &mut CommandBuilder, id: &str) {
     cmd.env("COLORTERM", "truecolor");
     cmd.env("DOOM_TERM", "1");
     cmd.env(SESSION_ID_ENV, id);
+    if let Some(path) = augmented_path() {
+        cmd.env("PATH", path);
+    }
 }
 
 fn available_tmux() -> std::result::Result<std::path::PathBuf, String> {
@@ -208,6 +235,9 @@ impl PtySession {
                 launch.env.push(("TERM".into(), "xterm-256color".into()));
                 launch.env.push(("COLORTERM".into(), "truecolor".into()));
                 launch.env.push(("DOOM_TERM".into(), "1".into()));
+                if let Some(path) = augmented_path() {
+                    launch.env.push(("PATH".into(), path));
+                }
                 let handle = TmuxHandle::create_owned(
                     exe,
                     &id,

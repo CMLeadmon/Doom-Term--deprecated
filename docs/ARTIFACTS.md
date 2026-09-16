@@ -27,25 +27,30 @@ Artifacts allow autonomous AI agents (`claude`, `codex`, `gemini`, `agy`), devel
 
 ## 🛠️ How to Publish Artifacts
 
-### 1. From the Terminal via CLI (`doom-term-artifact.sh`)
+### 1. From the Terminal via CLI (`doom-term-artifact`)
 
-Any child shell running inside Doom Term has `doom-term-artifact.sh` available in `tools/agent-hooks/`:
+**No repository clone required.** Whenever Doom Term launches, the background daemon automatically provisions `doom-term-artifact` into `~/.local/bin/` and ensures it is present on `$PATH` in every child shell:
 
 ```bash
 # Push a Markdown PR walkthrough (with optional inline ![Alt](url) images)
-tools/agent-hooks/doom-term-artifact.sh --title "PR Walkthrough" --type markdown report.md
+doom-term-artifact --title "PR Walkthrough" --type markdown report.md
 
 # Publish an image directly (auto-detects PNG/JPEG/SVG/GIF/WebP and base64 encodes)
-tools/agent-hooks/doom-term-artifact.sh --title "Architecture Diagram" architecture.png
+doom-term-artifact --title "Architecture Diagram" architecture.png
 
 # Pipe Git diff directly to a live diff pane
-git diff | tools/agent-hooks/doom-term-artifact.sh --title "Refactor Diff" --type diff
+git diff | doom-term-artifact --title "Refactor Diff" --type diff
 
 # Push an interactive HTML dashboard
-cat dashboard.html | tools/agent-hooks/doom-term-artifact.sh --title "Test Metrics" --type html
+cat dashboard.html | doom-term-artifact --title "Test Metrics" --type html
 
 # Update an existing artifact by passing its ID
-tools/agent-hooks/doom-term-artifact.sh --id "auth-refactor" --title "Updated Auth Diff" --type diff auth.patch
+doom-term-artifact --id "auth-refactor" --title "Updated Auth Diff" --type diff auth.patch
+```
+
+*In isolated containers or remote environments, you can also fetch or pipe the CLI helper directly from the running daemon without installing anything:*
+```bash
+curl -fsSL http://127.0.0.1:1421/doom-term-artifact | sh -s -- --title "Container Log" build.log
 ```
 
 ### 2. From Any Language or Process via HTTP API

@@ -31,7 +31,10 @@ import { fileURLToPath } from 'node:url';
 const MARKER = 'doom-term-hook';
 
 const HOOK_SRC = join(dirname(fileURLToPath(import.meta.url)), 'doom-term-hook.sh');
+const ARTIFACT_SRC = join(dirname(fileURLToPath(import.meta.url)), 'doom-term-artifact.sh');
 const hookDestination = root => join(root, '.doom-term', 'agent-hooks', 'doom-term-hook.sh');
+const artifactHookDestination = root => join(root, '.doom-term', 'agent-hooks', 'doom-term-artifact.sh');
+const localBinArtifact = root => join(root, '.local', 'bin', 'doom-term-artifact');
 
 /**
  * The events worth forwarding.
@@ -184,7 +187,19 @@ export function runInstaller({ root = homedir(), remove = false, purgeNodeterm =
   }
   if (!remove) {
     mkdirSync(dirname(destination), { recursive: true });
-    atomicWrite(destination, readFileSync(HOOK_SRC), 0o700);
+    atomicWrite(destination, readFileSync(HOOK_SRC), 0o755);
+    if (existsSync(ARTIFACT_SRC)) {
+      atomicWrite(artifactHookDestination(root), readFileSync(ARTIFACT_SRC), 0o755);
+      const localBin = localBinArtifact(root);
+      try {
+        mkdirSync(dirname(localBin), { recursive: true });
+        atomicWrite(localBin, readFileSync(ARTIFACT_SRC), 0o755);
+      } catch {}
+    }
+  } else {
+    try { unlinkSync(destination); } catch {}
+    try { unlinkSync(artifactHookDestination(root)); } catch {}
+    try { unlinkSync(localBinArtifact(root)); } catch {}
   }
   for (const plan of plans) {
     if (plan.changed) {
