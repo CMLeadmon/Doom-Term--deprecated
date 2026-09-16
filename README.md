@@ -85,6 +85,42 @@ Full verification proofs and component maps are detailed in [`docs/REFORMATION_A
 
 ---
 
+## 🖥️ Platform Support
+
+Doom Term identifies the agent running in a pane from the operating system, never
+from a tab title. There are exactly two witnesses for that, and which ones exist
+decides what the app can honestly report.
+
+| | Linux | macOS | Windows |
+| :--- | :--- | :--- | :--- |
+| Terminal, splits, scrollback, status plate | ✅ | ✅ | ✅ |
+| Agent identification (mugshot, agent well) | ✅ `/proc/<pid>/stat` `tpgid` | ✅ via tmux `pane_current_command` | ❌ **neither witness exists** |
+| Keyboard pass-through by foreground process | ✅ | ✅ (tmux) | ❌ |
+| Durable sessions across a daemon restart | ✅ tmux | ✅ tmux | ❌ no native tmux |
+| Child-checked paste | ✅ | ✅ | ❌ `unsupported on this platform` |
+| Claude context reading | ✅ hook `transcript_path` | ✅ | ⚠️ hook needs `bash`, `curl`, GNU `timeout` |
+| Codex context / rate reading | ✅ `/proc/<pid>/fd` | ❌ `--` | ❌ `--` |
+| Built and tested in CI | ✅ | ⚠️ compile-checked | ⚠️ compile-checked |
+
+**Linux is the reference platform.** It is the only one the full `npm run agent:verify`
+gate runs on.
+
+**macOS is supported** through the portable fallback: with tmux installed (Homebrew
+prefixes are searched directly, since a Finder-launched app cannot see them through
+`PATH` alone), tmux's own `pane_current_command` and `pane_current_path` stand in for
+`/proc`. Codex context stays `--`, because attributing a rollout file to a pane
+requires reading that process's open descriptors.
+
+**Windows is a degraded build, and is published as such.** A shell runs under ConPTY
+and the terminal itself works, but Windows has neither `/proc` nor a native tmux — so
+there is no witness at all for which process is in the foreground. The agent well
+never lights up, sessions do not survive a daemon restart, and paste cannot be
+child-checked. This is not a bug with a fix pending; it needs a third foreground
+witness written against the Win32 console API. Per Axiom 3 the affected readings
+render `--` rather than inventing a value.
+
+---
+
 ## 🚀 Quickstart
 
 ### Prerequisites
