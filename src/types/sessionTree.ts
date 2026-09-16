@@ -1,4 +1,4 @@
-import { AnsiLine } from './terminal';
+import { AnsiLine, ScreenCursor } from './terminal';
 
 export type SessionKind = 'terminal' | 'agent' | 'tui' | 'scratchpad' | 'artifact';
 
@@ -86,7 +86,7 @@ export interface SessionNode {
    * the lines it is drawn against by one frame — the caret would trail the text
    * it is supposed to be sitting in.
    */
-  cursor?: { row: number; col: number; visible?: boolean };
+  cursor?: ScreenCursor;
   commandHistory: string[];
   /** The last exit code seen for this session, if any. */
   lastExitCode?: number | null;

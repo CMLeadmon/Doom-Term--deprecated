@@ -143,3 +143,50 @@ describe('single layout AFTER pane-tree migration', () => {
     expect(screen.getByText('Pane: One')).toBeDefined();
   });
 });
+
+describe('a backgrounded pane measures the same box as a foreground one', () => {
+  /*
+   * `useTerminalSize` measures the pane's own box and floors it into columns,
+   * so any geometry difference between the shown pane and the hidden one is a
+   * column difference the moment you switch. It was 2px: a leaf carries a 1px
+   * border on every side (amber when active, transparent when not) and the
+   * off-tree wrapper carried none. Measured in Chromium at a 1600px window:
+   * 1600px hidden -> 195 columns, 1598px shown -> 194. Selecting the session
+   * therefore sent a genuine Resize, and an inline agent redraws its whole
+   * frame on SIGWINCH. That redraw is the "content shifts when switching
+   * between agents" report.
+   */
+  const renderOffTree = () =>
+    render(
+      <SplitPaneGrid
+        layout="single"
+        nodes={nodes}
+        activeNodeId="n1"
+        paneTree={paneLeaf('n1')}
+        onSelectNode={vi.fn()}
+        renderPane={(n) => <div>Pane: {n.title}</div>}
+      />
+    );
+
+  it('gives the hidden wrapper the same border box as the visible leaf', () => {
+    renderOffTree();
+    const shown = paneBox('One');
+    const hidden = paneBox('Two');
+    expect(hidden.style.visibility).toBe('hidden');
+    // The width is the whole point; the colour is what differs between them.
+    const width = (el: HTMLElement) => /^\s*(\S+)\s+solid/.exec(el.style.border)?.[1];
+    expect(width(shown)).toBe('1px');
+    expect(width(hidden)).toBe('1px');
+  });
+
+  it('stacks the hidden wrapper the same way, so its height matches too', () => {
+    renderOffTree();
+    expect(paneBox('Two').className).toContain('flex-col');
+    expect(paneBox('One').className).toContain('flex-col');
+  });
+
+  it('keeps the hidden pane unpainted — matching geometry is not a visible frame', () => {
+    renderOffTree();
+    expect(paneBox('Two').style.border).not.toContain('var(--st-live)');
+  });
+});

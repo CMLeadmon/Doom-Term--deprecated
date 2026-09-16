@@ -200,3 +200,35 @@ fn augmented_path_prepends_user_bins_when_missing() {
     // When already in PATH, returns None
     assert!(augment_path("/custom/user", &aug).is_none());
 }
+
+#[test]
+fn the_working_directory_is_anchored_somewhere_that_outlives_the_app() {
+    /*
+     * Nothing we spawn may inherit the directory an AppImage runs from.
+     * `AppRun` chdirs into the FUSE mount and the mount is gone once the app
+     * exits, while the tmux server started from it is not — surviving the app
+     * is the substrate's whole purpose. A tmux server holding a deleted
+     * directory silently ignores `new-session -c` and opens every later pane
+     * in the dead one, which is how a fresh terminal came up at
+     * `/tmp/.mount_DoomTeKMdGLL/usr` with `getcwd` failing.
+     *
+     * The choice is tested, not the chdir: see the note on the function.
+     */
+    let home = std::path::Path::new("/home/u");
+    assert_eq!(
+        anchor_candidates(Some(home)),
+        vec![
+            std::path::PathBuf::from("/home/u"),
+            std::path::PathBuf::from("/"),
+        ]
+    );
+}
+
+#[test]
+fn a_user_with_no_home_still_gets_off_the_mount() {
+    // Root is always there, and it is never a filesystem we brought with us.
+    assert_eq!(
+        anchor_candidates(None),
+        vec![std::path::PathBuf::from("/")]
+    );
+}

@@ -246,3 +246,184 @@ describe('XtermScreen', () => {
     expect(seen).not.toHaveBeenCalled();
   });
 });
+
+describe('what the caret is sitting on', () => {
+  /*
+   * A block caret is reverse video, so the view has to repaint the character
+   * under it in the ground colour. Only the emulator has a width table, so
+   * only the emulator can say which character a column holds — the view used
+   * to blend the block with the text instead, and `difference` against a fixed
+   * amber lands on whatever it lands on (bone #e8dcbc came out navy #083390).
+   */
+  it('reports the character under the caret', async () => {
+    const screen = new XtermScreen(20, 5);
+    try {
+      // Cursor home, then a step right: the caret is on the 'b'.
+      await parsed(screen, 'abc\x1b[3D\x1b[C');
+      expect(screen.getCursor()).toMatchObject({ row: 0, col: 1, glyph: 'b' });
+    } finally { screen.dispose(); }
+  });
+
+  it('says nothing about an empty cell rather than inventing a space', async () => {
+    const screen = new XtermScreen(20, 5);
+    try {
+      await parsed(screen, 'ab');
+      // Past the text: there is no character here, so there is no glyph.
+      expect(screen.getCursor().glyph).toBeUndefined();
+    } finally { screen.dispose(); }
+  });
+
+  it('covers both cells of a double-width character', async () => {
+    const screen = new XtermScreen(20, 5);
+    try {
+      await parsed(screen, '漢字\x1b[4D');
+      const cursor = screen.getCursor();
+      expect(cursor.col).toBe(0);
+      expect(cursor.glyph).toBe('漢');
+      // One character, two columns. A one-cell caret would clip it in half.
+      expect(cursor.cells).toBe(2);
+    } finally { screen.dispose(); }
+  });
+
+  it('leaves a single-width character on one cell', async () => {
+    const screen = new XtermScreen(20, 5);
+    try {
+      await parsed(screen, 'ab\x1b[2D');
+      expect(screen.getCursor().cells).toBeUndefined();
+    } finally { screen.dispose(); }
+  });
+});
+
+describe('synchronized output', () => {
+  /*
+   * A repaint does not arrive in one piece. tmux redraws a pane by homing the
+   * cursor and rewriting every row; the daemon delivers that in 8 KiB chunks,
+   * and a frame published between two of them is half old and half new. Most
+   * rows repaint to the same text so nothing looks wrong — except the caret,
+   * which mid-repaint is at the top of the pane. Sampled in Chromium on
+   * 2026-09-16 during streaming output, it landed exactly one viewport height
+   * above the tail for a single frame and snapped back.
+   */
+
+  // A real frame, not the straight-through stub the rest of the file uses:
+  // coalescing is the behaviour under test, and a synchronous rAF cannot
+  // coalesce anything.
+  let pending: FrameRequestCallback[] = [];
+  beforeEach(() => {
+    pending = [];
+    vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
+      pending.push(cb);
+      return pending.length;
+    });
+    vi.stubGlobal('cancelAnimationFrame', () => {});
+  });
+  const paint = () => { const due = pending; pending = []; for (const cb of due) cb(0); };
+
+  /** xterm's write callback is asynchronous however frames are scheduled. */
+  const settle = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+  const frames = (screen: XtermScreen) => {
+    let count = 0;
+    screen.onParsed(() => { count++; });
+    return () => count;
+  };
+
+  it('publishes no frame while an update is open', async () => {
+    const screen = new XtermScreen(20, 5);
+    try {
+      screen.write('before');
+      await settle();
+      paint();
+      const seen = frames(screen);
+      screen.write('\x1b[?2026h');
+      screen.write('\x1b[Hhalf a repaint');
+      await settle();
+      paint();
+      expect(seen()).toBe(0);
+    } finally { screen.dispose(); }
+  });
+
+  it('publishes exactly one frame when the update closes', async () => {
+    const screen = new XtermScreen(20, 5);
+    try {
+      screen.write('before');
+      await settle();
+      paint();
+      const seen = frames(screen);
+      screen.write('\x1b[?2026h');
+      screen.write('\x1b[Hrepaint');
+      await settle();
+      paint();
+      expect(seen()).toBe(0);
+      screen.write('\x1b[?2026l');
+      await settle();
+      paint();
+      expect(seen()).toBe(1);
+      expect(plain(screen.getLines())[0]).toBe('repaint');
+    } finally { screen.dispose(); }
+  });
+
+  it('counts nesting, so an inner close does not release the screen', async () => {
+    const screen = new XtermScreen(20, 5);
+    try {
+      const seen = frames(screen);
+      screen.write('\x1b[?2026h\x1b[?2026h');
+      screen.write('x');
+      await settle();
+      paint();
+      screen.write('\x1b[?2026l');
+      await settle();
+      paint();
+      expect(seen()).toBe(0);
+      screen.write('\x1b[?2026l');
+      await settle();
+      paint();
+      expect(seen()).toBe(1);
+    } finally { screen.dispose(); }
+  });
+
+  it('draws anyway when an update is never closed', async () => {
+    const screen = new XtermScreen(20, 5);
+    try {
+      const seen = frames(screen);
+      screen.write('\x1b[?2026h');
+      screen.write('stranded');
+      await settle();
+      paint();
+      expect(seen()).toBe(0);
+      // A writer that crashed mid-update must not freeze the pane. The hold is
+      // capped at the value mode 2026's own specification recommends.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      paint();
+      expect(seen()).toBe(1);
+    } finally { screen.dispose(); }
+  });
+
+  it('does not carry a half-open update across a reset', async () => {
+    const screen = new XtermScreen(20, 5);
+    try {
+      screen.write('\x1b[?2026h');
+      await settle();
+      screen.reset();
+      const seen = frames(screen);
+      screen.write('after');
+      await settle();
+      paint();
+      expect(seen()).toBeGreaterThan(0);
+    } finally { screen.dispose(); }
+  });
+
+  it('still hides and shows the caret inside the same handler', async () => {
+    const screen = new XtermScreen(20, 5);
+    try {
+      // Mode 25 and mode 2026 share one CSI ? h/l handler; neither may eat the
+      // other, and xterm must still apply every parameter itself.
+      screen.write('\x1b[?25l');
+      await settle();
+      expect(screen.getCursor().visible).toBe(false);
+      screen.write('\x1b[?2026h\x1b[?25h\x1b[?2026l');
+      await settle();
+      expect(screen.getCursor().visible).not.toBe(false);
+    } finally { screen.dispose(); }
+  });
+});

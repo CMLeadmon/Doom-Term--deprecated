@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { AnsiLine } from '../types/terminal';
+import { AnsiLine, ScreenCursor } from '../types/terminal';
 import { audioEngine } from '../core/audioEngine';
 import { spanStyle } from '../core/spanStyle';
 import { useTerminalSize } from '../hooks/useTerminalSize';
@@ -38,7 +38,7 @@ interface RawTerminalViewProps {
    */
   agentKey?: string | null;
   /** Where the caret is, indexing `lines`. Absent before the first frame. */
-  cursor?: { row: number; col: number; visible?: boolean } | null;
+  cursor?: ScreenCursor | null;
   /** A palette command addressed to this pane, delivered at most once. */
   viewActionRequest?: ViewActionRequest | null;
   /** Clear a request after this pane accepts it, before a later remount. */
@@ -78,6 +78,10 @@ interface TerminalLineRowProps {
   isMarked: boolean;
   isCursorHere: boolean;
   cursorCol?: number;
+  /** The character the caret sits on, repainted in the ground colour on it. */
+  cursorGlyph?: string;
+  /** Cells the caret covers: 2 over a double-width character, otherwise 1. */
+  cursorCells?: number;
   hasFocus?: boolean;
 }
 
@@ -87,6 +91,8 @@ const TerminalLineRow = React.memo(function TerminalLineRow({
   isMarked,
   isCursorHere,
   cursorCol = 0,
+  cursorGlyph = '',
+  cursorCells = 1,
   hasFocus = false,
 }: TerminalLineRowProps) {
   return (
@@ -107,23 +113,50 @@ const TerminalLineRow = React.memo(function TerminalLineRow({
           </span>
         ))}
         {isCursorHere && (
+          /*
+              REVERSE VIDEO, not a blend.
+
+              This used to be a bare amber block with `mix-blend-mode:
+              difference`, on the theory that the difference of the block and
+              the glyph reads as an inversion. It does not. Difference against
+              a fixed amber is a function of whatever colour the program chose,
+              and it lands wherever it lands: bone text `#e8dcbc` under the
+              caret `#e0a92c` came out `#083390`, navy on amber, which is the
+              "yellow rectangle over the character" this fixes. It also
+              synthesises colours that are in none of the five canonical state
+              colours and are contrast-guarded against nothing.
+
+              A block caret has exactly one correct form: paint the cell in the
+              live colour and repaint the character on it in the ground colour.
+              The character comes from the emulator — the only place that has a
+              width table — so the view never has to work out which character a
+              column holds.
+
+              Unfocused stays a hollow 1px ring and draws no glyph: the real
+              text underneath is already the right colour.
+          */
           <i
             aria-hidden="true"
             data-testid="terminal-cursor"
-            className="absolute top-0 pointer-events-none"
+            data-cursor-glyph={hasFocus && cursorGlyph ? cursorGlyph : undefined}
+            className="absolute top-0 pointer-events-none overflow-hidden"
             style={{
               // <i> defaults to italic, whose zero advance can differ from the
               // text face. Use the integer cell metric measured by useTerminalSize
               // instead of CSS `ch`, whose fallback-font metric can drift.
               fontStyle: 'normal',
               left: `calc(var(--terminal-cell-width, 1ch) * ${cursorCol})`,
-              width: 'var(--terminal-cell-width, 1ch)',
+              width: `calc(var(--terminal-cell-width, 1ch) * ${cursorCells})`,
               height: '100%',
               background: hasFocus ? 'var(--st-live)' : 'transparent',
               boxShadow: hasFocus ? 'none' : 'inset 0 0 0 1px var(--st-live)',
-              mixBlendMode: hasFocus ? 'difference' : 'normal',
+              color: 'var(--ground)',
+              // The glyph is drawn on the same grid as the text it covers.
+              letterSpacing: 'var(--terminal-tracking, 0px)',
             }}
-          />
+          >
+            {hasFocus ? cursorGlyph : ''}
+          </i>
         )}
       </span>
     </div>
@@ -738,6 +771,8 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
               isMarked={marks.has(i)}
               isCursorHere={isCursorHere}
               cursorCol={isCursorHere ? cursor?.col : undefined}
+              cursorGlyph={isCursorHere ? cursor?.glyph : undefined}
+              cursorCells={isCursorHere ? cursor?.cells : undefined}
               hasFocus={isCursorHere ? hasFocus : false}
             />
           );

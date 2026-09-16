@@ -2,6 +2,19 @@ export type CommandStatus = 'idle' | 'running' | 'completed' | 'error';
 
 export interface AnsiSpan {
   text: string;
+  /**
+   * Terminal columns this run occupies, as the emulator counted them.
+   *
+   * Carried so the view can put the run on the grid instead of hoping the
+   * browser's text layout lands there. `letter-spacing` reconciles the two
+   * only while every glyph advances by the base amount: a double-width
+   * character advances by its own width (measured 13px against a 16px
+   * two-cell allotment) and a character resolved from a FALLBACK font in the
+   * stack advances by that font's amount (measured 7.81px against an 8px
+   * cell). Either one shifts the whole rest of the line, which is how the
+   * caret ends up sitting on a neighbouring character.
+   */
+  cols?: number;
   fg?: string;
   bg?: string;
   bold?: boolean;
@@ -10,6 +23,32 @@ export interface AnsiSpan {
   underline?: boolean;
   strikethrough?: boolean;
   invert?: boolean;
+}
+
+/**
+ * Where the caret is, in the coordinates `getLines()` returns.
+ *
+ * One shape, exported, because the view, the node and the screen interface all
+ * need it and three hand-copied literals is how they drift apart.
+ */
+export interface ScreenCursor {
+  /** Index into the lines array. */
+  row: number;
+  /** Column, in cells. */
+  col: number;
+  /** Absent means visible; DECTCEM can turn it off. */
+  visible?: boolean;
+  /**
+   * The character the caret is sitting on, read from the cell itself.
+   *
+   * A block caret is REVERSE VIDEO, so the view has to repaint that character
+   * in the ground colour on top of the block. It cannot work the character out
+   * from the spans without a width table of its own, and the emulator already
+   * has one.
+   */
+  glyph?: string;
+  /** Cells the caret covers: 2 over a double-width character, otherwise 1. */
+  cells?: number;
 }
 
 export interface AnsiLine {

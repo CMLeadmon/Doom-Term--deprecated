@@ -103,3 +103,65 @@ describe('linesFrom', () => {
     expect(lines[1].isWrapped).toBe(true);
   });
 });
+
+describe('column counts, so the view can put a run on the grid', () => {
+  /*
+   * `letter-spacing` pulls text onto the integer cell grid only while every
+   * glyph advances by the same amount. Measured in Chromium on 2026-09-16
+   * against an 8px cell: a double-width character advanced 13px where the grid
+   * gives its two cells 16px, and a character resolved from a fallback font in
+   * the stack advanced 7.81px against 8px. Both walk the rest of the line out
+   * from under a caret that is placed at `col * cell`. The view can only pin a
+   * run to its columns if it is told how many columns the run has.
+   */
+  it('counts the columns of a plain run', async () => {
+    const term = makeTerm();
+    await feed(term, 'hello');
+    expect(linesFrom(term.buffer.active, 0)[0].spans[0].cols).toBe(5);
+  });
+
+  it('counts a double-width character as the two cells it occupies', async () => {
+    const term = makeTerm();
+    term.unicode.activeVersion = '11';
+    await feed(term, '漢字');
+    // One box per wide character, each exactly its own two columns. Sharing a
+    // box, the second would start wherever the first glyph's own advance left
+    // it — measured 13px against the 16px its cells are given.
+    const spans = linesFrom(term.buffer.active, 0)[0].spans;
+    expect(spans.map((s) => s.text)).toEqual(['漢', '字']);
+    expect(spans.map((s) => s.cols)).toEqual([2, 2]);
+  });
+
+  it('gives every non-ASCII cell its own box and leaves ASCII in long runs', async () => {
+    const term = makeTerm();
+    // A fallback-font glyph between two ASCII runs: the glyph is boxed alone,
+    // the ASCII either side stays whole.
+    await feed(term, 'ok ✔ done');
+    const spans = linesFrom(term.buffer.active, 0)[0].spans;
+    expect(spans.map((s) => s.text)).toEqual(['ok ', '✔', ' done']);
+    expect(spans.map((s) => s.cols)).toEqual([3, 1, 5]);
+  });
+
+  it('boxes each character of a box-drawing rule separately', async () => {
+    const term = makeTerm();
+    // Sharing one box, each segment lands at the fallback face's own advance
+    // and the rule slides further off its columns with every glyph.
+    await feed(term, '┌───┐');
+    const spans = linesFrom(term.buffer.active, 0)[0].spans;
+    expect(spans).toHaveLength(5);
+    expect(spans.every((s) => s.cols === 1)).toBe(true);
+  });
+
+  it('counts each run separately when an attribute changes mid-line', async () => {
+    const term = makeTerm();
+    await feed(term, 'ab\x1b[31mcde\x1b[0m');
+    const spans = linesFrom(term.buffer.active, 0)[0].spans;
+    expect(spans.map((s) => s.cols)).toEqual([2, 3]);
+  });
+
+  it('gives the placeholder on a blank line a column, so it is still on the grid', async () => {
+    const term = makeTerm();
+    await feed(term, '\r\n');
+    expect(linesFrom(term.buffer.active, 0)[0].spans[0]).toMatchObject({ text: ' ', cols: 1 });
+  });
+});

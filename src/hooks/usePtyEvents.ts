@@ -1,6 +1,6 @@
 import { useEffect } from 'react';
 import { ProjectWorkspace, SessionNode } from '../types/sessionTree';
-import { AnsiLine } from '../types/terminal';
+import { AnsiLine, ScreenCursor } from '../types/terminal';
 import { getEmulator, onScreenParsed } from '../core/emulatorRegistry';
 import { noteOutput } from '../core/activityMonitor';
 import { attentionQueue } from '../core/attentionQueue';
@@ -118,7 +118,7 @@ export function applyScreenToNode(
   node: SessionNode,
   lines: AnsiLine[],
   inAltScreen: boolean,
-  cursor?: { row: number; col: number; visible?: boolean },
+  cursor?: ScreenCursor,
 ): SessionNode {
   return { ...node, isTuiActive: inAltScreen, tuiLines: lines, cursor };
 }
@@ -236,6 +236,18 @@ export function usePtyEvents(setWorkspace: WorkspaceUpdater, setTelemetry: Telem
       const lines = emu.getLines();
       if (ptyClient.getHistory(sessionId) === null) ptyClient.setCachedHistoryBudget(sessionId, lines);
       const inAltScreen = resolveTuiState(emu.isAltScreen(), reportedTuiState.get(sessionId)?.active);
+      // Read WITH the lines, not inside the updater below.
+      //
+      // `cursor.row` is an index into `lines`, so the two are one observation
+      // and have to be taken in the same tick. A state updater is not a tick:
+      // React runs it during the next render, and React may run it more than
+      // once. The daemon keeps writing into the emulator in between, so the
+      // deferred read returned the caret of a buffer that had already scrolled
+      // past the snapshot — `baseY + cursorY` then named a row that, in the
+      // captured lines, is somewhere else entirely. Observed live as the caret
+      // flashing to a row near the top of the pane for a single frame during
+      // streaming output, then snapping back.
+      const cursor = emu.getCursor();
 
       setWorkspace((prev) => {
         const target = prev.nodes[sessionId];
@@ -245,7 +257,7 @@ export function usePtyEvents(setWorkspace: WorkspaceUpdater, setTelemetry: Telem
           target,
           lines,
           inAltScreen,
-          emu.getCursor(),
+          cursor,
         );
 
         return {

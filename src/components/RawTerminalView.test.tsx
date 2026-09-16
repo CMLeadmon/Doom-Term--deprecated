@@ -514,3 +514,76 @@ describe('RawTerminalView', () => {
     expect(renderedRows.length).toBe(300);
   });
 });
+
+describe('the caret is reverse video, not a colour blend', () => {
+  const base = {
+    lines: [],
+    onWrite: vi.fn(),
+    onPasteText: vi.fn().mockResolvedValue(undefined),
+    onSendSignal: vi.fn(),
+  };
+
+  const withCaret = (cursor: { row: number; col: number; glyph?: string; cells?: number }) => {
+    render(
+      <RawTerminalView
+        {...base}
+        isActive
+        cursor={cursor}
+        lines={[{ id: 'line-0', row: 0, spans: [{ text: 'echo', cols: 4 }], timestamp: 0 }]}
+      />,
+    );
+    fireEvent.focus(screen.getByTestId('raw-terminal'));
+    return screen.getByTestId('terminal-cursor');
+  };
+
+  /*
+   * The bug this replaces: the caret was an amber block with
+   * `mix-blend-mode: difference`, so the character under it came out at
+   * whatever difference(caret, textColour) happens to be. Bone text #e8dcbc
+   * under the caret #e0a92c is #083390 — navy on amber, a colour that is in
+   * none of the five canonical state colours and is contrast-guarded against
+   * nothing. On screen it reads as a yellow rectangle over the character.
+   */
+  it('repaints the character on the block instead of blending with it', () => {
+    const caret = withCaret({ row: 0, col: 0, glyph: 'e' });
+    expect(caret.textContent).toBe('e');
+    expect(caret.style.color).toBe('var(--ground)');
+    expect(caret.style.backgroundColor || caret.style.background).toContain('var(--st-live)');
+  });
+
+  it('uses no blend mode at all', () => {
+    expect(withCaret({ row: 0, col: 0, glyph: 'e' }).style.mixBlendMode).toBe('');
+  });
+
+  it('covers both cells of a double-width character', () => {
+    const caret = withCaret({ row: 0, col: 0, glyph: '漢', cells: 2 });
+    expect(caret.style.width).toBe('calc(var(--terminal-cell-width, 1ch) * 2)');
+  });
+
+  it('is one cell wide over anything else', () => {
+    expect(withCaret({ row: 0, col: 2, glyph: 'h' }).style.width)
+      .toBe('calc(var(--terminal-cell-width, 1ch) * 1)');
+  });
+
+  it('draws the glyph on the same grid as the text it covers', () => {
+    expect(withCaret({ row: 0, col: 0, glyph: 'e' }).style.letterSpacing)
+      .toBe('var(--terminal-tracking, 0px)');
+  });
+
+  it('draws no glyph while the pane is unfocused — the real text shows through', () => {
+    render(
+      <RawTerminalView
+        {...base}
+        isActive
+        cursor={{ row: 0, col: 0, glyph: 'e' }}
+        lines={[{ id: 'line-0', row: 0, spans: [{ text: 'echo', cols: 4 }], timestamp: 0 }]}
+      />,
+    );
+    // An active pane takes the keyboard on mount, so losing focus is what
+    // produces the hollow caret — the window went elsewhere, not the pane.
+    fireEvent.blur(screen.getByTestId('raw-terminal'));
+    const caret = screen.getByTestId('terminal-cursor');
+    expect(caret.textContent).toBe('');
+    expect(caret.style.boxShadow).toBe('inset 0 0 0 1px var(--st-live)');
+  });
+});

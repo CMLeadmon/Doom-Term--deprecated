@@ -156,6 +156,16 @@ set -ga terminal-overrides ',*:smcup@:rmcup@'
 set -g default-terminal "xterm-256color"
 set -as terminal-features ',*:RGB'
 
+# Tell tmux this client can be told where a repaint begins and ends, so it
+# brackets each one in DECSET/DECRST 2026. A pane repaint does not arrive in
+# one piece — tmux homes the cursor and rewrites every row, and the daemon
+# hands that to the frontend in 8 KiB chunks — so without the brackets the
+# emulator publishes frames from the middle of one. The text survives that;
+# the CARET does not, and it flashes to the top of the pane for a frame.
+# `xterm-256color` carries no Sync capability of its own, so tmux would
+# otherwise never emit the sequence. See `setSynchronized` in core/xtermScreen.
+set -as terminal-features ',*:sync'
+
 # Scrollback recovered by capture-pane on reattach; see session.rs.
 set -g history-limit 5000
 
@@ -236,9 +246,59 @@ pub fn create_session_args(
     // Without the terminator tmux folds the rest into a single command string
     // and parses our shell's own flags as its own.
     args.push("--".into());
-    args.push(shell.into());
-    args.extend(shell_args.iter().cloned());
+    args.extend(launch_in(cwd, shell, shell_args));
     args
+}
+
+/// The `sh` used to guarantee the start directory. POSIX requires it.
+const LAUNCHER: &str = "/bin/sh";
+
+/**
+ * Put the shell in the directory we were asked for, without asking tmux.
+ *
+ * `-c` above is not a guarantee. A tmux SERVER whose own working directory has
+ * been deleted discards `-c` silently and starts every new pane in that dead
+ * directory instead. Reproduced on 2026-09-16 by starting a server with its cwd
+ * in a scratch directory, creating one session (`-c /etc` honoured), removing
+ * the directory, and creating another: `-c /etc` ignored, the pane landed in
+ * `…/deadcwd (deleted)`. `#{session_path}` still reported `/etc`, so tmux had
+ * parsed the option and simply not used it.
+ *
+ * That is not a hypothetical. The server is per-user and long-lived by design
+ * — surviving detach is the whole feature — so it routinely outlives the app
+ * that started it. Under an AppImage the app runs from a FUSE mount that is
+ * unmounted on exit, and the server started from it is left holding a detached
+ * directory forever. Every terminal opened afterwards came up in it: the prompt
+ * read `/tmp/.mount_XXXXXXXX/usr`, `getcwd` failed, and the shell's own startup
+ * printed six lines of `cannot access parent directories: Transport endpoint is
+ * not connected` before the first prompt.
+ *
+ * So the shell does the chdir itself, as its own first act, and the answer no
+ * longer depends on the health of a process we did not start. The fallbacks are
+ * `resolve_cwd`'s, in the same order, because a directory can be removed
+ * between resolving it and spawning into it — and a pane that opens in the
+ * wrong place still beats one that refuses to open.
+ *
+ * `exec` replaces the launcher, so this costs no process and leaves
+ * `#{pane_pid}` — the identity every attachment check is built on — pointing at
+ * the shell exactly as before.
+ */
+fn launch_in(cwd: &Path, shell: &str, shell_args: &[String]) -> Vec<String> {
+    let mut argv: Vec<String> = vec![
+        LAUNCHER.into(),
+        "-c".into(),
+        // Arguments, never interpolation: the directory and the shell's own
+        // argv arrive as words, so a path with a space, a quote or a `$` in it
+        // is a path and not a fragment of script.
+        "cd -- \"$1\" 2>/dev/null || cd -- \"${HOME:-/}\" 2>/dev/null || cd /; shift; exec \"$@\""
+            .into(),
+        // $0. Named so it is obvious in `ps` where the wrapper came from.
+        "doom-term-launch".into(),
+        cwd.to_string_lossy().to_string(),
+        shell.into(),
+    ];
+    argv.extend(shell_args.iter().cloned());
+    argv
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -605,6 +665,17 @@ mod tests {
     }
 
     #[test]
+    fn the_config_asks_tmux_to_bracket_its_repaints() {
+        // A pane repaint is not one write. tmux homes the cursor and rewrites
+        // every row, the daemon delivers that in 8 KiB chunks, and the frontend
+        // publishes a frame between two of them — showing a screen that is half
+        // old and half new, with the caret wherever the redraw has reached.
+        // Mode 2026 marks the seams, and `xterm-256color` advertises no Sync
+        // capability of its own, so without this line tmux never sends it.
+        assert!(config_body().contains("terminal-features ',*:sync'"));
+    }
+
+    #[test]
     fn the_config_gives_tmux_no_keys_and_no_chrome_of_its_own() {
         // Doom Term draws the UI. A tmux status bar would eat a row and render
         // vocabulary we do not control, and a live prefix key would swallow
@@ -666,10 +737,95 @@ mod tests {
             &["--rcfile".into(), "/run/i.sh".into(), "-i".into()],
         );
         let dashdash = args.iter().position(|a| a == "--").expect("needs --");
+        // The shell's own argv is handed to `exec` as words, so nothing in it
+        // is re-parsed by anyone — not by tmux, and not by the launcher.
         assert_eq!(
             &args[dashdash + 1..],
-            ["/bin/bash", "--rcfile", "/run/i.sh", "-i"]
+            [
+                "/bin/sh",
+                "-c",
+                "cd -- \"$1\" 2>/dev/null || cd -- \"${HOME:-/}\" 2>/dev/null || cd /; shift; exec \"$@\"",
+                "doom-term-launch",
+                "/work",
+                "/bin/bash",
+                "--rcfile",
+                "/run/i.sh",
+                "-i",
+            ]
         );
+    }
+
+    #[test]
+    fn the_shell_chdirs_itself_rather_than_trusting_the_server_to() {
+        /*
+         * `-c` is an instruction, not a guarantee. A tmux server whose OWN
+         * working directory has been deleted discards it and starts every new
+         * pane in that dead directory. Reproduced 2026-09-16: a fresh server
+         * honoured `-c /etc`; after its cwd was removed with the server still
+         * running, an identical `-c /etc` landed the pane in
+         * `…/deadcwd (deleted)` while `#{session_path}` still read `/etc`.
+         *
+         * The server is per-user and outlives the app by design, and under an
+         * AppImage the app's directory is a mount that is torn down on exit —
+         * so this is the normal case on the second launch, not an edge one.
+         */
+        let args = create_session_args(
+            Path::new("/c"),
+            "doom-n1",
+            80,
+            24,
+            Path::new("/work/repo"),
+            &[],
+            "/bin/bash",
+            &["-i".into()],
+        );
+        // Still told, because it is right on a healthy server and it is what
+        // `#{session_path}` reports.
+        let dash_c = args.iter().position(|a| a == "-c").expect("needs -c");
+        assert_eq!(args[dash_c + 1], "/work/repo");
+        // And done anyway, by the shell, as its first act.
+        let script = args.iter().find(|a| a.contains("exec")).expect("needs exec");
+        assert!(script.starts_with("cd -- \"$1\""), "{script}");
+        assert!(script.ends_with("shift; exec \"$@\""), "{script}");
+    }
+
+    #[test]
+    fn a_directory_that_vanished_still_opens_a_pane() {
+        // The same fallback order `resolve_cwd` uses, because a directory can
+        // be removed between resolving it and spawning into it. A terminal in
+        // the wrong place beats a terminal that refuses to open.
+        let args = create_session_args(
+            Path::new("/c"),
+            "doom-n1",
+            80,
+            24,
+            Path::new("/gone"),
+            &[],
+            "/bin/bash",
+            &[],
+        );
+        let script = args.iter().find(|a| a.contains("exec")).expect("needs exec");
+        assert!(script.contains("${HOME:-/}"), "{script}");
+        assert!(script.contains("|| cd /;"), "{script}");
+    }
+
+    #[test]
+    fn a_working_directory_with_a_space_stays_one_word() {
+        // The path is an argument, never interpolated into the script. A repo
+        // called "Doom Term" is not two directories.
+        let args = create_session_args(
+            Path::new("/c"),
+            "doom-n1",
+            80,
+            24,
+            Path::new("/home/u/Doom Term"),
+            &[],
+            "/bin/bash",
+            &[],
+        );
+        assert!(args.iter().any(|a| a == "/home/u/Doom Term"));
+        let script = args.iter().find(|a| a.contains("exec")).expect("needs exec");
+        assert!(!script.contains("Doom Term"), "path was interpolated: {script}");
     }
 
     #[test]

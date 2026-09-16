@@ -1,12 +1,24 @@
 import { Terminal } from '@xterm/headless';
 import { Unicode11Addon } from '@xterm/addon-unicode11';
 import type { IMarker } from '@xterm/headless';
-import type { AnsiLine } from '../types/terminal';
+import type { AnsiLine, ScreenCursor } from '../types/terminal';
 import type { TerminalScreen } from './terminalScreen';
 import { linesFrom } from './xtermLines';
 
 /** Matches what the hand-written emulator kept, so scrollback depth is unchanged. */
 const SCROLLBACK = 5000;
+
+/** DEC private mode 2026: "everything until the matching reset is one frame". */
+const SYNCHRONIZED_OUTPUT = 2026;
+
+/**
+ * How long a synchronized update may hold the screen before we draw anyway.
+ *
+ * A writer that opens 2026 and never closes it — because it crashed, or
+ * because its output was truncated — must not be able to freeze the pane. The
+ * value is the one the mode's own specification recommends for exactly this.
+ */
+const SYNC_TIMEOUT_MS = 150;
 
 /**
  * A terminal screen backed by @xterm/headless.
@@ -26,6 +38,11 @@ export class XtermScreen implements TerminalScreen {
   private nextMarkId = 1;
   private frame = 0;
   private scheduled = false;
+  /** Open synchronized updates. A frame published inside one is a torn frame. */
+  private syncDepth = 0;
+  private syncTimer: ReturnType<typeof setTimeout> | null = null;
+  /** A frame fell due while the screen was held. Publish it on release. */
+  private syncPending = false;
   private disposed = false;
   private inputRevision = 0;
   private pendingWrites = 0;
@@ -59,9 +76,11 @@ export class XtermScreen implements TerminalScreen {
     // Headless exposes no public DECTCEM state. Observe parsed commands, then
     // return false so xterm still applies every parameter (including other modes).
     this.cursorVisible = true;
-    for (const [final, visible] of [['h', true], ['l', false]] as const) {
+    for (const [final, set] of [['h', true], ['l', false]] as const) {
       terminal.parser.registerCsiHandler({ prefix: '?', final }, params => {
-        if (params.includes(25)) this.cursorVisible = visible;
+        if (params.includes(25)) this.cursorVisible = set;
+        // DECSET/DECRST 2026 — synchronized output. See `syncDepth`.
+        if (params.includes(SYNCHRONIZED_OUTPUT)) this.setSynchronized(set);
         return false;
       });
     }
@@ -134,8 +153,71 @@ export class XtermScreen implements TerminalScreen {
    * A busy agent delivers many writes per frame and each one used to drive a
    * full React update over the whole scrollback.
    */
+  /**
+   * Hold the screen for the length of one repaint, or let it go.
+   *
+   * A full-screen repaint does not arrive in one piece. tmux repaints a pane by
+   * homing the cursor and rewriting every row, and the daemon hands us that in
+   * 8 KiB chunks; a frame published between two of them shows a screen that is
+   * half old and half new. The text survives that — most rows repaint to the
+   * same thing — but the CARET does not: mid-repaint it is wherever the redraw
+   * has got to, which is the top of the pane. Sampled in Chromium on
+   * 2026-09-16 during streaming output, the caret jumped to exactly one
+   * viewport height above the tail (`cursorY === 0`) for a single frame and
+   * snapped back — the "cursor flashes to a different area" report.
+   *
+   * Mode 2026 is the writer telling us where the seams are. `terminal-features
+   * ,*:sync` in the tmux config is what makes tmux emit it around each repaint.
+   * Nesting is counted rather than latched: a writer inside a writer must not
+   * release the screen early.
+   */
+  private setSynchronized(open: boolean): void {
+    if (open) {
+      this.syncDepth++;
+      if (this.syncTimer === null) {
+        this.syncTimer = setTimeout(() => {
+          // The update never closed. Draw rather than freeze.
+          this.syncDepth = 0;
+          this.syncTimer = null;
+          this.releaseSynchronized();
+        }, SYNC_TIMEOUT_MS);
+      }
+      return;
+    }
+    if (this.syncDepth === 0) return;
+    this.syncDepth--;
+    if (this.syncDepth > 0) return;
+    if (this.syncTimer !== null) {
+      clearTimeout(this.syncTimer);
+      this.syncTimer = null;
+    }
+    this.releaseSynchronized();
+  }
+
+  /** Drop any hold and its timer, without publishing. */
+  private clearSynchronized(): void {
+    this.syncDepth = 0;
+    this.syncPending = false;
+    if (this.syncTimer !== null) {
+      clearTimeout(this.syncTimer);
+      this.syncTimer = null;
+    }
+  }
+
+  private releaseSynchronized(): void {
+    if (!this.syncPending) return;
+    this.syncPending = false;
+    this.scheduleNotify();
+  }
+
   private scheduleNotify(): void {
-    if (this.disposed || this.scheduled) return;
+    if (this.disposed) return;
+    // Held for the rest of this repaint; the frame is owed, not dropped.
+    if (this.syncDepth > 0) {
+      this.syncPending = true;
+      return;
+    }
+    if (this.scheduled) return;
     // Set BEFORE scheduling, and guard on this rather than on the frame handle:
     // a callback that runs synchronously would otherwise fire before the
     // assignment completes, leaving a stale handle that swallows every later
@@ -193,12 +275,25 @@ export class XtermScreen implements TerminalScreen {
    * directly. Both are read together and from the same buffer object so a
    * frame cannot land between them and pair a new row with an old column.
    */
-  getCursor(): { row: number; col: number; visible?: boolean } {
+  getCursor(): ScreenCursor {
     const buffer = this.term.buffer.active;
+    const row = buffer.baseY + buffer.cursorY;
+    // Pending autowrap keeps cursorX == cols until the next glyph arrives.
+    const col = Math.min(buffer.cursorX, this.term.cols - 1);
+    // The cell under the caret, read here because this is the only place with
+    // a width table. A block caret is reverse video: the view repaints this
+    // character in the ground colour on the block, which is the only way it
+    // stays readable. Blending the block with whatever colour the program
+    // chose produces an arbitrary third colour instead — measured at
+    // difference(#e0a92c, #e8dcbc) = #083390, navy on amber.
+    const cell = buffer.getLine(row)?.getCell(col);
+    const glyph = cell?.getChars() ?? '';
+    const width = cell?.getWidth() ?? 1;
     return {
-      row: buffer.baseY + buffer.cursorY,
-      // Pending autowrap keeps cursorX == cols until the next glyph arrives.
-      col: Math.min(buffer.cursorX, this.term.cols - 1),
+      row,
+      col,
+      ...(glyph === '' || glyph === ' ' ? {} : { glyph }),
+      ...(width === 2 ? { cells: 2 } : {}),
       ...(this.cursorVisible ? {} : { visible: false }),
     };
   }
@@ -220,6 +315,8 @@ export class XtermScreen implements TerminalScreen {
   reset(): void {
     if (this.disposed) return;
     this.rejectBoundaries(new Error('Terminal screen was reset'));
+    // A half-open synchronized update belongs to the parser being thrown away.
+    this.clearSynchronized();
     this.parserGeneration++;
     this.submitted = 0;
     this.applied = 0;
@@ -239,6 +336,7 @@ export class XtermScreen implements TerminalScreen {
     this.inputRevision++;
     this.disposed = true;
     this.rejectBoundaries(new Error('Terminal screen is disposed'));
+    this.clearSynchronized();
     if (this.frame) cancelAnimationFrame(this.frame);
     this.frame = 0;
     this.scheduled = false;

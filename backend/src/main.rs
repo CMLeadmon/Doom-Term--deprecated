@@ -247,6 +247,14 @@ fn provision_cli_tools() {
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
+    // Before anything is spawned. The directory the daemon is launched in is
+    // not ours to keep — under an AppImage it is the FUSE mount, and it is
+    // unmounted the moment the app exits while the tmux server started from it
+    // lives on. See `anchor_working_directory`.
+    log::info!(
+        "working directory anchored at {}",
+        pty::anchor_working_directory().display()
+    );
     if let Ok(host) = std::env::var("DOOM_HOST") {
         anyhow::ensure!(
             security::loopback_host(&host),

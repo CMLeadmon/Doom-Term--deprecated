@@ -1546,3 +1546,99 @@ async fn recovery_an_evicted_resume_cursor_is_an_explicit_gap_not_a_silent_skip(
     );
     std::fs::write(&finish, []).unwrap();
 }
+
+/// A pane opens where it was told, even when the tmux server is in no
+/// position to put it there.
+///
+/// `new-session -c <dir>` is an instruction, not a guarantee: a tmux SERVER
+/// whose own working directory has been deleted discards it and starts every
+/// new pane in that dead directory instead. The server is per-user and
+/// deliberately outlives the app, and under an AppImage the app runs from a
+/// FUSE mount that is torn down on exit — so a server left holding a detached
+/// directory is the NORMAL state of the second launch, not an edge case. Every
+/// terminal after that came up somewhere the user never asked for, with
+/// `getcwd` failing and the shell printing "Transport endpoint is not
+/// connected" before its first prompt.
+///
+/// This runs in the isolated child so it can move the process's own working
+/// directory and then delete it, which is the only way to reproduce the
+/// server's state, and is exactly what the harness exists for.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_pane_opens_in_the_requested_directory_even_when_the_server_lost_its_own() {
+    if isolated_durable(
+        "a_pane_opens_in_the_requested_directory_even_when_the_server_lost_its_own",
+    ) {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let doomed = home.path().join("gone");
+    std::fs::create_dir(&doomed).unwrap();
+
+    let reporter = |path: &std::path::Path| {
+        let script = workspace.path().join(format!(
+            "report-{}.sh",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        // -P, because `pwd` without it prints $PWD, and $PWD in a tmux pane is
+        // inherited from the server's environment rather than observed.
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\npwd -P > '{}'\nexec cat\n", path.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        script
+    };
+
+    // Start the tmux server from a directory that is about to stop existing.
+    std::env::set_current_dir(&doomed).unwrap();
+    let fixture = fixture().await;
+    let mut ws = connect(&fixture).await;
+    let first_out = workspace.path().join("first");
+    send(
+        &mut ws,
+        json!({"action":"Create","payload":{"request_id":"first","id":"first","cols":80,"rows":24,
+            "cwd":workspace.path(),"shell":reporter(&first_out)}}),
+    )
+    .await;
+    assert!(
+        event(&mut ws, "CreateResult").await["error"].is_null(),
+        "the first session must open"
+    );
+
+    // Now take it away. The server keeps running; its cwd is detached.
+    std::env::set_current_dir("/").unwrap();
+    std::fs::remove_dir(&doomed).unwrap();
+
+    let second_out = workspace.path().join("second");
+    send(
+        &mut ws,
+        json!({"action":"Create","payload":{"request_id":"second","id":"second","cols":80,"rows":24,
+            "cwd":workspace.path(),"shell":reporter(&second_out)}}),
+    )
+    .await;
+    assert!(event(&mut ws, "CreateResult").await["error"].is_null());
+
+    let observed = |path: &std::path::Path| {
+        for _ in 0..200 {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                let text = text.trim().to_string();
+                if !text.is_empty() {
+                    return text;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        panic!("child never reported its directory: {}", path.display());
+    };
+
+    let wanted = std::fs::canonicalize(workspace.path()).unwrap();
+    assert_eq!(std::path::Path::new(&observed(&first_out)), wanted);
+    // The one that matters. Before the shell did its own chdir this was the
+    // deleted directory, reported by the kernel as `…/gone (deleted)`.
+    assert_eq!(std::path::Path::new(&observed(&second_out)), wanted);
+}

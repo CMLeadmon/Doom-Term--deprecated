@@ -23,16 +23,24 @@ pub fn telemetry(
     // that showed up as a permanent '--' next to a running agent.
     let observed = session.as_ref().and_then(|s| s.current_cwd());
 
+    // Observed, then asked for, then HOME — and never the daemon's own
+    // directory.
+    //
+    // This used to end at `std::env::current_dir()`. A session has nothing to
+    // do with where the daemon was started, and under an AppImage that is the
+    // FUSE mount: a GetTelemetry with no session and no cwd answered
+    // `/tmp/.mount_XXXXXXXX/usr`, the client stored it on the node, and every
+    // terminal opened from that node inherited it. The app reported a
+    // directory that belongs to a mount which is unmounted when the app exits.
+    // HOME is the same last resort `resolve_cwd` uses when it spawns a shell,
+    // so the two agree about where "nowhere in particular" is.
     let current_dir = observed
         .or_else(|| {
             cwd.map(|c| pty::session::expand_path(&c).to_string_lossy().to_string())
                 .filter(|c| !c.trim().is_empty())
         })
-        .unwrap_or_else(|| {
-            std::env::current_dir()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default()
-        });
+        .or_else(|| std::env::var("HOME").ok())
+        .unwrap_or_else(|| "/".to_string());
     // No game vocabulary in anything the UI can render: an unknown user
     // is unknown, not a "marine" on "phobos-base".
     let username = std::env::var("USER")

@@ -1,4 +1,4 @@
-import type { AnsiLine } from '../types/terminal';
+import type { AnsiLine, ScreenCursor } from '../types/terminal';
 
 /**
  * What the app needs from a terminal screen, independent of who parses.
@@ -47,7 +47,7 @@ export interface TerminalScreen {
    * with a shell that prints its prompt and then waits, there was nothing on
    * screen distinguishing a live terminal from a screenshot of one.
    */
-  getCursor(): { row: number; col: number; visible?: boolean };
+  getCursor(): ScreenCursor;
 
   /** Rows from `mark` to the end. Falls back to everything if the mark is gone. */
   linesSince(mark: number): AnsiLine[];

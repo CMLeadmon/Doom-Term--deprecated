@@ -116,13 +116,30 @@ export const SplitPaneGrid: React.FC<SplitPaneGridProps> = ({
     return (
       <div className="flex-1 relative flex min-h-0 min-w-0">
         {renderLeaf(effectiveTree)}
+        {/*
+            A backgrounded pane is the SAME BOX as a foreground one.
+
+            It stays mounted and laid out on purpose — `visibility` rather than
+            `display`, so it keeps measuring the window. That only works if it
+            measures the same box: this wrapper used to carry no border while a
+            leaf carries `1px solid`, so a session was 2px wider and 2px taller
+            while it was in the background. At 8px cells that is a whole column,
+            and selecting the session sent a real Resize — a SIGWINCH, which an
+            inline agent answers by redrawing its entire frame at a new width.
+            That redraw is what "the content shifts when I switch agents" is.
+        */}
         {nodes.filter((node) => !visibleIds.has(node.id)).map((node) => (
           <div
             key={node.id}
             data-pane={node.id}
             aria-hidden="true"
-            className="absolute inset-0 flex min-h-0 min-w-0"
-            style={{ visibility: 'hidden', pointerEvents: 'none' }}
+            className="absolute inset-0 flex flex-col min-h-0 min-w-0"
+            style={{
+              border: '1px solid transparent',
+              background: 'var(--ground)',
+              visibility: 'hidden',
+              pointerEvents: 'none',
+            }}
           >
             {renderPane(node, false)}
           </div>

@@ -13,6 +13,57 @@ use crate::stream::{
 };
 use crate::tmux::{self, TmuxHandle};
 
+/**
+ * Move off a working directory that can be taken away, once, at startup.
+ *
+ * Nothing we start should inherit the directory an AppImage happens to run
+ * from. `AppRun` chdirs into the mount — `/tmp/.mount_XXXXXXXX/usr` — and the
+ * mount goes away when the app exits, while the tmux server we started from it
+ * does not: surviving the app is the entire point of the tmux substrate. A
+ * server left holding that directory is holding a detached one, and a tmux
+ * server whose cwd has been deleted silently ignores `new-session -c` and puts
+ * every later pane in the dead directory instead. That is how a new terminal
+ * came up at `/tmp/.mount_DoomTeKMdGLL/usr` with `getcwd` failing and six lines
+ * of "Transport endpoint is not connected" ahead of its first prompt.
+ *
+ * `launch_in` in tmux.rs is the guarantee for the pane itself. This is the
+ * other half: the helpers we spawn, the servers they start, and
+ * `resolve_cwd`'s last resort all read the process's own directory, and after
+ * this it is one that exists for as long as the user does.
+ *
+ * Returns where it landed. Idempotent, and a failure is not fatal — the
+ * directory we have is no worse than the one we were trying to leave.
+ */
+pub fn anchor_working_directory() -> std::path::PathBuf {
+    let current = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    for candidate in anchor_candidates(home.as_deref()) {
+        if candidate == current {
+            return current;
+        }
+        if std::env::set_current_dir(&candidate).is_ok() {
+            return candidate;
+        }
+    }
+    current
+}
+
+/// Where to anchor, in order of preference. Pure, and pure for the same reason
+/// `augment_path` is: `set_current_dir` is process-global, so a test that
+/// exercised the real thing would move every other test's spawned child with
+/// it — the exact failure the note on `augment_path` describes.
+fn anchor_candidates(home: Option<&std::path::Path>) -> Vec<std::path::PathBuf> {
+    let mut candidates = Vec::with_capacity(2);
+    if let Some(home) = home {
+        // A user's home outlives the app. It is also `resolve_cwd`'s fallback,
+        // so both agree about where "nowhere in particular" is.
+        candidates.push(home.to_path_buf());
+    }
+    // Always reachable, and never a mount we brought with us.
+    candidates.push(std::path::PathBuf::from("/"));
+    candidates
+}
+
 pub fn expand_path(path_str: &str) -> std::path::PathBuf {
     if path_str == "~" {
         if let Ok(home) = std::env::var("HOME") {
