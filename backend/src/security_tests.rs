@@ -207,3 +207,67 @@ fn a_non_loopback_doom_host_is_refused_before_it_can_bind() {
         assert!(security::loopback_host(local), "{local} is loopback");
     }
 }
+
+#[tokio::test]
+async fn artifact_post_and_get_endpoints_work() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = Arc::new(recovery::RecoveryServer::new().unwrap());
+    let server_clone = server.clone();
+    tokio::spawn(async move {
+        while let Ok((stream, peer)) = listener.accept().await {
+            handle_connection_authenticated(stream, peer, server_clone.clone(), None).await;
+        }
+    });
+
+    let body = r##"{"id":"test-pr-1","title":"PR Walkthrough","type":"markdown","content":"# Summary\nAll tests pass."}"##;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(
+            format!(
+                "POST /artifact HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+
+    let mut resp = Vec::new();
+    stream.read_to_end(&mut resp).await.unwrap();
+    let resp_str = String::from_utf8_lossy(&resp);
+    assert!(resp_str.starts_with("HTTP/1.1 200 OK"));
+    assert!(resp_str.contains("test-pr-1"));
+
+    // Now GET /artifact/test-pr-1
+    let mut stream2 = TcpStream::connect(addr).await.unwrap();
+    stream2
+        .write_all(
+            format!("GET /artifact/test-pr-1 HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut resp2 = Vec::new();
+    stream2.read_to_end(&mut resp2).await.unwrap();
+    let resp_str2 = String::from_utf8_lossy(&resp2);
+    assert!(resp_str2.starts_with("HTTP/1.1 200 OK"));
+    assert!(resp_str2.contains("PR Walkthrough"));
+    assert!(resp_str2.contains("All tests pass."));
+
+    // Now GET /artifact/test-pr-1/raw
+    let mut stream3 = TcpStream::connect(addr).await.unwrap();
+    stream3
+        .write_all(
+            format!("GET /artifact/test-pr-1/raw HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut resp3 = Vec::new();
+    stream3.read_to_end(&mut resp3).await.unwrap();
+    let resp_str3 = String::from_utf8_lossy(&resp3);
+    assert!(resp_str3.starts_with("HTTP/1.1 200 OK"));
+    assert!(resp_str3.contains("# Summary\nAll tests pass."));
+}
+

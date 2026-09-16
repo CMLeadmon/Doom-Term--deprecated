@@ -1,6 +1,6 @@
 import { AnsiLine } from './terminal';
 
-export type SessionKind = 'terminal' | 'agent' | 'tui' | 'scratchpad';
+export type SessionKind = 'terminal' | 'agent' | 'tui' | 'scratchpad' | 'artifact';
 
 export type AgentLifecycleState = 'unknown' | 'idle' | 'running' | 'waiting_input' | 'verifying' | 'errored';
 
@@ -129,6 +129,12 @@ export interface SessionNode {
    */
   exited?: boolean;
   scratchpadContent?: string;
+  artifactId?: string;
+  artifactTitle?: string;
+  artifactType?: 'html' | 'markdown' | 'diff' | 'dashboard';
+  artifactContent?: string;
+  artifactVersion?: number;
+  artifactUpdatedAt?: number;
   createdAt: number;
 }
 

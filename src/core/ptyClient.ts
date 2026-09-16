@@ -19,6 +19,16 @@ export interface AgentHookEvent {
   agent: string; event: 'PermissionRequest' | 'Stop'; cwd: string | null;
   doomSessionId: string; incarnation: string; eventId: string; phase: 'catch-up' | 'live';
 }
+export interface ArtifactRecord {
+  id: string;
+  title: string;
+  type: 'html' | 'markdown' | 'diff' | 'dashboard';
+  content: string;
+  version: number;
+  session_id?: string | null;
+  created_at: number;
+  updated_at: number;
+}
 export type DemuxEventHandler = {
   /** Already parsed live output; never feed this into the emulator again. */
   onOutput: (data: string, sessionId: string) => void;
@@ -83,6 +93,7 @@ export class PtyClient {
   private hooks = new Map<string, { event: AgentHookEvent; bytes: number }>();
   private hookBytes = 0;
   private sessionModeHandlers = new Set<(id: string, durable: boolean, detail: string | null) => void>();
+  private artifactHandlers = new Set<(artifact: ArtifactRecord, openPane: boolean, phase: string) => void>();
 
   constructor(options: { socket?: () => RecoverySocket } = {}) {
     this.isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
@@ -347,12 +358,23 @@ export class PtyClient {
     if (event === 'AgentEvent') {
       this.receiveHook(data); return;
     }
+    if (event === 'ArtifactEvent') {
+      const artifact = data.artifact as unknown as ArtifactRecord;
+      const openPane = Boolean(data.open_pane);
+      const phase = String(data.phase || 'live');
+      this.artifactHandlers.forEach(handler => handler(artifact, openPane, phase));
+      return;
+    }
     if (event === 'OperationError') {
       if (typeof data.session_id === 'string') this.refused(data.session_id, 'Operation refused; attachment is not ready or delivery is unknown');
       return;
     }
     const id = event === 'StreamRecord' ? object(data.record).session_id : data.session_id;
     if (typeof id === 'string') this.bindings.get(id)?.attachment?.accept(event, data);
+  }
+  onArtifact(handler: (artifact: ArtifactRecord, openPane: boolean, phase: string) => void): () => void {
+    this.artifactHandlers.add(handler);
+    return () => this.artifactHandlers.delete(handler);
   }
   inputReadiness(id: string): string | null {
     const binding = this.bindings.get(id);

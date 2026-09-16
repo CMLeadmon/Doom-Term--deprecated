@@ -355,11 +355,17 @@ export function buildPaletteActions(ctx: PaletteContext): CommandPaletteAction[]
       run: () => onCreateNode(activeGroup.id, 'scratchpad'),
     },
     {
+      id: 'new-artifact',
+      category: 'Artifacts',
+      title: 'Create Blank Artifact Pane',
+      run: () => onCreateNode(activeGroup.id, 'artifact'),
+    },
+    {
       id: 'toggle-audio',
       category: 'Audio',
       title: 'Toggle Sound Effects',
       shortcut: chordFor('toggleAudio'),
       run: () => ctx.onToggleAudio?.(),
     },
-  ].filter((action) => activeNode?.kind !== 'scratchpad' || action.category !== 'Terminal');
+  ].filter((action) => (activeNode?.kind !== 'scratchpad' && activeNode?.kind !== 'artifact') || action.category !== 'Terminal');
 }

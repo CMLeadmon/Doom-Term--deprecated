@@ -8,6 +8,7 @@ import { SplitPaneGrid } from './components/SplitPaneGrid';
 import { SessionModeNotice } from './components/SessionModeNotice';
 import { CommandPalette, type CommandPaletteAction } from './components/CommandPalette';
 import { Scratchpad } from './components/Scratchpad';
+import { ArtifactPane } from './components/ArtifactPane';
 import { WorkspaceModal } from './components/WorkspaceModal';
 import { isWorking, lastOutputAt } from './core/activityMonitor';
 import { buildWaitingList } from './core/waitingList';
@@ -72,6 +73,7 @@ export const App: React.FC = () => {
     handleParkNode,
     handleKillNode,
     handleRecoverSession,
+    openOrUpdateArtifact,
   } = useWorkspaceSet();
   // Selection commits before the next daemon poll. Do not lend the old pane's
   // context, quota, model, or environment to the new one during that gap.
@@ -141,7 +143,7 @@ export const App: React.FC = () => {
     sessionNumber?: number | null;
   }>({ isOpen: false, nodeId: '', title: '' });
 
-  const activeViewSessionId = activeNode?.kind === 'scratchpad' ? null : activeNode?.id ?? null;
+  const activeViewSessionId = activeNode?.kind === 'scratchpad' || activeNode?.kind === 'artifact' ? null : activeNode?.id ?? null;
   const requestViewAction = useCallback((action: ViewAction) => {
     // A cached snapshot has no terminal view to acknowledge this request. If
     // it were queued anyway, reviving the session later would replay an old
@@ -258,13 +260,20 @@ export const App: React.FC = () => {
   // nodes; selecting a pane must not create, reset or replay its process.
   useEffect(() => {
     if (!activeNode) return;
-    if (activeNode.kind === 'scratchpad') return;
+    if (activeNode.kind === 'scratchpad' || activeNode.kind === 'artifact') return;
     // Nobody has said where the first terminal opens yet. Spawning HOME behind
     // the picker would leave a shell running in a folder no one chose, and the
     // chosen folder would then be the second session rather than the first.
     if (needsWorkspaceChoice) return;
     ptyClient.setActiveSession(activeNode.id);
   }, [activeNode?.id, activeNode?.kind, needsWorkspaceChoice]);
+
+  // Subscribe to live artifact events broadcast by the daemon
+  useEffect(() => {
+    return ptyClient.onArtifact((artifact, openPane) => {
+      openOrUpdateArtifact(artifact, openPane);
+    });
+  }, [openOrUpdateArtifact]);
 
   // The foreground process changes without any PTY event, so ask the daemon.
   useEffect(() => {
@@ -476,6 +485,24 @@ export const App: React.FC = () => {
               },
             }));
           }}
+        />
+      );
+    }
+
+    if (node.kind === 'artifact') {
+      return (
+        <ArtifactPane
+          node={node}
+          onUpdateContent={(content) => {
+            setWorkspace((prev) => ({
+              ...prev,
+              nodes: {
+                ...prev.nodes,
+                [node.id]: { ...node, artifactContent: content },
+              },
+            }));
+          }}
+          onClose={() => handleKillNode(node.id)}
         />
       );
     }
