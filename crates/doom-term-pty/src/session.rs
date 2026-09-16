@@ -119,6 +119,11 @@ pub struct PtySession {
     /// Why this session is not durable, when it is not. Reported to the UI:
     /// a persistence guarantee that silently is not one is worse than none.
     durability_detail: Option<String>,
+    /// Windows only: the job object holding this session's process tree, so
+    /// that closing a pane closes what the pane started. See `job.rs` — Unix
+    /// gets the same guarantee from `killpg` and needs no field.
+    #[cfg(windows)]
+    job: Option<crate::job::JobObject>,
 }
 
 pub struct DurableRebuild {
@@ -495,6 +500,21 @@ impl PtySession {
         })?;
         let child_pid = child.process_id();
         let shell_pid_direct = child_pid;
+        // Windows has no process group to signal, so the tree is held by a job
+        // object instead; see `job.rs`. This is the earliest seam
+        // `portable-pty` exposes — the race that leaves is documented there.
+        //
+        // A failure here must not fail the session: an unplaceable child is a
+        // pane that still works and still reports honestly, where refusing to
+        // start would be a terminal that does not open.
+        #[cfg(windows)]
+        let job = child_pid.and_then(|pid| match crate::job::JobObject::create_for(pid) {
+            Ok(job) => Some(job),
+            Err(error) => {
+                log::warn!("Session {id} could not be placed in a job object: {error:#}");
+                None
+            }
+        });
         let child: OwnedChild = Arc::new(parking_lot::Mutex::new(Some(child)));
         let reader_child = child.clone();
         let reader_tmux = tmux_handle.clone();
@@ -682,6 +702,8 @@ impl PtySession {
             observations,
             tmux: tmux_handle,
             durability_detail,
+            #[cfg(windows)]
+            job,
         })
     }
 
@@ -894,6 +916,14 @@ impl PtySession {
                 nix::sys::signal::Signal::SIGKILL,
             )
             .context("Failed to kill the owned PTY process group")?;
+        }
+        // The job object is the process group Windows does not have: every
+        // descendant the shell started is in it, so this is what stops a closed
+        // pane from leaving a running agent nobody can reach. `child.kill()`
+        // below stays as the fallback for a session that could not be placed.
+        #[cfg(windows)]
+        if let Some(job) = &self.job {
+            job.terminate()?;
         }
         #[cfg(not(unix))]
         child.kill()?;

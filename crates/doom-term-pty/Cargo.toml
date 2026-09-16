@@ -24,6 +24,10 @@ nix = { version = "0.29", features = ["signal", "process", "term"] }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    # CreateJobObjectW takes a *const SECURITY_ATTRIBUTES, and windows-sys omits
+    # any function whose signature reaches into a feature you did not enable.
+    "Win32_Security",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
     "Win32_System_Threading",
 ] }
