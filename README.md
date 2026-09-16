@@ -88,19 +88,24 @@ Full verification proofs and component maps are detailed in [`docs/REFORMATION_A
 ## 🖥️ Platform Support
 
 Doom Term identifies the agent running in a pane from the operating system, never
-from a tab title. There are exactly two witnesses for that, and which ones exist
-decides what the app can honestly report.
+from a tab title. Which witness the OS offers decides what the app can honestly
+report.
 
 | | Linux | macOS | Windows |
 | :--- | :--- | :--- | :--- |
 | Terminal, splits, scrollback, status plate | ✅ | ✅ | ✅ |
-| Agent identification (mugshot, agent well) | ✅ `/proc/<pid>/stat` `tpgid` | ✅ via tmux `pane_current_command` | ❌ **neither witness exists** |
-| Keyboard pass-through by foreground process | ✅ | ✅ (tmux) | ❌ |
+| Agent identification (mugshot, agent well) | ✅ `/proc/<pid>/stat` `tpgid` | ✅ via tmux `pane_current_command` | 🚧 in progress |
 | Durable sessions across a daemon restart | ✅ tmux | ✅ tmux | ❌ no native tmux |
-| Child-checked paste | ✅ | ✅ | ❌ `unsupported on this platform` |
-| Claude context reading | ✅ hook `transcript_path` | ✅ | ⚠️ hook needs `bash`, `curl`, GNU `timeout` |
+| Child-checked paste | ✅ | ✅ | 🚧 in progress |
+| Claude context reading | ✅ hook `transcript_path` | ✅ | 🚧 hook needs `bash`, `curl`, GNU `timeout` |
 | Codex context / rate reading | ✅ `/proc/<pid>/fd` | ❌ `--` | ❌ `--` |
-| Built and tested in CI | ✅ | ⚠️ compile-checked | ⚠️ compile-checked |
+| Git branch indicator | ✅ | ✅ | 🚧 in progress |
+| Closing a pane closes what it started | ✅ `killpg` | ✅ `killpg` | ❌ orphans descendants |
+| Built and bundled in CI | ✅ | ✅ | ✅ |
+
+Keyboard pass-through is **not** in this table, because it is not platform-dependent.
+Axiom 1 is unconditional: plain `Ctrl` keys are encoded and written to the child on
+every platform, with no reference to which process is in the foreground.
 
 **Linux is the reference platform.** It is the only one the full `npm run agent:verify`
 gate runs on.
@@ -111,13 +116,16 @@ prefixes are searched directly, since a Finder-launched app cannot see them thro
 `/proc`. Codex context stays `--`, because attributing a rollout file to a pane
 requires reading that process's open descriptors.
 
-**Windows is a degraded build, and is published as such.** A shell runs under ConPTY
-and the terminal itself works, but Windows has neither `/proc` nor a native tmux — so
-there is no witness at all for which process is in the foreground. The agent well
-never lights up, sessions do not survive a daemon restart, and paste cannot be
-child-checked. This is not a bug with a fix pending; it needs a third foreground
-witness written against the Win32 console API. Per Axiom 3 the affected readings
-render `--` rather than inventing a value.
+**Windows builds, bundles and runs a terminal, and is being brought up to parity.**
+It has no process *group*, which is what `tpgid` reports — but it has a process
+*tree*, and the most recently spawned descendant of the shell is a real foreground
+witness. That work is specified in
+[`docs/superpowers/specs/2026-09-16-windows-support-design.md`](docs/superpowers/specs/2026-09-16-windows-support-design.md)
+and tracked in
+[`docs/superpowers/plans/2026-09-16-windows-support.md`](docs/superpowers/plans/2026-09-16-windows-support.md).
+Until each row above is confirmed on Windows hardware it stays 🚧, not ✅ — per
+Axiom 3, an unproven reading renders `--` rather than a number, and an unproven
+claim renders as unproven rather than as a checkmark.
 
 ---
 
