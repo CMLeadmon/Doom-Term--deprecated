@@ -38,6 +38,7 @@ pub struct RecoveryServer {
     pub sessions: SessionsMap,
     pub usage: crate::UsageHandle,
     pub hooks: Arc<crate::hooks::HookHub>,
+    pub artifacts: Arc<crate::artifacts::ArtifactHub>,
     epoch: Identity,
     outbound: OutboundHub,
     catalog: Mutex<Catalog>,
@@ -416,6 +417,7 @@ impl RecoveryServer {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             usage: Arc::new(crate::usage::service::UsageService::new()),
             hooks: Arc::new(crate::hooks::HookHub::default()),
+            artifacts: Arc::new(crate::artifacts::ArtifactHub::default()),
             epoch: Identity::random()?,
             outbound: OutboundHub::default(),
             catalog: Mutex::new(Catalog::default()),
@@ -652,10 +654,12 @@ impl RecoveryServer {
             let dispatch = async {
                 let mut pump = None;
                 let mut hooks = None;
+                let mut artifacts = None;
                 let reply = match command {
                     Ok(Client::Negotiate { version: 2 }) if !negotiated => {
                         negotiated = true;
                         hooks = Some(self.hooks.subscribe());
+                        artifacts = Some(self.artifacts.subscribe());
                         json!({"event":"Negotiated","data":{"version":2,"daemon_epoch":self.epoch}})
                     }
                     Ok(Client::ListSessions { request_id }) if negotiated => {
@@ -982,14 +986,14 @@ impl RecoveryServer {
                         json!({"event":"Incompatible","data":{"message":"Negotiated protocol v2 is required; legacy commands are refused"}})
                     }
                 };
-                Some((reply, pump, hooks))
+                Some((reply, pump, hooks, artifacts))
             };
             let result = tokio::select! {
                 biased;
                 _ = tx.closed() => break,
                 result = dispatch => result,
             };
-            let Some((reply, pump, hooks)) = result else {
+            let Some((reply, pump, hooks, artifacts)) = result else {
                 continue;
             };
             if tx.send(&reply).await.is_err() {
@@ -997,6 +1001,9 @@ impl RecoveryServer {
             }
             if let Some(hooks) = hooks {
                 workers.spawn(crate::hooks::forward(hooks, tx.clone()));
+            }
+            if let Some(artifacts) = artifacts {
+                workers.spawn(crate::artifacts::forward_artifacts(artifacts, tx.clone()));
             }
             if let Some(pump) = pump {
                 workers.spawn(pump.run(tx.clone()));

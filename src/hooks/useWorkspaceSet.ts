@@ -14,7 +14,7 @@ import { uniqueId } from '../core/ids';
 import { disposeEmulator, BOOTSTRAP_COLS, BOOTSTRAP_ROWS } from '../core/emulatorRegistry';
 import { disposeActivity } from '../core/activityMonitor';
 import { attentionQueue } from '../core/attentionQueue';
-import { ptyClient } from '../core/ptyClient';
+import { ptyClient, type ArtifactRecord } from '../core/ptyClient';
 import { audioEngine } from '../core/audioEngine';
 import { placeRecoveredSession } from '../core/recoveryPlacement';
 import { equalizeTree, paneLeaf, removeLeaf, replaceLeaf, splitLeaf, treeForSelection, treeFromLayout } from '../core/paneTree';
@@ -134,7 +134,7 @@ export function useWorkspaceSet() {
         const listing = await ptyClient.listSessions();
         if (disposed) return;
         const nodes = workspaceSetRef.current.workspaces.flatMap(candidate => Object.values(candidate.nodes))
-          .filter(node => node.kind !== 'scratchpad' && !node.snapshotOf);
+          .filter(node => node.kind !== 'scratchpad' && node.kind !== 'artifact' && !node.snapshotOf);
         const next = reconcileSessions(nodes, listing.sessions, !listing.discovery_error);
         setRecoveryState((previous) =>
           JSON.stringify(previous) === JSON.stringify(next) ? previous : next
@@ -185,7 +185,7 @@ export function useWorkspaceSet() {
     // must pass exact-incarnation reconciliation above, even when selected.
     for (const candidate of workspaceSet.workspaces) {
       for (const node of Object.values(candidate.nodes)) {
-        if (node.kind !== 'scratchpad' && !node.snapshotOf && !restoredIds.current.has(node.id)) {
+        if (node.kind !== 'scratchpad' && node.kind !== 'artifact' && !node.snapshotOf && !restoredIds.current.has(node.id)) {
           ptyClient.setCachedHistoryBudget(node.id, node.tuiLines);
           ptyClient.ensureSession(node.id, node.cwd, node.incarnation);
         }
@@ -208,7 +208,7 @@ export function useWorkspaceSet() {
     // A terminal is identified by where it is; a scratchpad has no location to
     // be identified by, so it keeps the counted title.
     const title =
-      kind === 'scratchpad'
+      kind === 'scratchpad' || kind === 'artifact'
         ? nextSessionTitle(kind, Object.values(workspace.nodes).map((n) => n.title))
         : derivedSessionTitle(cwd, branch);
 
@@ -233,6 +233,12 @@ export function useWorkspaceSet() {
       tuiLines: [],
       commandHistory: [],
       scratchpadContent: kind === 'scratchpad' ? '' : undefined,
+      artifactId: kind === 'artifact' ? newNodeId : undefined,
+      artifactTitle: kind === 'artifact' ? title : undefined,
+      artifactType: kind === 'artifact' ? 'markdown' : undefined,
+      artifactContent: kind === 'artifact' ? '# New Artifact\n\n' : undefined,
+      artifactVersion: kind === 'artifact' ? 1 : undefined,
+      artifactUpdatedAt: kind === 'artifact' ? Date.now() : undefined,
       createdAt: Date.now(),
     };
 
@@ -321,7 +327,7 @@ export function useWorkspaceSet() {
 
   const cachedOnly = (node: SessionNode): boolean => {
     const status = ptyClient.getAttachmentState(node.id)?.status;
-    return !!node.snapshotOf || node.kind === 'scratchpad' || status === 'closed' || status === 'missing' || status === 'replaced'
+    return !!node.snapshotOf || node.kind === 'scratchpad' || node.kind === 'artifact' || status === 'closed' || status === 'missing' || status === 'replaced'
       || (restoredIds.current.has(node.id) && reconciled && recoveryState.snapshots.includes(node.id));
   };
 
@@ -564,7 +570,7 @@ export function useWorkspaceSet() {
   const handleReviveNode = useCallback(async (nodeId: string) => {
     const owner = workspaceSetRef.current.workspaces.find(candidate => candidate.nodes[nodeId]);
     const original = owner?.nodes[nodeId];
-    if (!owner || !original || original.kind === 'scratchpad' || pendingClosures.current.has(nodeId)) return;
+    if (!owner || !original || original.kind === 'scratchpad' || original.kind === 'artifact' || pendingClosures.current.has(nodeId)) return;
     const status = ptyClient.getAttachmentState(nodeId)?.status;
     if (status && !['missing', 'closed', 'replaced', 'disconnected', 'failed', 'incompatible'].includes(status)) return;
     pendingClosures.current.add(nodeId);
@@ -604,6 +610,95 @@ export function useWorkspaceSet() {
     } finally { pendingClosures.current.delete(nodeId); }
   }, []);
 
+  const openOrUpdateArtifact = useCallback((artifact: ArtifactRecord, openPane = true) => {
+    setWorkspace((prev) => {
+      const existingEntry = Object.entries(prev.nodes).find(
+        ([_, n]) => n.kind === 'artifact' && (n.artifactId === artifact.id || n.id === artifact.id),
+      );
+
+      if (existingEntry) {
+        const [nodeId, existingNode] = existingEntry;
+        return {
+          ...prev,
+          nodes: {
+            ...prev.nodes,
+            [nodeId]: {
+              ...existingNode,
+              artifactTitle: artifact.title,
+              artifactType: artifact.type,
+              artifactContent: artifact.content,
+              artifactVersion: artifact.version,
+              artifactUpdatedAt: artifact.updated_at,
+            },
+          },
+        };
+      }
+
+      if (!openPane) {
+        return prev;
+      }
+
+      const newNodeId = uniqueId('node');
+      const activeGroup = prev.groups.find((g) => g.id === prev.activeGroupId) || prev.groups[0];
+      const source = prev.nodes[activeGroup?.activeNodeId];
+      const cwd = source?.cwd || prev.rootPath || '~';
+
+      const newNode: SessionNode = {
+        id: newNodeId,
+        groupId: activeGroup.id,
+        title: `❖ ${artifact.title}`,
+        number: nextSessionNumber(
+          workspaceSetRef.current.workspaces
+            .flatMap((w) => Object.values(w.nodes))
+            .map((n) => n.number)
+            .filter((n): n is number => n !== null),
+        ),
+        kind: 'artifact',
+        cwd,
+        gitBranch: '',
+        activeBlockId: null,
+        isTuiActive: false,
+        agentState: 'idle',
+        tuiLines: [],
+        commandHistory: [],
+        artifactId: artifact.id,
+        artifactTitle: artifact.title,
+        artifactType: artifact.type,
+        artifactContent: artifact.content,
+        artifactVersion: artifact.version,
+        artifactUpdatedAt: artifact.updated_at,
+        createdAt: Date.now(),
+      };
+
+      const baseTree =
+        activeGroup.paneTree ??
+        treeFromLayout(activeGroup.layout, [
+          activeGroup.activeNodeId,
+          ...activeGroup.nodeIds.filter((id) => id !== activeGroup.activeNodeId),
+        ]);
+      const paneTree = baseTree
+        ? splitLeaf(baseTree, activeGroup.activeNodeId, newNodeId, 'column')
+        : undefined;
+
+      return {
+        ...prev,
+        groups: prev.groups.map((g) => {
+          if (g.id !== activeGroup.id) return g;
+          return {
+            ...g,
+            nodeIds: [...g.nodeIds, newNodeId],
+            activeNodeId: newNodeId,
+            paneTree,
+          };
+        }),
+        nodes: {
+          ...prev.nodes,
+          [newNodeId]: newNode,
+        },
+      };
+    });
+  }, []);
+
   return {
     workspaceSet,
     workspace,
@@ -631,5 +726,6 @@ export function useWorkspaceSet() {
     handleTogglePaneZoom,
     handleParkNode,
     handleKillNode,
+    openOrUpdateArtifact,
   };
 }

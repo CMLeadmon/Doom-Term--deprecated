@@ -123,7 +123,7 @@ export function buildWaitingList(
 
   const candidates = nodes
     .filter((n) => n.id !== activeId)
-    .filter((n) => n.kind !== 'scratchpad')
+    .filter((n) => n.kind !== 'scratchpad' && n.kind !== 'artifact')
     .filter((n) => probe.lastOutputAt(n.id) !== undefined);
 
   const waiting = candidates

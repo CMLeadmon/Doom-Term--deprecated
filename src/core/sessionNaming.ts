@@ -5,6 +5,7 @@ const LABEL: Record<SessionKind, string> = {
   agent: 'Agent',
   tui: 'Terminal',
   scratchpad: 'Notes',
+  artifact: 'Artifact',
 };
 
 /**

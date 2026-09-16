@@ -1,5 +1,6 @@
 use doom_term_pty as pty;
 
+pub mod artifacts;
 mod hooks;
 mod metadata;
 mod security;
@@ -91,6 +92,12 @@ pub enum ServerMessage {
         /// waiting on the user. Absent for an agent started before its session
         /// carried the variable, in which case the client falls back to cwd.
         doom_session_id: Option<String>,
+    },
+    /// An artifact was published or updated by an agent, tool, or user script.
+    ArtifactEvent {
+        artifact: crate::artifacts::ArtifactRecord,
+        open_pane: bool,
+        phase: String,
     },
     Telemetry {
         /// Which session this describes, echoed from the request.
@@ -427,6 +434,179 @@ async fn serve_hook(
     let _ = stream.flush().await;
 }
 
+async fn serve_artifact_post(
+    mut stream: TcpStream,
+    artifacts: &Arc<crate::artifacts::ArtifactHub>,
+) {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(2500);
+    loop {
+        if buf.len() > 4 * 1024 * 1024 + 8192 {
+            break;
+        }
+        let read = tokio::time::timeout_at(deadline, stream.read(&mut chunk)).await;
+        match read {
+            Ok(Ok(0)) | Err(_) => break,
+            Ok(Ok(n)) => {
+                buf.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&buf);
+                if let Some(headers_end) = text.find("\r\n\r\n") {
+                    let body_len = text[..headers_end]
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.trim()
+                                .eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse::<usize>().ok())?
+                        })
+                        .unwrap_or(0);
+                    if buf.len() >= headers_end + 4 + body_len {
+                        break;
+                    }
+                }
+            }
+            Ok(Err(_)) => break,
+        }
+    }
+
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let host_ok = stream.local_addr().ok().is_some_and(|addr| {
+        header_value(&text, "host").is_some_and(|h| security::trusted_host(&h, addr.port()))
+    });
+    if !host_ok {
+        let _ = stream
+            .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await;
+        return;
+    }
+
+    let session_id = header_value(&text, DOOM_SESSION_HEADER);
+    if let Some(body) = text.split("\r\n\r\n").nth(1) {
+        let clean_body = body.trim_end_matches(char::from(0));
+        match serde_json::from_str::<crate::artifacts::ArtifactPost>(clean_body) {
+            Ok(post) => match artifacts.publish_or_update(post, session_id) {
+                Ok((record, _)) => {
+                    let resp_body = serde_json::json!({
+                        "id": record.id,
+                        "title": record.title,
+                        "type": record.artifact_type,
+                        "version": record.version,
+                        "url": format!("http://127.0.0.1:1421/artifact/{}", record.id)
+                    });
+                    let resp_bytes = serde_json::to_vec(&resp_body).unwrap();
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        resp_bytes.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes()).await;
+                    let _ = stream.write_all(&resp_bytes).await;
+                    let _ = stream.flush().await;
+                    return;
+                }
+                Err(err) => {
+                    let resp_body = serde_json::json!({ "error": err });
+                    let resp_bytes = serde_json::to_vec(&resp_body).unwrap();
+                    let header = format!(
+                        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        resp_bytes.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes()).await;
+                    let _ = stream.write_all(&resp_bytes).await;
+                    let _ = stream.flush().await;
+                    return;
+                }
+            },
+            Err(err) => {
+                let resp_body = serde_json::json!({ "error": format!("Invalid JSON: {}", err) });
+                let resp_bytes = serde_json::to_vec(&resp_body).unwrap();
+                let header = format!(
+                    "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    resp_bytes.len()
+                );
+                let _ = stream.write_all(header.as_bytes()).await;
+                let _ = stream.write_all(&resp_bytes).await;
+                let _ = stream.flush().await;
+                return;
+            }
+        }
+    }
+
+    let _ = stream
+        .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
+        .await;
+    let _ = stream.flush().await;
+}
+
+async fn serve_artifact_list(
+    mut stream: TcpStream,
+    artifacts: &Arc<crate::artifacts::ArtifactHub>,
+) {
+    let mut drain = [0u8; 4096];
+    let _ = stream.read(&mut drain).await;
+    let list = artifacts.list();
+    let body_bytes = serde_json::to_vec(&list).unwrap_or_default();
+    let header = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body_bytes.len()
+    );
+    let _ = stream.write_all(header.as_bytes()).await;
+    let _ = stream.write_all(&body_bytes).await;
+    let _ = stream.flush().await;
+}
+
+async fn serve_artifact_get(
+    mut stream: TcpStream,
+    artifacts: &Arc<crate::artifacts::ArtifactHub>,
+    raw_head: &str,
+) {
+    let mut drain = [0u8; 4096];
+    let _ = stream.read(&mut drain).await;
+    let path = raw_head.split_whitespace().nth(1).unwrap_or("");
+    let rest = path.strip_prefix("/artifact/").unwrap_or("");
+    let is_raw = rest.ends_with("/raw");
+    let id = if is_raw {
+        rest.trim_end_matches("/raw")
+    } else {
+        rest
+    };
+
+    if let Some(record) = artifacts.get(id) {
+        if is_raw {
+            let body_bytes = record.content.as_bytes();
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body_bytes.len()
+            );
+            let _ = stream.write_all(header.as_bytes()).await;
+            let _ = stream.write_all(body_bytes).await;
+            let _ = stream.flush().await;
+        } else {
+            let html = artifacts.render_standalone_page(&record);
+            let body_bytes = html.as_bytes();
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body_bytes.len()
+            );
+            let _ = stream.write_all(header.as_bytes()).await;
+            let _ = stream.write_all(body_bytes).await;
+            let _ = stream.flush().await;
+        }
+    } else {
+        let not_found = format!(
+            "<!DOCTYPE html><html><body style=\"background:#14120f;color:#d8cbb0;font-family:monospace;padding:24px;\"><h3>Artifact not found</h3><p>Artifact '{}' does not exist or has expired.</p><p><a style=\"color:#e0a92c;\" href=\"/artifacts\">View all active artifacts</a></p></body></html>",
+            id
+        );
+        let header = format!(
+            "HTTP/1.1 404 Not Found\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            not_found.len()
+        );
+        let _ = stream.write_all(header.as_bytes()).await;
+        let _ = stream.write_all(not_found.as_bytes()).await;
+        let _ = stream.flush().await;
+    }
+}
+
 async fn handle_connection(
     stream: TcpStream,
     client_addr: SocketAddr,
@@ -458,6 +638,21 @@ async fn handle_connection_authenticated(
     };
     let peek_str = head.to_lowercase();
     let is_ws = header_value(&head, "upgrade").is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
+
+    if peek_str.starts_with("post /artifact") {
+        serve_artifact_post(stream, &server.artifacts).await;
+        return;
+    }
+
+    if peek_str.starts_with("get /artifacts") {
+        serve_artifact_list(stream, &server.artifacts).await;
+        return;
+    }
+
+    if peek_str.starts_with("get /artifact/") {
+        serve_artifact_get(stream, &server.artifacts, &head).await;
+        return;
+    }
 
     if peek_str.starts_with("post /hook") {
         // "POST /hook/claude HTTP/1.1" -> Some("claude")

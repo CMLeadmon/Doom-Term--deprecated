@@ -8,7 +8,7 @@ export type CloseDisposition = 'kill' | 'confirm';
  * terminal manager must never turn missing telemetry into process loss.
  */
 export function closeDisposition(node: SessionNode, _durable = true): CloseDisposition {
-  if (node.kind === 'scratchpad') return 'kill';
+  if (node.kind === 'scratchpad' || node.kind === 'artifact') return 'kill';
   const idleShell = node.atPrompt === true
     && !node.foregroundAgent
     && !node.isTuiActive
