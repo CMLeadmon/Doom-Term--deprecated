@@ -106,6 +106,13 @@ fn releasing_the_last_stream_handle_releases_its_retention_budget() {
     assert_eq!(hub.retained_bytes(), 0);
 }
 
+// POSIX fixture, not POSIX behaviour. What this pins — exit-code propagation,
+// journal ordering, fault handling — is platform-independent, but the programs
+// it drives (`/bin/false`, `/bin/cat`, a `#!/bin/sh` script) have no honest
+// one-binary Windows equivalent: CreateProcessW cannot exec a `.cmd`, and
+// translating sh into cmd would test the translation. Windows gets its own
+// ConPTY-native fixture below rather than a transliteration of this one.
+#[cfg(unix)]
 #[test]
 fn process_exit_is_not_a_fabricated_semantic_command_completion() {
     if isolated("process_exit_is_not_a_fabricated_semantic_command_completion") {
@@ -146,6 +153,13 @@ fn process_exit_is_not_a_fabricated_semantic_command_completion() {
     );
 }
 
+// POSIX fixture, not POSIX behaviour. What this pins — exit-code propagation,
+// journal ordering, fault handling — is platform-independent, but the programs
+// it drives (`/bin/false`, `/bin/cat`, a `#!/bin/sh` script) have no honest
+// one-binary Windows equivalent: CreateProcessW cannot exec a `.cmd`, and
+// translating sh into cmd would test the translation. Windows gets its own
+// ConPTY-native fixture below rather than a transliteration of this one.
+#[cfg(unix)]
 #[test]
 fn real_pty_output_and_successful_resize_are_in_the_same_stream() {
     if isolated("real_pty_output_and_successful_resize_are_in_the_same_stream") {
@@ -203,6 +217,13 @@ fn real_pty_output_and_successful_resize_are_in_the_same_stream() {
     }
 }
 
+// POSIX fixture, not POSIX behaviour. What this pins — exit-code propagation,
+// journal ordering, fault handling — is platform-independent, but the programs
+// it drives (`/bin/false`, `/bin/cat`, a `#!/bin/sh` script) have no honest
+// one-binary Windows equivalent: CreateProcessW cannot exec a `.cmd`, and
+// translating sh into cmd would test the translation. Windows gets its own
+// ConPTY-native fixture below rather than a transliteration of this one.
+#[cfg(unix)]
 #[test]
 fn direct_control_fault_keeps_the_process_alive_but_refuses_further_input() {
     if isolated("direct_control_fault_keeps_the_process_alive_but_refuses_further_input") {
@@ -254,6 +275,72 @@ exec sleep 30
         assert!(session.paste("NOT_SENT").is_err());
         assert!(session.resize(100, 35).is_err());
         assert!(journal.snapshot().ended);
+    }));
+    session.kill().unwrap();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// The same guarantee as the three tests above, with a fixture built for ConPTY
+/// instead of translated from sh.
+///
+/// This is the only place Windows exercises a real PTY end to end. ConPTY
+/// creation, the reader thread, the demuxer's UTF-8 reassembly and the
+/// journal's ordering all have to work for `journal-probe` to come back, so a
+/// regression in any of them fails here rather than on a user's desktop.
+#[cfg(windows)]
+#[test]
+fn real_conpty_output_and_successful_resize_are_in_the_same_stream() {
+    if isolated("real_conpty_output_and_successful_resize_are_in_the_same_stream") {
+        return;
+    }
+    let session = doom_term_pty::PtySession::create(
+        format!("conpty-{}", std::process::id()),
+        80,
+        24,
+        None,
+        // cmd.exe is on every Windows installation and, unlike a .cmd script,
+        // is directly executable by CreateProcessW.
+        Some("cmd.exe".into()),
+    )
+    .unwrap();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        session.write(b"echo journal-probe\r\n").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let journal = session.stream();
+        let mut cursor = Sequence::default();
+        let mut seen = false;
+        while std::time::Instant::now() < deadline {
+            while let Some(record) = journal.read_after(cursor).unwrap() {
+                cursor = record.sequence;
+                if matches!(record.payload, StreamPayload::Event(DemuxEvent::Output { ref data }) if data.contains("journal-probe"))
+                {
+                    seen = true;
+                }
+            }
+            if seen {
+                break;
+            }
+            journal.wait_for_change(cursor, std::time::Duration::from_millis(50));
+        }
+        assert!(seen, "real ConPTY output did not arrive");
+
+        let before_resize = journal.snapshot().high_water;
+        session.resize(100, 35).unwrap();
+        let after_resize = journal.snapshot().high_water;
+        assert!(after_resize > before_resize);
+        let mut cursor = before_resize;
+        let mut resize = None;
+        while cursor < after_resize {
+            let record = journal.read_after(cursor).unwrap().unwrap();
+            cursor = record.sequence;
+            if let StreamPayload::Resize { cols, rows } = record.payload {
+                resize = Some((cols, rows));
+            }
+        }
+        assert_eq!(resize, Some((100, 35)));
+        assert_eq!(journal.snapshot().metadata.initial_cols, 80);
     }));
     session.kill().unwrap();
     if let Err(panic) = result {
