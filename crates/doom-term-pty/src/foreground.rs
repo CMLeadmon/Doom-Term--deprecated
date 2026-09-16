@@ -1,8 +1,36 @@
 //! Who is actually running in the terminal.
 //!
-//! The only honest answer comes from the kernel: /proc/<pid>/stat field 8
-//! (`tpgid`) is the foreground process group of the controlling terminal, and
-//! /proc/<tpgid>/comm is the command in it. Never guess from a tab title.
+//! The only honest answer comes from the operating system, never from a tab
+//! title — and which answer the OS can give differs by platform. This module is
+//! the shared vocabulary; the witness itself lives in one of two submodules.
+//!
+//! ── THE TWO WITNESSES ──────────────────────────────────────────────────────
+//!
+//! `procfs` reads /proc/<pid>/stat field 8 (`tpgid`), the kernel's own record
+//! of which process group owns the controlling terminal. It is exact, and it is
+//! the primary source wherever /proc exists. It compiles on macOS too, where
+//! every read fails and every answer is `None` — which is why `session.rs`
+//! falls back to tmux's `pane_current_command` there.
+//!
+//! `windows` walks the process tree and takes the shell's most recently spawned
+//! descendant. Windows has no foreground process group to ask about, so this is
+//! a different question with a usually-identical answer. It is weaker and the
+//! module says exactly how.
+//!
+//! What both must preserve: an unknown answer is `None`, all the way up. Every
+//! caller — `metadata.rs`, `hint.rs`, the plate's `pct()` — is built to render
+//! that as `--`. A witness that coerces "I cannot tell" into a name or a zero
+//! breaks Axiom 3 at the source, before any of those guards can catch it.
+
+#[cfg(not(windows))]
+mod procfs;
+#[cfg(not(windows))]
+pub use procfs::{foreground_command, foreground_cwd, foreground_identity, identify, open_files};
+
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+pub use windows::{foreground_command, foreground_cwd, foreground_identity, identify, open_files};
 
 /// What the plate needs to render an agent. There is deliberately no `model`
 /// field: no agent CLI reports its model to the terminal, so any model string
@@ -13,144 +41,27 @@ pub struct AgentIdentity {
     pub name: &'static str,
 }
 
-/// Field 8 of /proc/<pid>/stat. `comm` (field 2) is parenthesised and may
-/// contain ')' and spaces, so split after the LAST ')': the remaining fields
-/// are state, ppid, pgrp, session, tty_nr, tpgid — tpgid is index 5.
-fn parse_tpgid(stat: &str) -> Option<i32> {
-    let after_comm = stat.rsplit_once(')')?.1;
-    let tpgid: i32 = after_comm.split_whitespace().nth(5)?.parse().ok()?;
-    if tpgid <= 0 {
-        None
-    } else {
-        Some(tpgid)
-    }
-}
-
-/// PID plus kernel start ticks distinguish an agent restart and PID reuse.
-/// Unknown off Linux: a name or a pane id alone is not a process identity.
+/// A pid plus a per-spawn nonce. A pid alone is not an identity: they are
+/// reused, and a reused one would attribute a dead agent's transcript to
+/// whatever took its number.
+///
+/// `start_ticks` is whatever the platform offers that is fixed for the life of
+/// a process and different for the next one to hold that pid: kernel start
+/// ticks from /proc/<pid>/stat on Linux, the creation `FILETIME` from
+/// `GetProcessTimes` on Windows. It is only ever compared for equality, never
+/// displayed or interpreted, so the two need not share a unit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProcessIdentity {
     pub pid: u32,
     pub start_ticks: u64,
 }
 
-/// Start ticks for a pid: /proc/<pid>/stat field 22, which is field 3 after the
-/// final parenthesized comm. None when the process is gone.
-fn start_ticks(pid: u32) -> Option<u64> {
-    std::fs::read_to_string(format!("/proc/{pid}/stat"))
-        .ok()?
-        .rsplit_once(')')?
-        .1
-        .split_whitespace()
-        .nth(19)?
-        .parse()
-        .ok()
-}
-
-/// One pid, as an identity. A pid on its own is not one: they are reused.
-pub fn identify(pid: u32) -> Option<ProcessIdentity> {
-    Some(ProcessIdentity {
-        pid,
-        start_ticks: start_ticks(pid)?,
-    })
-}
-
-pub fn foreground_identity(shell_pid: u32) -> Option<ProcessIdentity> {
-    let shell_stat = std::fs::read_to_string(format!("/proc/{shell_pid}/stat")).ok()?;
-    identify(u32::try_from(parse_tpgid(&shell_stat)?).ok()?)
-}
-
-/// How many descriptors we will look at before giving up on a process.
-///
-/// This runs on the telemetry poll, several times a second. A process holding
-/// more open files than this is not one we are going to describe usefully, and
-/// walking an unbounded directory there would be the most expensive thing the
-/// daemon does.
-const MAX_DESCRIPTORS: usize = 512;
-
-/// The regular files this exact process has open, per the kernel.
-///
-/// ── WHY A DESCRIPTOR AND NOT A DIRECTORY SCAN ──────────────────────────────
-///
-/// "Which transcript belongs to THIS pane" is an ownership question, and a
-/// directory cannot answer it: two agents in one repository write two matching
-/// files and nothing outside them can say which is which. A descriptor is the
-/// kernel's own bookkeeping — the file is open in that process and no other —
-/// so it settles the question the scan could only guess at.
-///
-/// `identity` is re-checked after the walk, so a pid recycled midway through
-/// cannot hand back another process's files. Anything that is not a plain
-/// existing file is skipped: sockets, pipes and anon inodes all appear here,
-/// and a deleted file's link still resolves to a path that reads as real.
-pub fn open_files(identity: ProcessIdentity) -> Vec<std::path::PathBuf> {
-    // Cheapest check first: a pid that is already someone else is not worth
-    // walking, and the walk is the expensive half.
-    if start_ticks(identity.pid) != Some(identity.start_ticks) {
-        return Vec::new();
-    }
-    let Ok(entries) = std::fs::read_dir(format!("/proc/{}/fd", identity.pid)) else {
-        return Vec::new();
-    };
-    let mut found = Vec::new();
-    for entry in entries.flatten().take(MAX_DESCRIPTORS) {
-        let Ok(path) = std::fs::read_link(entry.path()) else {
-            continue;
-        };
-        if path.is_absolute() && path.is_file() {
-            found.push(path);
-        }
-    }
-    // The pid may have been reused between naming it and reading it.
-    if start_ticks(identity.pid) != Some(identity.start_ticks) {
-        return Vec::new();
-    }
-    found
-}
-
-/// The command currently in the foreground of `shell_pid`'s terminal.
-/// Returns None off Linux, or when the shell itself is in the foreground.
-pub fn foreground_command(shell_pid: u32) -> Option<String> {
-    let stat = std::fs::read_to_string(format!("/proc/{}/stat", shell_pid)).ok()?;
-    let tpgid = parse_tpgid(&stat)?;
-    let comm = std::fs::read_to_string(format!("/proc/{}/comm", tpgid)).ok()?;
-    Some(comm.trim().to_string())
-}
-
-/// The working directory of whatever is in the foreground of `shell_pid`'s
-/// terminal, falling back to the shell's own.
-///
-/// ── WHY NOT ASK THE SHELL ──────────────────────────────────────────────────
-///
-/// Doom Term learned the directory from OSC 7, which the integration script
-/// emits from `PROMPT_COMMAND` — that is, once per prompt. `cd somewhere &&
-/// claude` never draws another prompt, so the sequence never fires and the app
-/// keeps reporting the directory the session started in, indefinitely.
-///
-/// That is not cosmetic. CONTEXT % is looked up BY directory, so a stale one
-/// silently sends the lookup to a path with no transcripts and the plate reads
-/// '--' for an agent that is right there. The kernel has the answer, it costs
-/// one readlink, and it is true whatever the user's shell does or does not
-/// emit.
-///
-/// The FOREGROUND process is asked first because it is the one the reading is
-/// about: an agent may have changed directory since it started, and it is that
-/// agent's context we are trying to describe.
-pub fn foreground_cwd(shell_pid: u32) -> Option<String> {
-    let read = |pid: i64| {
-        std::fs::read_link(format!("/proc/{}/cwd", pid))
-            .ok()
-            .map(|p| p.to_string_lossy().to_string())
-    };
-
-    std::fs::read_to_string(format!("/proc/{}/stat", shell_pid))
-        .ok()
-        .and_then(|stat| parse_tpgid(&stat))
-        .and_then(|tpgid| read(tpgid as i64))
-        .or_else(|| read(shell_pid as i64))
-}
-
 /// Map a real process name to a plate identity. Unknown binaries are not
 /// agents — a plain command must never light up the agent well.
+///
+/// Matching is exact, on the bare name the platform reports. Windows folds
+/// "Claude.exe" to "claude" before calling here rather than loosening these
+/// arms, so that a new platform cannot quietly widen what counts as an agent.
 pub fn classify_agent(comm: &str) -> Option<AgentIdentity> {
     // The key selects which mark and which colour the plate draws, so it has to
     // name the vendor whose agent this actually is. Borrowing another vendor's
@@ -174,6 +85,10 @@ pub fn classify_agent(comm: &str) -> Option<AgentIdentity> {
 
 /// Isolation is reported, never assumed. The daemon spawns onto the host, so
 /// the only true "sandbox" is the whole process being containerised.
+///
+/// Both marker paths are absent on Windows, so a Windows container reports
+/// `host`. That is the same position Linux takes when the files are missing:
+/// no evidence of containment is not evidence of containment.
 pub fn detect_isolation() -> &'static str {
     let contained = std::path::Path::new("/run/.containerenv").exists()
         || std::path::Path::new("/.dockerenv").exists();
@@ -224,53 +139,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_tpgid_from_a_stat_line_whose_comm_contains_spaces_and_parens() {
-        // /proc/<pid>/stat field 2 is parenthesised and may itself contain
-        // ')' and spaces, so the parse must split after the LAST ')'.
-        let stat = "4242 (my )weird( proc) S 4240 4242 4242 34816 9001 4194304 …";
-        assert_eq!(parse_tpgid(stat), Some(9001));
-    }
-
-    #[test]
-    fn open_files_reports_a_file_this_process_actually_holds_open() {
-        // The whole point of reading descriptors rather than scanning a
-        // directory: this answer is about ONE process, and the kernel is the
-        // one giving it.
-        let path = std::env::temp_dir().join("doom-term-open-files-probe.jsonl");
-        let handle = std::fs::File::create(&path).expect("probe file");
-        let me = identify(std::process::id()).expect("our own identity");
-
-        let open = open_files(me);
-        assert!(
-            open.iter().any(|found| found == &path),
-            "a file we are holding open must appear: {open:?}"
-        );
-
-        drop(handle);
-        std::fs::remove_file(&path).ok();
-        assert!(
-            !open_files(me).iter().any(|found| found == &path),
-            "a closed file must stop being reported"
-        );
-    }
-
-    #[test]
-    fn open_files_refuses_to_answer_for_a_process_that_is_not_the_one_named() {
-        // Start ticks are what separate a live agent from a recycled pid. A
-        // mismatched identity must yield nothing rather than another
-        // process's files.
-        let imposter = ProcessIdentity {
-            pid: std::process::id(),
-            start_ticks: u64::MAX,
-        };
-        assert!(open_files(imposter).is_empty());
-    }
-
-    #[test]
     fn a_shell_in_the_foreground_of_its_own_terminal_is_not_an_agent() {
         assert!(classify_agent("bash").is_none());
         assert!(classify_agent("zsh").is_none());
         assert!(classify_agent("ls").is_none());
+    }
+
+    #[test]
+    fn a_windows_image_name_is_not_an_agent_until_it_has_been_folded() {
+        // The fold belongs to the Windows witness, not to this match. If these
+        // ever start resolving, a platform has widened what counts as an agent
+        // by loosening the shared table instead of normalising its own input.
+        assert!(classify_agent("claude.exe").is_none());
+        assert!(classify_agent("Claude").is_none());
+        assert!(classify_agent("CODEX.EXE").is_none());
     }
 
     #[test]
@@ -323,11 +205,6 @@ mod tests {
             before - 1,
             "only agy/antigravity may share a key"
         );
-    }
-
-    #[test]
-    fn a_negative_tpgid_means_no_controlling_terminal() {
-        assert_eq!(parse_tpgid("1 (init) S 0 1 1 0 -1 4194560"), None);
     }
 
     fn tmp(name: &str) -> std::path::PathBuf {
