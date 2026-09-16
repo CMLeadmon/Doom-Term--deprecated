@@ -72,6 +72,29 @@ while [ $# -gt 0 ]; do
       PORT="$2"
       shift 2
       ;;
+    -h|--help)
+      cat <<'EOF'
+Doom Term Artifact Publisher
+
+Usage:
+  doom-term-artifact [options] [file]
+  echo "..." | doom-term-artifact [options]
+
+Options:
+  --title <text>    Human-readable title (default: "Artifact")
+  --type <type>     Content type: markdown | html | diff | dashboard | image (default: markdown)
+  --id <id>         Stable artifact id for updates (optional)
+  --no-open         Do not automatically open a split pane in Doom Term
+  --port <port>     Daemon port (defaults to $DOOM_PORT or 1421)
+  -h, --help        Show this help message
+
+Examples:
+  doom-term-artifact --title "PR Walkthrough" report.md
+  doom-term-artifact --title "Architecture Diagram" architecture.png
+  git diff | doom-term-artifact --title "Git Diff" --type diff
+EOF
+      exit 0
+      ;;
     *)
       if [ -z "$FILE" ]; then
         FILE="$1"
