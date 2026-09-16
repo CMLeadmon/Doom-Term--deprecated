@@ -52,3 +52,28 @@ test('an empty failure with no explanation fails rather than excusing itself', (
   assert.deepEqual(classifyCargoFailure(1, ''), { kind: 'fail' });
   assert.deepEqual(classifyCargoFailure(1, undefined), { kind: 'fail' });
 });
+
+test('a Windows runner without the MSVC toolchain is blocked, not broken', () => {
+  // Before this, nothing in the marker list said anything a Windows failure
+  // says, so a missing build tool was reported as "the crate does not
+  // compile" — conflating an environment with a defect, which is the one
+  // thing this classifier exists to keep apart.
+  const result = classifyCargoFailure(
+    101,
+    'error occurred in cc-rs: failed to find tool "lib.exe": No such file or directory'
+  );
+  assert.equal(result.kind, 'blocked');
+  assert.match(result.reason, /failed to find tool/);
+});
+
+test('a missing MSVC linker is blocked, not broken', () => {
+  const result = classifyCargoFailure(101, 'error: linker `link.exe` not found');
+  assert.equal(result.kind, 'blocked');
+});
+
+test('a real Windows compile error is still a failure', () => {
+  // The permissive direction remains the dangerous one: a genuine error on
+  // Windows must not be excused just because the platform is Windows.
+  const result = classifyCargoFailure(101, 'error[E0425]: cannot find value `nope` in this scope');
+  assert.equal(result.kind, 'fail');
+});

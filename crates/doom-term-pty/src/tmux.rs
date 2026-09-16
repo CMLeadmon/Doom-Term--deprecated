@@ -784,7 +784,10 @@ mod tests {
         let dash_c = args.iter().position(|a| a == "-c").expect("needs -c");
         assert_eq!(args[dash_c + 1], "/work/repo");
         // And done anyway, by the shell, as its first act.
-        let script = args.iter().find(|a| a.contains("exec")).expect("needs exec");
+        let script = args
+            .iter()
+            .find(|a| a.contains("exec"))
+            .expect("needs exec");
         assert!(script.starts_with("cd -- \"$1\""), "{script}");
         assert!(script.ends_with("shift; exec \"$@\""), "{script}");
     }
@@ -804,7 +807,10 @@ mod tests {
             "/bin/bash",
             &[],
         );
-        let script = args.iter().find(|a| a.contains("exec")).expect("needs exec");
+        let script = args
+            .iter()
+            .find(|a| a.contains("exec"))
+            .expect("needs exec");
         assert!(script.contains("${HOME:-/}"), "{script}");
         assert!(script.contains("|| cd /;"), "{script}");
     }
@@ -824,8 +830,14 @@ mod tests {
             &[],
         );
         assert!(args.iter().any(|a| a == "/home/u/Doom Term"));
-        let script = args.iter().find(|a| a.contains("exec")).expect("needs exec");
-        assert!(!script.contains("Doom Term"), "path was interpolated: {script}");
+        let script = args
+            .iter()
+            .find(|a| a.contains("exec"))
+            .expect("needs exec");
+        assert!(
+            !script.contains("Doom Term"),
+            "path was interpolated: {script}"
+        );
     }
 
     #[test]

@@ -243,8 +243,10 @@ async fn artifact_post_and_get_endpoints_work() {
     let mut stream2 = TcpStream::connect(addr).await.unwrap();
     stream2
         .write_all(
-            format!("GET /artifact/test-pr-1 HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n")
-                .as_bytes(),
+            format!(
+                "GET /artifact/test-pr-1 HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
         )
         .await
         .unwrap();
@@ -259,8 +261,10 @@ async fn artifact_post_and_get_endpoints_work() {
     let mut stream3 = TcpStream::connect(addr).await.unwrap();
     stream3
         .write_all(
-            format!("GET /artifact/test-pr-1/raw HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n")
-                .as_bytes(),
+            format!(
+                "GET /artifact/test-pr-1/raw HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
         )
         .await
         .unwrap();
@@ -276,7 +280,12 @@ async fn security_serves_cli_artifact_and_hook_scripts() {
     let (addr, _, task) = server().await;
     let mut stream = TcpStream::connect(addr).await.unwrap();
     stream
-        .write_all(format!("GET /doom-term-artifact HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes())
+        .write_all(
+            format!(
+                "GET /doom-term-artifact HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
         .await
         .unwrap();
     let mut buf = Vec::new();
@@ -301,15 +310,27 @@ fn provision_cli_tools_creates_executable_helpers() {
         std::env::set_var("HOME", h);
     }
 
-    let artifact_bin = tmp.path().join(".local").join("bin").join("doom-term-artifact");
+    let artifact_bin = tmp
+        .path()
+        .join(".local")
+        .join("bin")
+        .join("doom-term-artifact");
     assert!(artifact_bin.exists());
     let content = std::fs::read_to_string(&artifact_bin).unwrap();
     assert!(content.contains("Doom Term Artifact Publisher"));
 
-    let doom_bin = tmp.path().join(".doom-term").join("bin").join("doom-term-artifact");
+    let doom_bin = tmp
+        .path()
+        .join(".doom-term")
+        .join("bin")
+        .join("doom-term-artifact");
     assert!(doom_bin.exists());
 
-    let hook_file = tmp.path().join(".doom-term").join("agent-hooks").join("doom-term-hook.sh");
+    let hook_file = tmp
+        .path()
+        .join(".doom-term")
+        .join("agent-hooks")
+        .join("doom-term-hook.sh");
     assert!(hook_file.exists());
     let hook_content = std::fs::read_to_string(&hook_file).unwrap();
     assert!(hook_content.contains("Doom Term agent hook"));
@@ -317,11 +338,13 @@ fn provision_cli_tools_creates_executable_helpers() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&artifact_bin).unwrap().permissions().mode();
+        let mode = std::fs::metadata(&artifact_bin)
+            .unwrap()
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o111, 0o111);
     }
 }
-
 
 /// Accepts every connection on its own task: the artifact event stream is
 /// long-lived, so a sequential accept loop would wedge behind it.
@@ -407,7 +430,9 @@ async fn artifact_event_stream_wakes_only_the_page_that_owns_the_artifact() {
     // No CORS grant: a site the user happens to be browsing must not be able to
     // watch which artifacts a local agent is publishing.
     assert!(
-        !head.to_ascii_lowercase().contains("access-control-allow-origin"),
+        !head
+            .to_ascii_lowercase()
+            .contains("access-control-allow-origin"),
         "{head}"
     );
 
@@ -449,9 +474,10 @@ async fn the_daemons_own_origin_still_cannot_open_the_terminal_socket() {
     // the socket that drives PTYs.
     let (addr, _, task) = server().await;
     let mut request = format!("ws://{addr}").into_client_request().unwrap();
-    request
-        .headers_mut()
-        .insert("Origin", format!("http://127.0.0.1:{}", addr.port()).parse().unwrap());
+    request.headers_mut().insert(
+        "Origin",
+        format!("http://127.0.0.1:{}", addr.port()).parse().unwrap(),
+    );
     let response = tokio_tungstenite::connect_async(request).await;
     task.abort();
     assert!(

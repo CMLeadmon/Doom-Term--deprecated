@@ -354,8 +354,12 @@ fn provision_cli_tools() {
 
     let targets = [
         home.join(".local").join("bin").join("doom-term-artifact"),
-        home.join(".doom-term").join("bin").join("doom-term-artifact"),
-        home.join(".doom-term").join("agent-hooks").join("doom-term-artifact.sh"),
+        home.join(".doom-term")
+            .join("bin")
+            .join("doom-term-artifact"),
+        home.join(".doom-term")
+            .join("agent-hooks")
+            .join("doom-term-artifact.sh"),
     ];
 
     for target in &targets {
@@ -379,9 +383,10 @@ fn provision_cli_tools() {
         }
     }
 
-    let hook_targets = [
-        home.join(".doom-term").join("agent-hooks").join("doom-term-hook.sh"),
-    ];
+    let hook_targets = [home
+        .join(".doom-term")
+        .join("agent-hooks")
+        .join("doom-term-hook.sh")];
     for target in &hook_targets {
         if let Some(parent) = target.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -1057,12 +1062,16 @@ async fn handle_connection_authenticated(
         return;
     }
 
-    if peek_str.starts_with("get /doom-term-artifact") || peek_str.starts_with("get /cli/doom-term-artifact") {
+    if peek_str.starts_with("get /doom-term-artifact")
+        || peek_str.starts_with("get /cli/doom-term-artifact")
+    {
         serve_cli_artifact_script(stream).await;
         return;
     }
 
-    if peek_str.starts_with("get /doom-term-hook") || peek_str.starts_with("get /cli/doom-term-hook") {
+    if peek_str.starts_with("get /doom-term-hook")
+        || peek_str.starts_with("get /cli/doom-term-hook")
+    {
         serve_cli_hook_script(stream).await;
         return;
     }

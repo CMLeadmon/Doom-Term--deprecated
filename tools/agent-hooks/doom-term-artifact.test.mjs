@@ -9,6 +9,15 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 const script = fileURLToPath(new URL('./doom-term-artifact.sh', import.meta.url));
+// The fixtures below are POSIX shell scripts and /usr/bin symlinks. What they
+// pin is platform-independent; the way they pin it is not, and translating a
+// `sh` fixture into `cmd` would test the translation. Linux CI is the gate for
+// this behaviour — these are skipped on Windows, not quietly passing there.
+const posixFixture =
+  process.platform === 'win32'
+    ? { skip: 'POSIX shell fixture; covered by the Linux CI job' }
+    : {};
+
 
 async function fixture(t) {
   const requests = [];
@@ -60,7 +69,7 @@ async function runCli(t, args, stdinContent, { env = {} } = {}) {
   };
 }
 
-test('doom-term-artifact publishes stdin payload with title and type', async (t) => {
+test('doom-term-artifact publishes stdin payload with title and type', posixFixture, async (t) => {
   const { port, requests } = await fixture(t);
   const result = await runCli(
     t,
@@ -83,7 +92,7 @@ test('doom-term-artifact publishes stdin payload with title and type', async (t)
   assert.match(result.stdout, /art-fixture/);
 });
 
-test('doom-term-artifact reads content from file argument', async (t) => {
+test('doom-term-artifact reads content from file argument', posixFixture, async (t) => {
   const { port, requests } = await fixture(t);
   const tempFile = join(tmpdir(), `artifact-test-${Date.now()}.diff`);
   writeFileSync(tempFile, 'diff --git a/foo b/foo\n+line');
@@ -108,7 +117,7 @@ test('doom-term-artifact reads content from file argument', async (t) => {
   assert.equal(parsed.content, 'diff --git a/foo b/foo\n+line');
 });
 
-test('doom-term-artifact auto-detects image files and encodes as base64 data URI', async (t) => {
+test('doom-term-artifact auto-detects image files and encodes as base64 data URI', posixFixture, async (t) => {
   const { port, requests } = await fixture(t);
   const tempImage = join(tmpdir(), `artifact-test-${Date.now()}.png`);
   // Minimal 1x1 PNG transparent pixel

@@ -68,7 +68,13 @@ fn now_millis() -> u64 {
 fn sanitize_id(raw: &str) -> String {
     let clean: String = raw
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     let trimmed = clean.trim_matches('-');
     if trimmed.is_empty() {
@@ -208,7 +214,12 @@ impl ArtifactHub {
         self.bus.subscribe()
     }
 
-    pub fn subscribe(&self) -> (Vec<Arc<ArtifactRecord>>, broadcast::Receiver<(Arc<ArtifactRecord>, bool)>) {
+    pub fn subscribe(
+        &self,
+    ) -> (
+        Vec<Arc<ArtifactRecord>>,
+        broadcast::Receiver<(Arc<ArtifactRecord>, bool)>,
+    ) {
         let state = self.state.lock();
         let receiver = self.bus.subscribe();
         let retained = state
@@ -254,9 +265,13 @@ impl ArtifactHub {
             "html" => {
                 // If the content already contains <html> or <body>, inject the live reload script before </body>
                 if record.content.contains("</body>") {
-                    record.content.replacen("</body>", &format!("{}\n</body>", live_script), 1)
+                    record
+                        .content
+                        .replacen("</body>", &format!("{}\n</body>", live_script), 1)
                 } else if record.content.contains("</html>") {
-                    record.content.replacen("</html>", &format!("{}\n</html>", live_script), 1)
+                    record
+                        .content
+                        .replacen("</html>", &format!("{}\n</html>", live_script), 1)
                 } else {
                     format!(
                         r#"<!DOCTYPE html>
@@ -278,16 +293,37 @@ impl ArtifactHub {
             }
             "diff" => {
                 let formatted_diff = render_diff_html(&record.content);
-                format_chrome_page(&record.title, &record.id, record.version, "DIFF", &formatted_diff, &live_script)
+                format_chrome_page(
+                    &record.title,
+                    &record.id,
+                    record.version,
+                    "DIFF",
+                    &formatted_diff,
+                    &live_script,
+                )
             }
             "image" => {
                 let formatted_img = render_image_html(&record.content, &record.title);
-                format_chrome_page(&record.title, &record.id, record.version, "IMAGE", &formatted_img, &live_script)
+                format_chrome_page(
+                    &record.title,
+                    &record.id,
+                    record.version,
+                    "IMAGE",
+                    &formatted_img,
+                    &live_script,
+                )
             }
             _ => {
                 // Markdown or text
                 let formatted_md = render_markdown_html(&record.content);
-                format_chrome_page(&record.title, &record.id, record.version, "MARKDOWN", &formatted_md, &live_script)
+                format_chrome_page(
+                    &record.title,
+                    &record.id,
+                    record.version,
+                    "MARKDOWN",
+                    &formatted_md,
+                    &live_script,
+                )
             }
         }
     }
@@ -382,7 +418,9 @@ fn format_chrome_page(
 
 fn render_diff_html(content: &str) -> String {
     let mut out = String::new();
-    out.push_str("<div class=\"diff-container\" style=\"font-family: monospace; white-space: pre;\">");
+    out.push_str(
+        "<div class=\"diff-container\" style=\"font-family: monospace; white-space: pre;\">",
+    );
     for line in content.lines() {
         let escaped = html_escape(line);
         if line.starts_with("diff --git") || line.starts_with("--- ") || line.starts_with("+++ ") {

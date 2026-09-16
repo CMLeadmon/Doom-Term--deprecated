@@ -108,15 +108,7 @@ fn created_at(pid: u32) -> Option<u64> {
     let mut user = creation;
     // SAFETY: handle is live for the duration of the call and all four
     // out-parameters point at initialised, owned FILETIMEs.
-    let ok = unsafe {
-        GetProcessTimes(
-            handle.0,
-            &mut creation,
-            &mut exit,
-            &mut kernel,
-            &mut user,
-        )
-    };
+    let ok = unsafe { GetProcessTimes(handle.0, &mut creation, &mut exit, &mut kernel, &mut user) };
     if ok == 0 {
         return None;
     }
@@ -370,8 +362,8 @@ mod tests {
     fn a_process_with_no_descendants_reports_itself() {
         // Mirrors what tpgid reports on Linux at a bare prompt: the shell. The
         // caller's classify_agent then correctly declines to call it an agent.
-        let identity = foreground_identity(std::process::id())
-            .expect("we are always our own fallback answer");
+        let identity =
+            foreground_identity(std::process::id()).expect("we are always our own fallback answer");
         assert!(identity.start_ticks > 0);
     }
 

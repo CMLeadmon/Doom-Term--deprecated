@@ -4,8 +4,17 @@ import { mkdtempSync, writeFileSync, chmodSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
+// The fixtures below are POSIX shell scripts and /usr/bin symlinks. What they
+// pin is platform-independent; the way they pin it is not, and translating a
+// `sh` fixture into `cmd` would test the translation. Linux CI is the gate for
+// this behaviour — these are skipped on Windows, not quietly passing there.
+const posixFixture =
+  process.platform === 'win32'
+    ? { skip: 'POSIX shell fixture; covered by the Linux CI job' }
+    : {};
 
-test('the desktop verification command cannot succeed without compiling the shell', () => {
+
+test('the desktop verification command cannot succeed without compiling the shell', posixFixture, () => {
   const dir = mkdtempSync(join(tmpdir(), 'doom-tauri-check-'));
   try {
     const cargo = join(dir, 'cargo');

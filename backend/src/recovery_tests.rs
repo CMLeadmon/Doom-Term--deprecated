@@ -1489,7 +1489,10 @@ async fn recovery_an_evicted_resume_cursor_is_an_explicit_gap_not_a_silent_skip(
     .await;
     let attached = event(&mut ws, "AttachResult").await;
     let epoch = attached["descriptor"]["stream_epoch"].clone();
-    assert!(!epoch.is_null(), "attach must describe its stream: {attached}");
+    assert!(
+        !epoch.is_null(),
+        "attach must describe its stream: {attached}"
+    );
 
     let child = fixture
         .server
@@ -1566,9 +1569,8 @@ async fn recovery_an_evicted_resume_cursor_is_an_explicit_gap_not_a_silent_skip(
 #[cfg(unix)]
 #[tokio::test]
 async fn a_pane_opens_in_the_requested_directory_even_when_the_server_lost_its_own() {
-    if isolated_durable(
-        "a_pane_opens_in_the_requested_directory_even_when_the_server_lost_its_own",
-    ) {
+    if isolated_durable("a_pane_opens_in_the_requested_directory_even_when_the_server_lost_its_own")
+    {
         return;
     }
     use std::os::unix::fs::PermissionsExt;

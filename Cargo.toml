@@ -9,3 +9,22 @@ default-members = [
     "crates/doom-term-pty",
     "backend",
 ]
+
+# Clippy as a ratchet, not a cleanup project.
+#
+# These seven fire on code written before the lint was enforced. Naming them
+# means every OTHER lint is denied in CI, so new code cannot quietly add to the
+# list — removing an entry is a deliberate act, and adding one requires someone
+# to decide it is acceptable.
+#
+# Fixing them is worthwhile and separate. Three (type_complexity,
+# too_many_arguments, result_large_err) are design changes to subsystems a
+# Windows port has no business reshaping while it is in flight.
+[workspace.lints.clippy]
+collapsible_if = "allow"
+manual_strip = "allow"
+new_without_default = "allow"
+result_large_err = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
+unnecessary_sort_by = "allow"
