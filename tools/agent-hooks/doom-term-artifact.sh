@@ -84,82 +84,114 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-if [ -n "$FILE" ]; then
-  if [ ! -f "$FILE" ]; then
-    echo "Error: File not found: $FILE" >&2
-    exit 1
-  fi
-  if is_image_file "$FILE" || [ "$TYPE" = "image" ]; then
-    TYPE="image"
-    MIME=$(get_image_mime "$FILE")
-    if command -v base64 >/dev/null 2>&1; then
-      B64=$(base64 "$FILE" 2>/dev/null | tr -d '\r\n')
-    elif command -v python3 >/dev/null 2>&1; then
-      B64=$(python3 -c 'import sys, base64; sys.stdout.write(base64.b64encode(open(sys.argv[1], "rb").read()).decode("ascii"))' "$FILE")
-    elif command -v node >/dev/null 2>&1; then
-      B64=$(node -e 'process.stdout.write(require("fs").readFileSync(process.argv[1]).toString("base64"))' "$FILE")
-    else
-      echo "Error: base64 utility required to encode image file" >&2
-      exit 1
-    fi
-    CONTENT="data:${MIME};base64,${B64}"
-  else
-    CONTENT=$(cat "$FILE")
-  fi
-else
-  # Read from stdin
-  CONTENT=$(cat)
-fi
+TMP_PAYLOAD=$(mktemp 2>/dev/null || mktemp -t doom_artifact.XXXXXX)
+trap 'rm -f "$TMP_PAYLOAD"' EXIT INT TERM
 
-if [ -z "$CONTENT" ]; then
-  echo "Error: Artifact content is empty" >&2
-  exit 1
-fi
-
-# Build JSON payload using python or node if available, or lightweight sed escaping
 if command -v node >/dev/null 2>&1; then
-  PAYLOAD=$(node -e '
-    const [title, type, id, openPane, content] = process.argv.slice(1);
+  node -e '
+    const fs = require("fs");
+    const [title, type, id, openPane, filePath, outPath] = process.argv.slice(1);
+    let rawContent;
+    try {
+      rawContent = filePath ? fs.readFileSync(filePath) : fs.readFileSync(0);
+    } catch (e) {
+      process.stderr.write("Error reading input: " + e.message + "\n");
+      process.exit(1);
+    }
+    const extMatch = filePath ? filePath.match(/\.[^.]+$/) : null;
+    const ext = extMatch ? extMatch[0].toLowerCase() : "";
+    const mimes = {
+      ".png": "image/png",
+      ".jpg": "image/jpeg",
+      ".jpeg": "image/jpeg",
+      ".gif": "image/gif",
+      ".webp": "image/webp",
+      ".svg": "image/svg+xml",
+      ".bmp": "image/bmp",
+      ".ico": "image/x-icon",
+    };
+    let isImage = type === "image" || Boolean(mimes[ext]);
+    let mime = mimes[ext] || "image/png";
+    let content;
+    let finalType = isImage ? "image" : (type || "markdown");
+    if (isImage) {
+      content = `data:${mime};base64,${rawContent.toString("base64")}`;
+    } else {
+      content = rawContent.toString("utf8");
+    }
+    if (!content) {
+      process.stderr.write("Error: Artifact content is empty\n");
+      process.exit(1);
+    }
     const body = {
       title,
-      type,
+      type: finalType,
       content,
       open_pane: openPane === "true",
     };
     if (id) body.id = id;
-    process.stdout.write(JSON.stringify(body));
-  ' "$TITLE" "$TYPE" "$ID" "$OPEN_PANE" "$CONTENT")
+    fs.writeFileSync(outPath, JSON.stringify(body));
+  ' "$TITLE" "$TYPE" "$ID" "$OPEN_PANE" "$FILE" "$TMP_PAYLOAD"
 elif command -v python3 >/dev/null 2>&1; then
-  PAYLOAD=$(python3 -c '
-import sys, json
-title, atype, aid, open_pane, content = sys.argv[1:]
+  python3 -c '
+import sys, json, os, mimetypes, base64
+title, atype, aid, open_pane, file_path, out_path = sys.argv[1:]
+if file_path:
+    with open(file_path, "rb") as f:
+        raw_content = f.read()
+else:
+    raw_content = sys.stdin.buffer.read()
+
+ext = os.path.splitext(file_path)[1].lower() if file_path else ""
+image_exts = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".ico"}
+is_image = atype == "image" or ext in image_exts
+mime = mimetypes.guess_type(file_path)[0] or "image/png" if is_image else None
+
+if is_image:
+    content = f"data:{mime};base64,{base64.b64encode(raw_content).decode(\"ascii\")}"
+    final_type = "image"
+else:
+    content = raw_content.decode("utf-8", errors="replace")
+    final_type = atype or "markdown"
+
+if not content:
+    sys.stderr.write("Error: Artifact content is empty\n")
+    sys.exit(1)
+
 body = {
     "title": title,
-    "type": atype,
+    "type": final_type,
     "content": content,
     "open_pane": open_pane == "true",
 }
 if aid:
     body["id"] = aid
-sys.stdout.write(json.dumps(body))
-' "$TITLE" "$TYPE" "$ID" "$OPEN_PANE" "$CONTENT")
+
+with open(out_path, "w", encoding="utf-8") as f:
+    json.dump(body, f)
+' "$TITLE" "$TYPE" "$ID" "$OPEN_PANE" "$FILE" "$TMP_PAYLOAD"
 else
-  # Fallback: simple string escaping
+  # Fallback for simple small inputs
+  if [ -n "$FILE" ]; then
+    CONTENT=$(cat "$FILE")
+  else
+    CONTENT=$(cat)
+  fi
   ESCAPED_CONTENT=$(printf '%s' "$CONTENT" | awk '{gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); gsub(/\r/, ""); printf "%s\\n", $0}' | sed '$ s/\\n$//')
-  PAYLOAD=$(printf '{"title":"%s","type":"%s","open_pane":%s,"content":"%s"}' "$TITLE" "$TYPE" "$OPEN_PANE" "$ESCAPED_CONTENT")
+  printf '{"title":"%s","type":"%s","open_pane":%s,"content":"%s"}' "$TITLE" "$TYPE" "$OPEN_PANE" "$ESCAPED_CONTENT" > "$TMP_PAYLOAD"
 fi
 
 HEADERS="Content-Type: application/json"
 if [ -n "${DOOM_TERM_SESSION_ID:-}" ]; then
-  RESPONSE=$(curl --disable --silent --noproxy "*" --max-time 4 --request POST \
+  RESPONSE=$(curl --disable --silent --noproxy "*" --max-time 6 --request POST \
     --header "$HEADERS" \
     --header "X-Doom-Term-Session: ${DOOM_TERM_SESSION_ID}" \
-    --data-binary "$PAYLOAD" \
+    --data-binary "@$TMP_PAYLOAD" \
     "http://127.0.0.1:${PORT}/artifact" || true)
 else
-  RESPONSE=$(curl --disable --silent --noproxy "*" --max-time 4 --request POST \
+  RESPONSE=$(curl --disable --silent --noproxy "*" --max-time 6 --request POST \
     --header "$HEADERS" \
-    --data-binary "$PAYLOAD" \
+    --data-binary "@$TMP_PAYLOAD" \
     "http://127.0.0.1:${PORT}/artifact" || true)
 fi
 
