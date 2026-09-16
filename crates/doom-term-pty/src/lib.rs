@@ -7,6 +7,9 @@
 
 pub mod demuxer;
 pub mod foreground;
+/// Windows only: the process-tree equivalent of a Unix process group.
+#[cfg(windows)]
+pub mod job;
 pub mod paste;
 pub mod process_io;
 mod runtime_files;
