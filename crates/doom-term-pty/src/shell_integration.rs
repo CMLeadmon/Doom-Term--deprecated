@@ -2,13 +2,22 @@ use portable_pty::CommandBuilder;
 
 /// Shells we know how to instrument. Anything else is launched untouched.
 pub fn supports_integration(shell_path: &str) -> bool {
-    matches!(shell_name(shell_path).as_str(), "bash" | "zsh")
+    matches!(
+        shell_name(shell_path).as_str(),
+        "bash" | "zsh" | "powershell" | "pwsh"
+    )
 }
 
+/// The shell's bare name, without extension and case-folded.
+///
+/// `file_stem` rather than `file_name`, because the Windows default shell is
+/// `powershell.exe` and an extension is not a different shell. Folding case
+/// costs nothing on Unix, where these names are lowercase by convention, and
+/// is required on Windows, where the path may arrive as `PowerShell.exe`.
 fn shell_name(shell_path: &str) -> String {
     std::path::Path::new(shell_path)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
+        .file_stem()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default()
 }
 
@@ -122,6 +131,97 @@ preexec_functions+=(__doom_term_preexec)
 
 /// Write an integration script somewhere only this user can reach it. A shell
 /// sources this file, so a world-writable location would be an execution hole.
+/// PowerShell shell integration.
+///
+/// ── WHY THIS IS NOT COSMETIC ON WINDOWS ────────────────────────────────────
+///
+/// On Linux and macOS this adds the OSC 133 block model to a terminal that
+/// already knows its own directory. On Windows it is also the ONLY source of
+/// that directory: `foreground_cwd` returns None there because a process's cwd
+/// lives in its PEB, and `hint::transcript_for` is keyed on
+/// `(agent, cwd, session_id)`. Without OSC 7, CONTEXT % has nothing to look up
+/// and reads `--` next to a running agent.
+///
+/// Every block is guarded. This is dot-sourced into a user's live shell, and a
+/// failure here must leave them with a working prompt, not a broken one.
+pub fn powershell_integration_script() -> String {
+    String::from(
+        r#"# Doom Term shell integration. Generated per session; safe to delete.
+
+if ($env:DOOM_TERM_NO_SHELL_INTEGRATION) { return }
+
+# The user's own profile first. Ours is additive, never a replacement.
+foreach ($candidate in @(
+    $PROFILE.AllUsersAllHosts,
+    $PROFILE.CurrentUserAllHosts,
+    $PROFILE.CurrentUserCurrentHost
+)) {
+    if ($candidate -and (Test-Path -LiteralPath $candidate)) {
+        try { . $candidate } catch { }
+    }
+}
+
+$global:__DoomTermEsc = [char]27
+$global:__DoomTermBel = [char]7
+
+# Whatever prompt was in effect after the user's profile ran, including one the
+# profile installed. Captured once so a re-source cannot nest us inside
+# ourselves and emit the sequences twice.
+if (-not (Test-Path variable:global:__DoomTermInnerPrompt)) {
+    $global:__DoomTermInnerPrompt = $function:prompt
+}
+
+function global:prompt {
+    # $? describes the last statement whatever it was; $LASTEXITCODE only ever
+    # tracks native programs and keeps its value long after one finished. Ask
+    # $? first, or a failed cmdlet is reported as the last exe's success.
+    $ok = $?
+    $code = if ($ok) { 0 } elseif ($global:LASTEXITCODE) { $global:LASTEXITCODE } else { 1 }
+
+    $esc = $global:__DoomTermEsc
+    $bel = $global:__DoomTermBel
+    $out = "$esc]133;D;$code$bel$esc]133;A$bel"
+
+    # OSC 7. On Windows this is the only thing that tells the daemon where this
+    # pane is; see the note on this function.
+    try {
+        $cwd = (Get-Location).ProviderPath
+        if ($cwd) {
+            $machine = if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { "localhost" }
+            $out += "$esc]7;file://$machine/$($cwd -replace '\\', '/')$bel"
+        }
+    } catch { }
+
+    $inner = ""
+    try { $inner = [string](& $global:__DoomTermInnerPrompt) } catch { }
+    if (-not $inner) { $inner = "PS $($ExecutionContext.SessionState.Path.CurrentLocation)> " }
+
+    # $LASTEXITCODE is deliberately not cleared: doing so would lie to the
+    # user's own prompt and to any script that reads it after we run.
+    return "$out$inner$esc]133;B$bel"
+}
+
+# 133;C marks the moment a command actually begins. PowerShell has no PS0, so
+# there is no hook that fires between submission and execution; PSReadLine's
+# Enter handler is the closest true signal.
+#
+# Emitting C from the prompt instead would date every command to the moment the
+# prompt was drawn and fold the user's typing time into its duration. That is a
+# fabricated measurement, so when PSReadLine is unavailable C is simply absent
+# and the block model reports what it can.
+try {
+    if (Get-Module -ListAvailable -Name PSReadLine) {
+        Import-Module PSReadLine -ErrorAction Stop
+        Set-PSReadLineKeyHandler -Chord Enter -ScriptBlock {
+            [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine()
+            [Console]::Write("$([char]27)]133;C$([char]7)")
+        }
+    }
+} catch { }
+"#,
+    )
+}
+
 fn write_integration_file(name: &str, body: &str) -> Option<std::path::PathBuf> {
     crate::runtime_files::write(name, body)
         .map_err(|err| {
@@ -171,6 +271,24 @@ pub fn shell_launch(shell: &str) -> ShellLaunch {
                         .env
                         .push(("ZDOTDIR".to_string(), dir.to_string_lossy().to_string()));
                 }
+            }
+        }
+        "powershell" | "pwsh" => {
+            if let Some(path) = write_integration_file(
+                "powershell-integration.ps1",
+                &powershell_integration_script(),
+            ) {
+                // -NoExit keeps the session interactive after the script runs;
+                // -File would otherwise run it and exit. Bypass is required
+                // because the script is generated per session and unsigned,
+                // and it is scoped to this one invocation rather than changing
+                // any machine or user policy.
+                launch.args.push("-NoLogo".to_string());
+                launch.args.push("-NoExit".to_string());
+                launch.args.push("-ExecutionPolicy".to_string());
+                launch.args.push("Bypass".to_string());
+                launch.args.push("-File".to_string());
+                launch.args.push(path.to_string_lossy().to_string());
             }
         }
         _ => {}
@@ -340,5 +458,75 @@ mod tests {
         assert!(supports_integration("/usr/bin/zsh"));
         assert!(!supports_integration("/usr/bin/fish"));
         assert!(!supports_integration("/bin/sh"));
+    }
+
+    #[test]
+    fn a_windows_shell_is_recognised_through_its_extension_and_case() {
+        // The Windows default arrives as `powershell.exe`, and may arrive
+        // capitalised. Neither is a different shell.
+        //
+        // Spelled without backslashes on purpose: `Path` only treats `\` as a
+        // separator on Windows, so a backslash fixture here would assert
+        // nothing on Linux and quietly pass. A real backslashed path is
+        // exercised below, where it means something.
+        assert!(supports_integration("powershell.exe"));
+        assert!(supports_integration("PowerShell.exe"));
+        assert!(supports_integration("pwsh.exe"));
+        assert!(supports_integration("/usr/bin/pwsh"));
+        assert!(!supports_integration("cmd.exe"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_real_windows_path_resolves_to_its_shell() {
+        assert!(supports_integration(
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+        ));
+        assert!(supports_integration(
+            r"C:\Program Files\PowerShell\7\pwsh.exe"
+        ));
+        assert!(!supports_integration(r"C:\Windows\System32\cmd.exe"));
+    }
+
+    #[test]
+    fn powershell_integration_emits_the_boundaries_it_can_measure() {
+        let script = powershell_integration_script();
+        assert!(script.contains("133;A"), "prompt start");
+        assert!(script.contains("133;B"), "command start");
+        assert!(script.contains("133;D;$code"), "execution end with exit code");
+        assert!(
+            script.contains("133;C"),
+            "execution start, via the PSReadLine handler"
+        );
+    }
+
+    #[test]
+    fn powershell_integration_reports_the_working_directory() {
+        // Not cosmetic on Windows: foreground_cwd returns None there, so this
+        // is the only thing that tells the daemon where the pane is, and
+        // hint::transcript_for is keyed on that directory.
+        let script = powershell_integration_script();
+        assert!(script.contains("]7;file://"), "OSC 7");
+    }
+
+    #[test]
+    fn powershell_integration_keeps_the_users_own_profile_and_prompt() {
+        let script = powershell_integration_script();
+        assert!(script.contains("$PROFILE"), "must source the user's profile");
+        assert!(
+            script.contains("__DoomTermInnerPrompt"),
+            "must call through to whatever prompt was already installed"
+        );
+    }
+
+    #[test]
+    fn powershell_is_launched_with_a_script_and_stays_interactive() {
+        let launch = shell_launch("powershell.exe");
+        assert!(
+            launch.args.contains(&"-NoExit".to_string()),
+            "without -NoExit the shell would run the script and quit: {:?}",
+            launch.args
+        );
+        assert_eq!(launch.args.iter().rev().nth(1).map(String::as_str), Some("-File"));
     }
 }
