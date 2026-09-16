@@ -334,3 +334,78 @@ fn rapid_numbered_lines_all_reach_the_journal() {
         missing
     );
 }
+
+/// The same burst, paced like the browser fixture.
+///
+/// Writing as fast as possible coalesces into a handful of large reads. The
+/// recovery fixture pauses 5 ms between lines, so the demuxer sees ~510 separate
+/// small reads instead - a different regime, and the one that loses lines.
+#[cfg(unix)]
+#[test]
+fn paced_numbered_lines_all_reach_the_journal() {
+    if std::env::var_os("DOOM_PACED_LINES_CHILD").is_none() {
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "paced_numbered_lines_all_reach_the_journal",
+                "--nocapture",
+            ])
+            .env("DOOM_PACED_LINES_CHILD", "1")
+            .env("DOOM_TERM_NO_TMUX", "1")
+            .env("DOOM_TERM_NO_SHELL_INTEGRATION", "1")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("paced.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\ni=0\nwhile [ $i -lt 510 ]; do printf 'CELL_%03d\\n' $i; i=$((i+1)); sleep 0.005; done\nprintf 'CELLS_DONE\\n'\nsleep 5\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let session = doom_term_pty::session::PtySession::create(
+        "paced".into(),
+        80,
+        24,
+        None,
+        Some(script.to_string_lossy().into_owned()),
+    )
+    .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut text = String::new();
+    let mut records = 0usize;
+    let mut cursor = doom_term_pty::stream::Sequence::default();
+    while std::time::Instant::now() < deadline && !text.contains("CELLS_DONE") {
+        while let Ok(Some(record)) = session.stream().read_after(cursor) {
+            cursor = record.sequence;
+            records += 1;
+            if let doom_term_pty::stream::StreamPayload::Event(
+                doom_term_pty::demuxer::DemuxEvent::Output { data },
+            ) = &record.payload
+            {
+                text.push_str(data);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let missing: Vec<String> = (0..510)
+        .map(|i| format!("CELL_{i:03}"))
+        .filter(|cell| !text.contains(cell.as_str()))
+        .collect();
+    let _ = session.kill();
+    assert!(
+        missing.is_empty(),
+        "the journal lost {} of 510 paced lines across {records} records: {:?}",
+        missing.len(),
+        missing
+    );
+}

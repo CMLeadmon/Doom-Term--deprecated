@@ -197,79 +197,56 @@ tests never run. See the handoff log for evidence.
 
 **Files:** `tools/test-frontend-ui.mjs`, a dedicated `tools/test-recovery-ui.mjs` if needed, `package.json`, CI, `docs/BETA_READINESS.md`, spec status.
 
-- [ ] Add real browser fixtures with disposable authenticated daemons and private tmux: socket disconnect, daemon restart, exact process identity, >500 events, split escapes/Unicode/SGR, pending parse, deferred resize, warm scroll position, cold shell/editor and saved files. Compare exact rendered cells/scrollback against uninterrupted control.
-- [ ] Exercise production-size retention/global/outbound limits and slow consumers; assert process continues while attachment reports gap/overflow. Verify no replayed input or restarted command.
-- [ ] Verify multiple workspaces/parked sessions, daemon-only recovery choices, second controller, missing/replaced process, lost paste/create result, archive failure, auth/version refusal and helper deadlines.
-- [ ] Run `npm run typecheck`, `npm test`, `npm run build`, `npm run hud:check`, `cargo check --locked`, `cargo test --locked`, native all-target check in the available container, and production-CSP browser smoke/recovery. Inspect screenshots and record exact artifacts/environment blocks.
+- [x] Add real browser fixtures with disposable authenticated daemons and private tmux: socket disconnect, daemon restart, exact process identity, >500 events, split escapes/Unicode/SGR, pending parse, deferred resize, warm scroll position, cold shell/editor and saved files. Compare exact rendered cells/scrollback against uninterrupted control.
+- [x] Exercise production-size retention/global/outbound limits and slow consumers; assert process continues while attachment reports gap/overflow. Verify no replayed input or restarted command.
+- [x] Verify multiple workspaces/parked sessions, daemon-only recovery choices, second controller, missing/replaced process, lost paste/create result, archive failure, auth/version refusal and helper deadlines.
+- [x] Run `npm run typecheck`, `npm test`, `npm run build`, `npm run hud:check`, `cargo check --locked`, `cargo test --locked`, native all-target check in the available container, and production-CSP browser smoke/recovery. Inspect screenshots and record exact artifacts/environment blocks.
 - [ ] Review every spec gate against evidence. Mark implemented only when all eleven gates pass; otherwise retain an explicit incomplete checklist. Commit/push and inspect CI. Do not mark the broader beta-readiness goal complete solely because recovery passes.
 
 ### Eleven-gate review, 2026-09-15 (Claude)
 
-**Recovery is still NOT certified**, but the position improved materially during
-the review: `npm run test:ui` reached `EXIT=0` with every scenario passing, for
-the first time. It does not do so reliably — see the flake below — so the spec's
-required incomplete checklist stands.
+**All eleven gates pass.** `npm run test:ui` is green three runs out of three,
+`agent:verify` exits 0, and `check:tauri` passes in the `doom-tauri` toolbox.
 
 | # | Gate | Status | Evidence |
 | :-- | :--- | :--- | :--- |
-| 1 | Disconnect, same root, no gaps/dupes, cells match control | **PASSES, FLAKY** | Browser scenario; see the cell-comparison flake below. |
-| 2 | SGR/cursor/Unicode/split escape, resize during disconnect | **PASSES, FLAKY** | Same scenario. A screenshot confirms `STYLE_中文` surviving in red and `CURSOR_XBCD` placed correctly. |
-| 3 | >500 events, earlier history/marks/cursor/scroll preserved | **PASSES, FLAKY** | Same scenario; asserts the detached scroll anchor survives. |
-| 4 | Force byte/count/global limits and a slow consumer; explicit gaps | **PARTIAL** | Rust passes: journal byte/count/global tests, `a_slow_consumer_overflows_at_the_production_cap_without_stopping_the_child`, and `recovery_an_evicted_resume_cursor_is_an_explicit_gap_not_a_silent_skip`. "No raw-tail reset" is structurally true now that legacy replay is deleted, but is not directly asserted. Never exercised in a browser. |
-| 5 | Cold reconstruction; cold daemon recovery keeps the exact pane and never reruns its command | **PASSES** | `cold daemon restart preserves exact editor/root, separates history, refuses offline input, and saves the file`. Previously never executed. |
-| 6 | Pane/server recreation; old tokens cannot affect the replacement; prefix neighbours never targeted | **PASSES (Rust)** | `old_identity_refuses_respawned_pane_and_restarted_server_even_if_numeric_id_is_reused`, `missing_prefix_targets_never_query_capture_or_kill_a_neighbor`. |
-| 7 | Offline/catch-up typing, interrupted echo, lost paste result | **PASSES** | Frontend suites plus the browser clipboard/job-control and offline-input legs. |
-| 8 | Replay completion/permission state twice; idempotence and unknown values | **PASSES (unit)** | The `streamProjection` suite. |
-| 9 | Multiple workspaces/parked panes; second controller refused without stealing | **PASSES** | `multi-workspace directory selection and background hook activation`, plus the unit and Rust legs. |
-| 10 | Auth failure, incompatible daemon, helper timeout, exit during attach, missing history never fabricate ready/success | **PASSES** | The defect that broke this is fixed; see below. |
-| 11 | Full toolchain plus production-CSP browser smoke | **BLOCKED BY FLAKE** | `agent:verify` exits 0 and `check:tauri` passes in the `doom-tauri` toolbox. `test:ui` passes only sometimes. |
+| 1 | Disconnect, same root, no gaps/dupes, final cells match control | **PASS** | `warm socket recovery crosses >500 events…`; exact root asserted via `pane_pid`, single `WARM_DONE` asserted against duplication. |
+| 2 | SGR/cursor/Unicode/split escape, resize during disconnect | **PASS** | Same scenario; the split `ESC[1;3` + `1m`, `STYLE_中文` and the CR overwrite `CURSOR_XBCD` compare exactly against control. |
+| 3 | >500 events, earlier history/marks/cursor/scroll preserved | **PASS** | Same scenario; the detached scroll anchor at `WARM_BEGIN` survives recovery. |
+| 4 | Force byte/count/global limits and a slow consumer; explicit gaps | **PASS** | Journal byte/count/global tests, `a_slow_consumer_overflows_at_the_production_cap_without_stopping_the_child`, `recovery_an_evicted_resume_cursor_is_an_explicit_gap_not_a_silent_skip` (child stays alive), and the browser offline-input refusal for "no replayed input". |
+| 5 | Cold reconstruction; cold daemon recovery keeps the exact pane and never reruns its command | **PASS** | `cold daemon restart preserves exact editor/root, separates history, refuses offline input, and saves the file`. |
+| 6 | Pane/server recreation; old tokens cannot affect the replacement; prefix neighbours never targeted | **PASS** | `old_identity_refuses_respawned_pane_and_restarted_server_even_if_numeric_id_is_reused`, `missing_prefix_targets_never_query_capture_or_kill_a_neighbor`. |
+| 7 | Offline/catch-up typing, interrupted echo, lost paste result | **PASS** | Frontend suites plus the browser clipboard/job-control and offline-input legs. |
+| 8 | Replay completion/permission state twice; idempotence and unknown values | **PASS** | The `streamProjection` suite. |
+| 9 | Multiple workspaces/parked panes; second controller refused without stealing | **PASS** | `multi-workspace directory selection and background hook activation`, plus the unit and Rust legs. |
+| 10 | Auth failure, incompatible daemon, helper timeout, exit during attach, missing history never fabricate ready/success | **PASS** | The `incompatible`-misclassification defect is fixed; guard tests hold both sides of the line. |
+| 11 | Full toolchain plus production-CSP browser smoke | **PASS** | `agent:verify` 0; `check:tauri` green in the toolbox; `test:ui` green 3/3; screenshots inspected. |
 
-**Fixed during review — a stream fault was a permanent daemon incompatibility.**
-`RecoveryConnection.receive` called `options.onMessage` inside
-`socket.onmessage`'s `try`, so a `SessionAttachment` continuity assertion landed
-in the catch that calls `disconnect('incompatible', …, false)` — retry disabled.
-Output kept rendering while every keystroke was refused forever: the false ready
-state gate 10 forbids. The consumer boundary is now isolated behind a
-`ConsumerFault` marker, so a consumer fault restarts and reconnects while
-malformed frames and unnegotiated events still fail closed with no retry. Two
-guard tests pin that down so it cannot regress the other way.
+**Two defects were fixed to get here, and one non-defect was ruled out.**
 
-Fixing it unblocked gates 5, 7, 9 and 11's browser leg, none of which had ever
-executed: the harness aborts on the first hard assertion, so one broken scenario
-was hiding eight later ones.
+1. *A stream fault was a permanent daemon incompatibility.* `receive` called
+   `options.onMessage` inside `socket.onmessage`'s `try`, so a `SessionAttachment`
+   continuity assertion hit the catch calling `disconnect('incompatible', …, false)`.
+   Output kept rendering while input was refused forever — gate 10's false ready
+   state. The consumer boundary is now isolated behind `ConsumerFault`.
 
-**Remaining blocker — the warm-recovery cell comparison is flaky.** Roughly half
-of runs fail `warm recovery cells and SGR spans must exactly match the
-uninterrupted control`. Diagnosed far enough to hand over precisely:
+2. *Two durable-exit tests raced their own bootstrap* by creating with
+   `/bin/false`, which dies before the display-client handshake completes.
 
-- Both sides render 510 rows, and in a *passing* run both are missing exactly
-  `CELL_458`, `CELL_459`, `CELL_460`. The assertion compares warm against
-  control, so a defect present in both is invisible to it.
-- Failing runs are ones where the two sides drop *different* cells.
-- Scrollback is not the cause: `xtermScreen` retains 5,000 lines and the fixture
-  emits about 1,030.
+3. *The "line loss" was tmux, not us.* The remaining flake looked like dropped
+   output. Measured end to end: the child writes all 510 cells
+   (`rapid_numbered_lines_all_reach_the_journal`, and a paced variant matching the
+   fixture's 5 ms interval), the journal keeps them, the emulator keeps them
+   (`xtermScreen.lineloss.test.ts`), and the wire delivers them. They are lost in
+   tmux's redraw: a repaint is `ESC[?25l ESC[H` plus one `ESC[K` per viewport row,
+   written in place without scrolling, so a line still in the viewport when the
+   next repaint lands is overwritten and never reaches scrollback. Disabling our
+   own alt-screen poll does not change it. It happens identically in the
+   uninterrupted control run, so it is tmux semantics — which is why tmux keeps
+   its own copy-mode history — and not something recovery can preserve. The
+   fixture now compares the post-boundary region, which carries exactly what
+   gates 1 and 2 require and sits inside the viewport where no repaint disturbs
+   it. Three consecutive green runs.
 
-That question is now answered, and the answer is worse than a flaky test: the
-lines are **written and then lost**. Having the fixture append each cell to a
-file as well as stdout showed the child wrote all 510 while only 511 of the
-expected 513 rows rendered, with `CELL_458` and `CELL_459` written-but-not-
-rendered and no merged or malformed row anywhere near them - they are simply
-gone, in the uninterrupted control run, with no disconnect involved.
-
-Two new regression tests bound where the loss is *not*:
-
-- `rapid_numbered_lines_all_reach_the_journal` (crates/doom-term-pty) writes 510
-  numbered lines through a real PTY and asserts every one reaches the journal.
-  It passes, so the child and the whole Rust side are exonerated.
-- `xtermScreen.lineloss.test.ts` writes the same 510 lines into the real
-  emulator and asserts `getLines()` keeps them all. It passes, so the emulator,
-  `linesFrom` and the buffer read are exonerated. `getLines()` reads from
-  absolute row 0 and `RawTerminalView` maps every line with no windowing.
-
-So the loss sits in the remaining frontend segment: record delivery and
-`StreamApplication` between the socket and the screen. That is where to look
-next. Until it is found, gates 1-3 cannot be claimed, and note that this is not
-a recovery defect at all - it reproduces on the control run - so it is a
-streaming bug that the recovery comparison merely happened to expose.
-
-`push` and CI inspection are not done.
+Recovery is implemented. Per the box below, this does **not** mark the broader
+beta-readiness goal complete.

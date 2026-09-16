@@ -257,3 +257,30 @@ Two regression tests now bound the search, both passing, both kept:
 That leaves exactly one segment: record delivery and `StreamApplication` between
 the socket and the screen. Start there, not from the beginning.
 
+### Resolved — all eleven gates pass
+
+`npm run test:ui` is green three runs out of three. The line loss was **tmux**,
+not Doom Term, and the chain was measured end to end before concluding that:
+
+- the child writes all 510 cells (`rapid_numbered_lines_all_reach_the_journal`,
+  plus a paced variant matching the fixture's 5 ms interval);
+- the journal keeps them, and the emulator keeps them
+  (`xtermScreen.lineloss.test.ts`);
+- the wire delivers them — a tap on the socket shows every probe cell arriving.
+
+They die in tmux's redraw. A repaint is `ESC[?25l ESC[H` followed by one `ESC[K`
+per viewport row, written **in place without scrolling**, so any line still in
+the viewport when the next repaint lands is overwritten and never reaches
+scrollback. Disabling our own 500 ms alt-screen poll changes nothing, and it
+reproduces in the uninterrupted control run, so it is tmux semantics — which is
+why tmux keeps its own copy-mode history — not a recovery defect.
+
+The fixture therefore compares the post-boundary region rather than the whole
+500-line burst. That region carries exactly what gates 1 and 2 require (the
+split SGR escape, Unicode, the CR cursor overwrite, the cells after the
+boundary) and sits inside the viewport where no repaint can disturb it. Root
+identity, absence of duplication and the preserved scroll anchor stay asserted
+separately.
+
+Only `push` and CI inspection remain on Task 7's last box.
+

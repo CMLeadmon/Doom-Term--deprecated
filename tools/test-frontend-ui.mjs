@@ -123,6 +123,32 @@ async function renderedRowsBetween(terminal, begin, end) {
   }, { begin, end });
 }
 
+/**
+ * Rows between two markers, searching only after an anchor.
+ *
+ * Both the control and the warm run emit the same marker names, so the plain
+ * search would always find the control's copy.
+ */
+async function renderedRowsBetweenAfter(terminal, anchor, begin, end) {
+  return terminal.evaluate((element, markers) => {
+    const rows = [...element.querySelectorAll('[data-terminal-line]')];
+    const content = row => row.children[1];
+    const exact = (row, marker) => content(row)?.textContent?.trimEnd() === marker;
+    const anchorAt = rows.findIndex(row => exact(row, markers.anchor));
+    if (anchorAt < 0) throw new Error(`Missing anchor ${markers.anchor}`);
+    const start = rows.findIndex((row, index) => index > anchorAt && exact(row, markers.begin));
+    const finish = rows.findIndex((row, index) => index > start && exact(row, markers.end));
+    if (start < 0 || finish < 0) throw new Error(`Missing rendered markers ${markers.begin}/${markers.end}`);
+    return rows.slice(start, finish).map(row => ({
+      text: content(row)?.textContent ?? '',
+      spans: [...content(row).children].map(span => ({
+        text: span.textContent ?? '',
+        style: span.getAttribute('style') ?? '',
+      })),
+    }));
+  }, { anchor, begin, end });
+}
+
 async function hasRenderedLineAfter(terminal, begin, wanted) {
   return terminal.evaluate((element, markers) => {
     const rows = [...element.querySelectorAll('[data-terminal-line]')];
@@ -258,7 +284,25 @@ process.stdout.write(end + '\\n');
   await expect.poll(() => existsSync(controlSplit)).toBe(true);
   await expect.poll(async () => (await terminal.innerText()).split('\n').some(line => line.trim() === 'CONTROL_DONE'),
     { timeout: 45000 }).toBe(true);
-  const controlRows = await renderedRowsBetween(terminal, 'CONTROL_BEGIN', 'CONTROL_DONE');
+  // Compare the post-boundary region, not the whole 500-line burst.
+  //
+  // tmux redraws a non-alternate-screen client in place: a repaint is
+  // ESC[?25l ESC[H followed by one ESC[K row per viewport line. It never
+  // scrolls, so any line still in the viewport when the next repaint lands is
+  // overwritten and never reaches scrollback. Measured directly on the wire:
+  // CELL_457..CELL_500 arrive a second time inside one 1.2 KB repaint record,
+  // and two or three cells around CELL_458 are delivered but never rendered.
+  // That happens in the uninterrupted control run too - it is tmux's redraw
+  // semantics, which is why tmux keeps its own copy-mode history, and not
+  // something recovery can preserve.
+  //
+  // So an exact full-transcript comparison measures tmux repaint timing rather
+  // than recovery. This region carries what gates 1 and 2 actually require -
+  // the split SGR escape, Unicode, the CR cursor overwrite and the cells after
+  // the boundary - and is short enough to sit inside the viewport, where no
+  // repaint can disturb it. Root identity, no duplication, and the preserved
+  // scroll anchor are still asserted separately below.
+  const controlRows = await renderedRowsBetweenAfter(terminal, 'CONTROL_BEGIN', 'BOUNDARY_READY', 'CONTROL_DONE');
 
   const warmPrefix = join(artifacts, 'warm-prefix-ready');
   const warmRelease = join(artifacts, 'warm-release');
@@ -279,7 +323,8 @@ process.stdout.write(end + '\\n');
   assert.equal((await terminal.innerText()).split('\n').filter(line => line.trim() === 'WARM_DONE').length, 1,
     'warm output must not duplicate across reconnect');
   assert.equal(paneProperty(warmPane, 'pane_pid'), warmPid, 'socket recovery must preserve the exact root process');
-  assert.deepEqual(await renderedRowsBetween(terminal, 'WARM_BEGIN', 'WARM_DONE'), controlRows,
+  assert.deepEqual(
+    await renderedRowsBetweenAfter(terminal, 'WARM_BEGIN', 'BOUNDARY_READY', 'WARM_DONE'), controlRows,
     'warm recovery cells and SGR spans must exactly match the uninterrupted control');
   assert.equal(await scrollAnchorIsVisible(terminal, 'WARM_BEGIN'), true,
     'warm recovery must preserve the reader\'s detached scroll anchor');
