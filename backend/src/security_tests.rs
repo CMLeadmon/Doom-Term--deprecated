@@ -322,3 +322,140 @@ fn provision_cli_tools_creates_executable_helpers() {
     }
 }
 
+
+/// Accepts every connection on its own task: the artifact event stream is
+/// long-lived, so a sequential accept loop would wedge behind it.
+async fn concurrent_server() -> SocketAddr {
+    std::env::set_var("DOOM_TERM_NO_TMUX", "1");
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = Arc::new(recovery::RecoveryServer::new().unwrap());
+    tokio::spawn(async move {
+        while let Ok((stream, peer)) = listener.accept().await {
+            let server = server.clone();
+            tokio::spawn(async move {
+                handle_connection_authenticated(stream, peer, server, None).await;
+            });
+        }
+    });
+    addr
+}
+
+async fn post_artifact(addr: SocketAddr, id: &str, content: &str) {
+    let body = serde_json::json!({
+        "id": id,
+        "title": "Live Reload Fixture",
+        "type": "markdown",
+        "content": content,
+    })
+    .to_string();
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(
+            format!(
+                "POST /artifact HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200 OK"));
+}
+
+/// Reads one byte at a time so the stream is never consumed past `delim`.
+async fn read_until(stream: &mut TcpStream, delim: &str) -> String {
+    let mut out = Vec::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout_at(deadline, stream.read(&mut byte))
+            .await
+            .unwrap_or_else(|_| panic!("timed out; got {:?}", String::from_utf8_lossy(&out)))
+            .expect("event stream read failed");
+        if read == 0 {
+            break;
+        }
+        out.push(byte[0]);
+        if out.ends_with(delim.as_bytes()) {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[tokio::test]
+async fn artifact_event_stream_wakes_only_the_page_that_owns_the_artifact() {
+    let addr = concurrent_server().await;
+    post_artifact(addr, "live-1", "# v1").await;
+    post_artifact(addr, "other-1", "# unrelated").await;
+
+    let mut events = TcpStream::connect(addr).await.unwrap();
+    events
+        .write_all(
+            format!("GET /artifact/live-1/events HTTP/1.1\r\nHost: {addr}\r\nAccept: text/event-stream\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+
+    let head = read_until(&mut events, "\r\n\r\n").await;
+    assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
+    assert!(head.contains("Content-Type: text/event-stream"), "{head}");
+    // No CORS grant: a site the user happens to be browsing must not be able to
+    // watch which artifacts a local agent is publishing.
+    assert!(
+        !head.to_ascii_lowercase().contains("access-control-allow-origin"),
+        "{head}"
+    );
+
+    // Primed with the version held right now, so a page that reconnects after a
+    // missed update still settles on the truth.
+    let primed = read_until(&mut events, "\n\n").await;
+    assert!(primed.contains("\"version\":1"), "{primed}");
+
+    // An unrelated artifact must not wake this stream; its own must.
+    post_artifact(addr, "other-1", "# unrelated v2").await;
+    post_artifact(addr, "live-1", "# v2").await;
+
+    let event = read_until(&mut events, "\n\n").await;
+    assert!(event.contains("\"id\":\"live-1\""), "{event}");
+    assert!(event.contains("\"version\":2"), "{event}");
+    assert!(!event.contains("other-1"), "{event}");
+}
+
+#[tokio::test]
+async fn artifact_event_stream_is_not_found_for_an_unknown_artifact() {
+    let addr = concurrent_server().await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(
+            format!("GET /artifact/no-such-thing/events HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 404"));
+}
+
+#[tokio::test]
+async fn the_daemons_own_origin_still_cannot_open_the_terminal_socket() {
+    // An `html` artifact is agent-authored JavaScript running on the daemon's
+    // own origin. Live reload must never be bought by admitting that origin to
+    // the socket that drives PTYs.
+    let (addr, _, task) = server().await;
+    let mut request = format!("ws://{addr}").into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("Origin", format!("http://127.0.0.1:{}", addr.port()).parse().unwrap());
+    let response = tokio_tungstenite::connect_async(request).await;
+    task.abort();
+    assert!(
+        response.is_err(),
+        "the artifact origin was admitted to the terminal socket"
+    );
+}

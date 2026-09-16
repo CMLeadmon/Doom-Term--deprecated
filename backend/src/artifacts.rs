@@ -201,6 +201,13 @@ impl ArtifactHub {
             .collect()
     }
 
+    /// A receiver for publish events only. Unlike [`Self::subscribe`] this skips
+    /// the retained snapshot: a standalone page is watching for the next change
+    /// to one artifact, not replaying every artifact still in the cache.
+    pub fn subscribe_events(&self) -> broadcast::Receiver<(Arc<ArtifactRecord>, bool)> {
+        self.bus.subscribe()
+    }
+
     pub fn subscribe(&self) -> (Vec<Arc<ArtifactRecord>>, broadcast::Receiver<(Arc<ArtifactRecord>, bool)>) {
         let state = self.state.lock();
         let receiver = self.bus.subscribe();
@@ -213,23 +220,34 @@ impl ArtifactHub {
     }
 
     /// Renders a standalone HTML representation of any artifact.
-    /// Injects a live reload script connecting back to the local daemon WebSocket.
+    ///
+    /// Injects a live reload script that subscribes to this artifact's own
+    /// Server-Sent Events stream. It deliberately does not reach for the
+    /// terminal WebSocket: `security::trusted_origin` refuses the daemon's own
+    /// origin, so that socket 403s the handshake and the page never reloads.
+    /// Admitting the origin there is not the fix either, because an `html`
+    /// artifact is agent-authored JavaScript and that socket drives PTYs.
     pub fn render_standalone_page(&self, record: &ArtifactRecord) -> String {
         let live_script = format!(
             r#"<script>
 (function() {{
   try {{
-    var ws = new WebSocket('ws://' + location.host);
-    ws.onmessage = function(e) {{
-      var m = JSON.parse(e.data);
-      if (m.event === 'ArtifactEvent' && m.data && m.data.artifact && m.data.artifact.id === '{id}') {{
-        location.reload();
-      }}
+    var version = {version};
+    var es = new EventSource({path});
+    es.onmessage = function(e) {{
+      try {{
+        var m = JSON.parse(e.data);
+        if (m && typeof m.version === 'number' && m.version !== version) {{
+          location.reload();
+        }}
+      }} catch (err) {{}}
     }};
-  }} catch(e) {{}}
+  }} catch (e) {{}}
 }})();
 </script>"#,
-            id = record.id
+            version = record.version,
+            path = serde_json::to_string(&format!("/artifact/{}/events", record.id))
+                .unwrap_or_else(|_| "\"\"".to_string()),
         );
 
         match record.artifact_type.as_str() {
@@ -596,7 +614,32 @@ mod tests {
         let html = hub.render_standalone_page(&record);
         assert!(html.contains("ARTIFACT: My Doc"));
         assert!(html.contains("doc-1"));
-        assert!(html.contains("WebSocket"));
+        // Live reload rides the artifact's own event stream. The terminal
+        // WebSocket refuses this page's origin by design, so a page that
+        // reaches for it silently never reloads.
+        assert!(html.contains("/artifact/doc-1/events"));
+        assert!(html.contains("EventSource"));
+        assert!(!html.contains("WebSocket"));
+    }
+
+    #[test]
+    fn html_artifacts_keep_their_own_markup_and_still_get_live_reload() {
+        let hub = ArtifactHub::new();
+        let record = ArtifactRecord {
+            id: "dash-1".into(),
+            title: "Dashboard".into(),
+            artifact_type: "html".into(),
+            content: "<html><body><h1>Metrics</h1></body></html>".into(),
+            version: 3,
+            session_id: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let html = hub.render_standalone_page(&record);
+        assert!(html.contains("<h1>Metrics</h1>"));
+        assert!(html.contains("/artifact/dash-1/events"));
+        assert!(html.contains("var version = 3;"));
+        assert!(!html.contains("WebSocket"));
     }
 
     #[test]

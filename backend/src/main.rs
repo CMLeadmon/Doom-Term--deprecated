@@ -669,6 +669,109 @@ async fn serve_artifact_get(
     }
 }
 
+/// Server-Sent Events for a single artifact: an id and a version, nothing else.
+///
+/// A standalone artifact page cannot use the terminal WebSocket, because
+/// `security::trusted_origin` refuses the daemon's own origin — and it must keep
+/// refusing it, since an `html` artifact is agent-authored JavaScript and that
+/// socket drives PTYs. This stream is the narrow grant that replaces it:
+/// same-origin only (no CORS header), scoped to one artifact, and carrying no
+/// content a same-origin fetch could not already read.
+async fn serve_artifact_events(
+    mut stream: TcpStream,
+    artifacts: &Arc<crate::artifacts::ArtifactHub>,
+    id: &str,
+) {
+    let mut drain = [0u8; 4096];
+    let _ = stream.read(&mut drain).await;
+
+    if artifacts.get(id).is_none() {
+        let body = format!("Artifact '{id}' does not exist or has expired.");
+        let header = format!(
+            "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(header.as_bytes()).await;
+        let _ = stream.write_all(body.as_bytes()).await;
+        let _ = stream.flush().await;
+        return;
+    }
+
+    let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nX-Accel-Buffering: no\r\n\r\n";
+    if stream.write_all(header.as_bytes()).await.is_err() {
+        return;
+    }
+
+    // Subscribe before priming. The reverse order drops an update that lands in
+    // between, leaving the page on stale content until a human reloads it.
+    let mut events = artifacts.subscribe_events();
+    if let Some(current) = artifacts.get(id) {
+        if write_artifact_event(&mut stream, &current.id, current.version)
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+
+    let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(20));
+    keepalive.tick().await; // the first tick completes immediately
+
+    loop {
+        tokio::select! {
+            event = events.recv() => match event {
+                Ok((record, _)) => {
+                    if record.id != id {
+                        continue;
+                    }
+                    if write_artifact_event(&mut stream, &record.id, record.version)
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                // A dropped broadcast may have carried this artifact. The store
+                // holds the truth, so resend that instead of guessing.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    let Some(current) = artifacts.get(id) else {
+                        return;
+                    };
+                    if write_artifact_event(&mut stream, &current.id, current.version)
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            },
+            _ = keepalive.tick() => {
+                // A comment frame. Its only job is to turn a departed client into
+                // a write error, so this task stops parking on a dead socket.
+                if stream.write_all(b": keepalive\n\n").await.is_err() {
+                    return;
+                }
+                if stream.flush().await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+async fn write_artifact_event(
+    stream: &mut TcpStream,
+    id: &str,
+    version: u32,
+) -> std::io::Result<()> {
+    let payload = serde_json::json!({ "id": id, "version": version });
+    stream
+        .write_all(format!("data: {payload}\n\n").as_bytes())
+        .await?;
+    stream.flush().await
+}
+
 async fn serve_cli_artifact_script(mut stream: TcpStream) {
     let mut drain = [0u8; 4096];
     let _ = stream.read(&mut drain).await;
@@ -738,6 +841,16 @@ async fn handle_connection_authenticated(
     }
 
     if peek_str.starts_with("get /artifact/") {
+        // Ids are case-sensitive, so the id comes off the raw head rather than
+        // the lowercased copy the routing match uses.
+        let path = head.split_whitespace().nth(1).unwrap_or("");
+        if let Some(id) = path
+            .strip_prefix("/artifact/")
+            .and_then(|rest| rest.strip_suffix("/events"))
+        {
+            serve_artifact_events(stream, &server.artifacts, id).await;
+            return;
+        }
         serve_artifact_get(stream, &server.artifacts, &head).await;
         return;
     }

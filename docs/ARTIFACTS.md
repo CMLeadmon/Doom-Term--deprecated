@@ -16,7 +16,7 @@ Artifacts allow autonomous AI agents (`claude`, `codex`, `gemini`, `agy`), devel
    - HTML / Web application previews.
 2. **Local Daemon Serving & Instant Live Reload**:
    - Every artifact is hosted on loopback at `http://127.0.0.1:1421/artifact/:id`.
-   - Standalone pages connect to the daemon's WebSocket and automatically reload when the agent updates the artifact.
+   - Standalone pages subscribe to `http://127.0.0.1:1421/artifact/:id/events`, a Server-Sent Events stream carrying `{"id","version"}`, and reload themselves when the agent republishes the artifact. They deliberately do **not** use the terminal WebSocket: `security::trusted_origin` refuses the daemon's own origin, and it must keep refusing it — an `html` artifact is agent-authored JavaScript, and that socket drives PTYs. The stream sends no CORS header, so only pages the daemon itself served can watch it.
    - Raw source accessible at `http://127.0.0.1:1421/artifact/:id/raw`.
 3. **Strict Four-Material Compliance**:
    - Striated neutral grey plate header (`--plate`), recessed well (`--ground`, `--ground-2`), hard 1px bevel pair (`--bevel-up`, `--bevel-dn`), and contrast-guarded ink.
