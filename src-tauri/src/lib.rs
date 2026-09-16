@@ -45,10 +45,21 @@ pub fn run() {
         .expect("error while building Doom Term application");
 
     app.run(|handle, event| {
-        // Take the daemon down with the app; an orphaned one would hold the
-        // port and silently become the daemon of the next launch.
         if matches!(event, RunEvent::Exit) {
+            // On Linux and macOS, take the daemon down with the app. The work
+            // is not in the daemon — tmux holds it — so an orphan would only
+            // hold the port and silently become the daemon of the next launch.
+            //
+            // On Windows the work IS in the daemon: no tmux, and the ConPTY
+            // dies with it. Becoming the daemon of the next launch is exactly
+            // what we want there, and daemon::start already attaches to a live
+            // one rather than spawning a second. It is not left forever:
+            // DOOM_TERM_IDLE_EXIT_SECS gives it a grace period with no client,
+            // after which it exits and its job objects end the process trees.
+            #[cfg(not(windows))]
             daemon::stop(handle);
+            #[cfg(windows)]
+            let _ = handle;
         }
     });
 }

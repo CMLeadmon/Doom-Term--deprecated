@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 #[cfg(test)]
@@ -186,6 +187,166 @@ fn listen_addr(host: Option<String>, port: Option<String>) -> String {
 const CLI_ARTIFACT_SCRIPT: &str = include_str!("../../tools/agent-hooks/doom-term-artifact.sh");
 const HOOK_SCRIPT: &str = include_str!("../../tools/agent-hooks/doom-term-hook.sh");
 
+/// When a daemon that nobody is connected to should stop.
+///
+/// ── WHY THIS EXISTS AT ALL ─────────────────────────────────────────────────
+///
+/// On Linux and macOS the tmux substrate is what survives: the shell is nobody's
+/// child of ours, so the daemon can come and go. Windows has no tmux, and the
+/// ConPTY dies with the daemon — so there, and only there, the daemon itself has
+/// to be the thing that outlives the window. Closing Doom Term and reopening it
+/// should find the agent still working.
+///
+/// The cost of that is a process with no window, which is exactly the kind of
+/// thing that gets forgotten. `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` means a
+/// forgotten daemon is a forgotten agent still burning tokens, so the grace is
+/// bounded: reopen within it and the session is there, walk away and the daemon
+/// exits and takes the tree with it — which is exactly today's behaviour, just
+/// deferred.
+///
+/// ── WHY AN ENV VAR AND NOT `cfg(windows)` ──────────────────────────────────
+///
+/// Compiling this only for Windows would make it untestable from a Linux host,
+/// and the failure mode is severe: a miscount exits a daemon somebody is
+/// actively using and every session dies at once. Gating on a variable the
+/// Tauri shell sets means the logic runs, and is tested, everywhere — while
+/// staying inert for `npm run server`, which must not disappear from under a
+/// developer.
+struct IdleWatch {
+    live: std::sync::atomic::AtomicUsize,
+    /// When the last client left, or when the daemon started and none ever
+    /// arrived. `None` while somebody is connected.
+    alone_since: parking_lot::Mutex<Option<std::time::Instant>>,
+    grace: Duration,
+}
+
+impl IdleWatch {
+    fn new(grace: Duration, now: std::time::Instant) -> Self {
+        // A daemon nobody ever connects to must not live forever either, so the
+        // clock starts at boot rather than at the first disconnect.
+        Self {
+            live: std::sync::atomic::AtomicUsize::new(0),
+            alone_since: parking_lot::Mutex::new(Some(now)),
+            grace,
+        }
+    }
+
+    fn joined(&self) {
+        self.live.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *self.alone_since.lock() = None;
+    }
+
+    fn left(&self, now: std::time::Instant) {
+        // fetch_sub returns the PREVIOUS value, so 1 means this was the last.
+        if self.live.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            *self.alone_since.lock() = Some(now);
+        }
+    }
+
+    fn should_exit(&self, now: std::time::Instant) -> bool {
+        if self.live.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            return false;
+        }
+        match *self.alone_since.lock() {
+            Some(since) => now.duration_since(since) >= self.grace,
+            None => false,
+        }
+    }
+}
+
+/// Decrements on every exit path, including a panic in the connection handler.
+///
+/// Without this a handler that panicked would leave the count permanently above
+/// zero and the daemon would never exit. Leaking upward is the safe direction,
+/// but "safe" here means "never reclaims", which is not a state to design for.
+struct ClientGuard(Option<Arc<IdleWatch>>);
+
+impl Drop for ClientGuard {
+    fn drop(&mut self) {
+        if let Some(watch) = &self.0 {
+            watch.left(std::time::Instant::now());
+        }
+    }
+}
+
+#[cfg(test)]
+mod idle_watch_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_daemon_nobody_ever_connects_to_still_exits() {
+        // The clock starts at boot, not at the first disconnect: otherwise a
+        // daemon spawned by a window that never opened would live forever.
+        let now = Instant::now();
+        let watch = IdleWatch::new(Duration::from_secs(60), now);
+        assert!(!watch.should_exit(now));
+        assert!(watch.should_exit(now + Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn a_connected_client_keeps_the_daemon_alive_indefinitely() {
+        // The severe failure this guards: exiting under somebody who is working.
+        let now = Instant::now();
+        let watch = IdleWatch::new(Duration::from_secs(60), now);
+        watch.joined();
+        assert!(!watch.should_exit(now + Duration::from_secs(60 * 60 * 24)));
+    }
+
+    #[test]
+    fn the_grace_starts_when_the_last_client_leaves_not_the_first() {
+        let start = Instant::now();
+        let watch = IdleWatch::new(Duration::from_secs(60), start);
+        watch.joined();
+        watch.joined();
+
+        let first_left = start + Duration::from_secs(10);
+        watch.left(first_left);
+        assert!(
+            !watch.should_exit(first_left + Duration::from_secs(120)),
+            "one of two clients leaving is not an idle daemon"
+        );
+
+        let last_left = start + Duration::from_secs(20);
+        watch.left(last_left);
+        assert!(!watch.should_exit(last_left + Duration::from_secs(59)));
+        assert!(watch.should_exit(last_left + Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn reconnecting_inside_the_grace_cancels_the_exit() {
+        // This is the whole feature: close the window, reopen it, find the
+        // agent still working.
+        let start = Instant::now();
+        let watch = IdleWatch::new(Duration::from_secs(60), start);
+        watch.joined();
+        watch.left(start + Duration::from_secs(1));
+        watch.joined();
+        assert!(!watch.should_exit(start + Duration::from_secs(600)));
+    }
+
+    #[test]
+    fn the_guard_decrements_even_if_the_handler_unwinds() {
+        let start = Instant::now();
+        let watch = Arc::new(IdleWatch::new(Duration::from_secs(60), start));
+        watch.joined();
+        // AssertUnwindSafe because parking_lot::Mutex is not RefUnwindSafe.
+        // Sound here: the panic is raised before the guard touches anything, and
+        // the assertion below is precisely that the mutex is left consistent.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let watch = watch.clone();
+            move || {
+                let _guard = ClientGuard(Some(watch));
+                panic!("a connection handler died");
+            }
+        }));
+        assert!(result.is_err());
+        // Without the Drop guard the count would still be 1 here and the daemon
+        // would never reclaim itself.
+        assert!(watch.should_exit(Instant::now() + Duration::from_secs(120)));
+    }
+}
+
 fn provision_cli_tools() {
     let Some(home) = pty::home_dir() else {
         return;
@@ -276,6 +437,32 @@ async fn main() -> Result<()> {
     let usage = server.usage.clone();
     tokio::spawn(server.clone().maintain());
 
+    // Set by the Tauri shell on Windows, where the daemon has to outlive the
+    // window because there is no tmux to hold the session. Unset everywhere
+    // else, including `npm run server`.
+    let idle: Option<Arc<IdleWatch>> = std::env::var("DOOM_TERM_IDLE_EXIT_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(|secs| {
+            log::info!("daemon will exit after {secs}s with no connected client");
+            Arc::new(IdleWatch::new(
+                Duration::from_secs(secs),
+                std::time::Instant::now(),
+            ))
+        });
+    if let Some(watch) = idle.clone() {
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                if watch.should_exit(std::time::Instant::now()) {
+                    log::info!("no client for the grace period; daemon exiting");
+                    std::process::exit(0);
+                }
+            }
+        });
+    }
+
     // Rate-limit usage refreshes on its own timer, never on the request path:
     // GetTelemetry is polled every 2 s and must not wait on an HTTPS round-trip.
     {
@@ -315,7 +502,15 @@ async fn main() -> Result<()> {
     loop {
         match listener.accept().await {
             Ok((stream, client_addr)) => {
-                tokio::spawn(handle_connection(stream, client_addr, server.clone()));
+                let server = server.clone();
+                let idle = idle.clone();
+                tokio::spawn(async move {
+                    if let Some(watch) = &idle {
+                        watch.joined();
+                    }
+                    let _guard = ClientGuard(idle);
+                    handle_connection(stream, client_addr, server).await;
+                });
             }
             Err(e) => {
                 log::warn!("Listener accept error (retrying): {:?}", e);

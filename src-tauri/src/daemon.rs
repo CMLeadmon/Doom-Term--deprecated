@@ -54,11 +54,28 @@ pub fn start(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     // AppImage's loader paths are for the GUI, not host programs. Clear
     // inheritance before supplying the sanitized snapshot so removed variables
     // cannot leak back into the daemon, tmux server, or terminal children.
+    // Only Windows adds to it, so `mut` is genuinely unused elsewhere.
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut env = crate::daemon_env::sanitize(std::env::vars_os());
+    // Windows only. Linux and macOS have tmux: the shell is nobody's child of
+    // ours, so the daemon may come and go and the work survives either way.
+    // Windows has no tmux and the ConPTY dies with the daemon, so there the
+    // daemon itself is what has to outlive the window — see RunEvent::Exit in
+    // lib.rs, which deliberately does not stop it there.
+    //
+    // The grace is what keeps that from becoming a forgotten process: reopen
+    // within ten minutes and the agent is still working, walk away and the
+    // daemon exits and takes its process tree with it.
+    #[cfg(windows)]
+    env.insert(
+        std::ffi::OsString::from("DOOM_TERM_IDLE_EXIT_SECS"),
+        std::ffi::OsString::from("600"),
+    );
     let (mut rx, child) = app
         .shell()
         .sidecar("doom-term-server")?
         .env_clear()
-        .envs(crate::daemon_env::sanitize(std::env::vars_os()))
+        .envs(env)
         .spawn()?;
     app.manage(Daemon(Mutex::new(Some(child))));
 
