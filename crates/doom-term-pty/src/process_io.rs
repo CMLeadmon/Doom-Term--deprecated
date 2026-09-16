@@ -331,6 +331,55 @@ mod windows_tests {
         }
     }
 
+    // These fixtures run only in subprocesses selected by the regression test.
+    #[test]
+    #[ignore]
+    fn inherited_pipe_descendant() {
+        std::thread::sleep(Duration::from_secs(10));
+    }
+
+    #[test]
+    #[ignore]
+    fn exiting_pipe_parent() {
+        use std::io::Read;
+        // The runner writes only after assigning the parent to its job.
+        let mut input = Vec::new();
+        std::io::stdin().read_to_end(&mut input).unwrap();
+        assert_eq!(input, b"start");
+        let _descendant = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "process_io::windows_tests::inherited_pipe_descendant",
+            ])
+            .spawn()
+            .unwrap();
+    }
+
+    #[test]
+    fn exited_parent_does_not_disable_the_pipe_deadline() {
+        let started = Instant::now();
+        let result = run_bounded(
+            &std::env::current_exe().unwrap(),
+            &args(&[
+                "--ignored",
+                "--exact",
+                "process_io::windows_tests::exiting_pipe_parent",
+            ]),
+            b"start",
+            HelperLimits {
+                timeout: Duration::from_secs(2),
+                input_bytes: 64,
+                output_bytes: 65536,
+            },
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "pipe join exceeded deadline"
+        );
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+    }
+
     #[test]
     fn a_helper_that_succeeds_returns_its_output() {
         let out = run_bounded(
