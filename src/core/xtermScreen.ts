@@ -19,6 +19,8 @@ const SCROLLBACK = 5000;
  */
 export class XtermScreen implements TerminalScreen {
   private term: Terminal;
+  private cursorVisible = true;
+  private renderedLines: AnsiLine[] = [];
   private listeners = new Set<() => void>();
   private marks = new Map<number, IMarker>();
   private nextMarkId = 1;
@@ -54,6 +56,18 @@ export class XtermScreen implements TerminalScreen {
       // registerMarker and the unicode API are proposed API and throw without this.
       allowProposedApi: true,
     });
+    // Headless exposes no public DECTCEM state. Observe parsed commands, then
+    // return false so xterm still applies every parameter (including other modes).
+    this.cursorVisible = true;
+    for (const [final, visible] of [['h', true], ['l', false]] as const) {
+      terminal.parser.registerCsiHandler({ prefix: '?', final }, params => {
+        if (params.includes(25)) this.cursorVisible = visible;
+        return false;
+      });
+    }
+    const showCursor = () => { this.cursorVisible = true; return false; };
+    terminal.parser.registerCsiHandler({ intermediates: '!', final: 'p' }, showCursor);
+    terminal.parser.registerEscHandler({ final: 'c' }, showCursor);
     try {
       terminal.loadAddon(new Unicode11Addon());
       terminal.unicode.activeVersion = '11';
@@ -168,7 +182,8 @@ export class XtermScreen implements TerminalScreen {
   }
 
   getLines(): AnsiLine[] {
-    return linesFrom(this.term.buffer.active, 0);
+    this.renderedLines = linesFrom(this.term.buffer.active, 0, this.renderedLines);
+    return this.renderedLines;
   }
 
   /**
@@ -178,9 +193,14 @@ export class XtermScreen implements TerminalScreen {
    * directly. Both are read together and from the same buffer object so a
    * frame cannot land between them and pair a new row with an old column.
    */
-  getCursor(): { row: number; col: number } {
+  getCursor(): { row: number; col: number; visible?: boolean } {
     const buffer = this.term.buffer.active;
-    return { row: buffer.baseY + buffer.cursorY, col: buffer.cursorX };
+    return {
+      row: buffer.baseY + buffer.cursorY,
+      // Pending autowrap keeps cursorX == cols until the next glyph arrives.
+      col: Math.min(buffer.cursorX, this.term.cols - 1),
+      ...(this.cursorVisible ? {} : { visible: false }),
+    };
   }
 
   linesSince(mark: number): AnsiLine[] {
@@ -212,6 +232,7 @@ export class XtermScreen implements TerminalScreen {
     this.term.dispose();
     this.term = this.createTerminal(cols, rows);
     this.marks.clear();
+    this.renderedLines = [];
   }
 
   dispose(): void {

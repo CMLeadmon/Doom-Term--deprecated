@@ -104,6 +104,10 @@ function lineToAnsi(line: IBufferLine, id: string, probe: IBufferCell, row?: num
  * stays even when blank, because that is where the next output lands.
  */
 function lastUsedLine(buffer: IBuffer, probe: IBufferCell): number {
+  // Once the screen has scrolled, blank viewport rows are physical terminal
+  // cells too. Trimming them makes every erase/home redraw shrink scrollHeight
+  // and pulls history into view. Alternate screens always occupy a full grid.
+  if (buffer.baseY > 0 || buffer.type === 'alternate') return buffer.length - 1;
   const cursorLine = buffer.baseY + buffer.cursorY;
   let last = Math.min(cursorLine, buffer.length - 1);
   for (let y = buffer.length - 1; y > last; y--) {
@@ -123,7 +127,7 @@ function lastUsedLine(buffer: IBuffer, probe: IBufferCell): number {
  * trims, which costs a re-render of the rows below; a monotonic id would need a
  * line-creation event xterm does not expose.
  */
-export function linesFrom(buffer: IBuffer, startLine: number): AnsiLine[] {
+export function linesFrom(buffer: IBuffer, startLine: number, previous: AnsiLine[] = []): AnsiLine[] {
   const out: AnsiLine[] = [];
   const probe = buffer.getNullCell();
   const from = Math.max(0, startLine);
@@ -131,7 +135,14 @@ export function linesFrom(buffer: IBuffer, startLine: number): AnsiLine[] {
   for (let y = from; y <= to; y++) {
     const line = buffer.getLine(y);
     if (!line) continue;
-    out.push(lineToAnsi(line, `row-${y}`, probe, y));
+    const next = lineToAnsi(line, `row-${y}`, probe, y);
+    const old = previous[y - from];
+    // Preserve immutable row identity so React.memo can skip unchanged history.
+    // Compare attributes as well as text: an SGR-only repaint must still render.
+    const unchanged = old && old.row === y && old.isWrapped === next.isWrapped
+      && old.isError === next.isError && old.spans.length === next.spans.length
+      && old.spans.every((span, i) => span.text === next.spans[i].text && sameAttr(span, next.spans[i]));
+    out.push(unchanged ? old : next);
   }
   return out;
 }

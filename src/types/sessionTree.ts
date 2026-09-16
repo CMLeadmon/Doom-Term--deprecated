@@ -86,7 +86,7 @@ export interface SessionNode {
    * the lines it is drawn against by one frame — the caret would trail the text
    * it is supposed to be sitting in.
    */
-  cursor?: { row: number; col: number };
+  cursor?: { row: number; col: number; visible?: boolean };
   commandHistory: string[];
   /** The last exit code seen for this session, if any. */
   lastExitCode?: number | null;

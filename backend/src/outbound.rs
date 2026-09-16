@@ -118,6 +118,7 @@ impl OutboundHub {
             Inbox { rx, budget },
         )
     }
+    #[allow(dead_code)]
     pub fn retained_bytes(&self) -> usize {
         *self.0.lock()
     }

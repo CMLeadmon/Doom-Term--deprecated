@@ -26,6 +26,69 @@ beforeEach(() => {
 afterEach(() => vi.unstubAllGlobals());
 
 describe('XtermScreen', () => {
+  it('keeps a pending-wrap caret inside the last column', async () => {
+    const screen = new XtermScreen(10, 5);
+    try {
+      await parsed(screen, '1234567890');
+      expect(screen.getCursor()).toMatchObject({ row: 0, col: 9 });
+      await parsed(screen, 'x');
+      expect(screen.getCursor()).toMatchObject({ row: 1, col: 1 });
+    } finally { screen.dispose(); }
+  });
+
+  it('honors cursor hiding across split writes, showing and terminal resets', async () => {
+    const screen = new XtermScreen(40, 10);
+    try {
+      await parsed(screen, '\x1b[?2');
+      await parsed(screen, '5l');
+      expect(screen.getCursor()).toMatchObject({ visible: false });
+      await parsed(screen, '\x1b[?25h');
+      expect(screen.getCursor().visible).not.toBe(false);
+      await parsed(screen, '\x1b[?25l\x1b[!p');
+      expect(screen.getCursor().visible).not.toBe(false);
+      await parsed(screen, '\x1b[?25l\x1bc');
+      expect(screen.getCursor().visible).not.toBe(false);
+      await parsed(screen, '\x1b[?25l');
+      screen.reset();
+      expect(screen.getCursor().visible).not.toBe(false);
+    } finally { screen.dispose(); }
+  });
+
+  it('keeps the full viewport while a scrolled terminal clears and redraws', async () => {
+    const screen = new XtermScreen(40, 10);
+    try {
+      await parsed(screen, 'history\r\n'.repeat(20));
+      const before = screen.getLines().length;
+      await parsed(screen, '\x1b[H\x1b[Jtop');
+      expect(screen.getLines()).toHaveLength(before);
+      expect(plain(screen.getLines()).at(-1)).toBe('');
+    } finally { screen.dispose(); }
+  });
+
+  it('retains blank alternate-screen rows when the cursor moves to the top', async () => {
+    const screen = new XtermScreen(40, 10);
+    try {
+      await parsed(screen, '\x1b[?1049h\x1b[Htop');
+      expect(screen.getLines()).toHaveLength(10);
+    } finally { screen.dispose(); }
+  });
+
+  it('reuses unchanged row snapshots when only the prompt changes', async () => {
+    const screen = new XtermScreen(40, 10);
+    try {
+      await parsed(screen, 'history\r\nprompt> ');
+      const before = screen.getLines();
+      await parsed(screen, 'x');
+      const after = screen.getLines();
+      expect(after[0]).toBe(before[0]);
+      expect(after[1]).not.toBe(before[1]);
+      expect(plain(before)[1]).toBe('prompt>');
+      expect(plain(after)[1]).toBe('prompt> x');
+      await parsed(screen, '\x1b[H\x1b[31mhistory');
+      expect(screen.getLines()[0]).not.toBe(before[0]);
+    } finally { screen.dispose(); }
+  });
+
   it('cannot apply queued old bytes or acknowledgements after a reset', async () => {
     const screen = new XtermScreen(40, 10);
     try {

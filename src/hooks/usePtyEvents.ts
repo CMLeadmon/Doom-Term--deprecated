@@ -118,7 +118,7 @@ export function applyScreenToNode(
   node: SessionNode,
   lines: AnsiLine[],
   inAltScreen: boolean,
-  cursor?: { row: number; col: number },
+  cursor?: { row: number; col: number; visible?: boolean },
 ): SessionNode {
   return { ...node, isTuiActive: inAltScreen, tuiLines: lines, cursor };
 }

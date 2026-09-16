@@ -47,7 +47,7 @@ export interface TerminalScreen {
    * with a shell that prints its prompt and then waits, there was nothing on
    * screen distinguishing a live terminal from a screenshot of one.
    */
-  getCursor(): { row: number; col: number };
+  getCursor(): { row: number; col: number; visible?: boolean };
 
   /** Rows from `mark` to the end. Falls back to everything if the mark is gone. */
   linesSince(mark: number): AnsiLine[];

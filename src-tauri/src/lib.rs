@@ -1,5 +1,6 @@
 pub mod commands;
 pub mod daemon;
+mod daemon_env;
 
 use tauri::{Manager, RunEvent};
 

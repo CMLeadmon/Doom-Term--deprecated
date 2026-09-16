@@ -38,7 +38,7 @@ interface RawTerminalViewProps {
    */
   agentKey?: string | null;
   /** Where the caret is, indexing `lines`. Absent before the first frame. */
-  cursor?: { row: number; col: number } | null;
+  cursor?: { row: number; col: number; visible?: boolean } | null;
   /** A palette command addressed to this pane, delivered at most once. */
   viewActionRequest?: ViewActionRequest | null;
   /** Clear a request after this pane accepts it, before a later remount. */
@@ -100,8 +100,12 @@ const TerminalLineRow = React.memo(function TerminalLineRow({
             data-testid="terminal-cursor"
             className="absolute top-0 pointer-events-none"
             style={{
-              left: `${cursorCol}ch`,
-              width: '1ch',
+              // <i> defaults to italic, whose zero advance can differ from the
+              // text face. Use the integer cell metric measured by useTerminalSize
+              // instead of CSS `ch`, whose fallback-font metric can drift.
+              fontStyle: 'normal',
+              left: `calc(var(--terminal-cell-width, 1ch) * ${cursorCol})`,
+              width: 'var(--terminal-cell-width, 1ch)',
               height: '100%',
               background: hasFocus ? 'var(--st-live)' : 'transparent',
               boxShadow: hasFocus ? 'none' : 'inset 0 0 0 1px var(--st-live)',
@@ -199,7 +203,7 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
   const containerRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const [hasFocus, setHasFocus] = useState(false);
-  const detachedRef = useRef(false);
+  const detachedRef = useRef(sessionId ? stateOf(sessionId).detached : false);
   const userScrollIntentRef = useRef(false);
   /**
    * Search entry is a keyboard MODE, not a text box.
@@ -274,7 +278,6 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
     const el = scrollRef.current;
     if (!el) return;
     if (sessionId) noteTotal(sessionId, lines.length);
-    if (!isActive) return;
     if (!detachedRef.current) {
       el.scrollTop = el.scrollHeight;
     } else if (sessionId && sessionScrollPositions.has(sessionId)) {
@@ -622,7 +625,7 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
         {recoveredHistory && <RecoveredHistory cache={recoveryCacheLines}
           cacheTruncated={recoveryCacheTruncated} history={recoveredHistory} />}
         {lines.map((line, i) => {
-          const isCursorHere = isActive && cursor
+          const isCursorHere = isActive && cursor && cursor.visible !== false
             ? (line.row !== undefined ? cursor.row === line.row : cursor.row === i)
             : false;
           return (
@@ -632,8 +635,8 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
               index={i}
               isMarked={marks.has(i)}
               isCursorHere={isCursorHere}
-              cursorCol={cursor?.col}
-              hasFocus={hasFocus}
+              cursorCol={isCursorHere ? cursor?.col : undefined}
+              hasFocus={isCursorHere ? hasFocus : false}
             />
           );
         })}

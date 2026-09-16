@@ -199,7 +199,7 @@ describe('alternate screen', () => {
     await feed(s, 'shell line\r\n');
     await feed(s, '\x1b[?1049h\x1b[Hfullscreen app');
     expect(s.isAltScreen()).toBe(true);
-    expect(rows(s)).toEqual(['fullscreen app']);
+    expect(rows(s)).toEqual(['fullscreen app', '', '', '', '']);
 
     await feed(s, '\x1b[?1049l');
     expect(s.isAltScreen()).toBe(false);

@@ -58,7 +58,12 @@ export function useTerminalSize(
 
       const usable = Math.max(0, el.clientWidth - padX - reservedPx);
       const usableHeight = Math.max(0, el.clientHeight - padY);
-      const next = gridSize(usable, usableHeight, measureCell(el));
+      const cell = measureCell(el);
+      // The caret is positioned in the DOM using this exact integer metric.
+      // CSS `ch` measures the first fallback font's zero glyph, which can differ
+      // from the fallback that actually renders the terminal text.
+      el.style.setProperty('--terminal-cell-width', `${cell.width}px`);
+      const next = gridSize(usable, usableHeight, cell);
       // A no-op resize is not free: each one is a SIGWINCH, and a running agent
       // answers it by redrawing its whole frame. Only report real changes.
       if (last.current && last.current.cols === next.cols && last.current.rows === next.rows) {

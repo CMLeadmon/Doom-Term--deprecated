@@ -582,6 +582,43 @@ process.stdout.write(end + '\\n');
     'offline input must not replay and the recovered editor must save through the original process');
   await page.screenshot({ path: join(artifacts, 'cold-recovery-editor.png') });
   console.log('[UI Test] PASS: cold daemon restart preserves exact editor/root, separates history, refuses offline input, and saves the file');
+  // Exercise the child's cursor mode and a multi-frame erase/redraw through
+  // the real tmux -> daemon -> headless -> DOM path. Hold the second frame on
+  // read, so this proves the intermediate state rather than winning a timer race.
+  await page.keyboard.press('Control+Shift+t');
+  const visualTerminal = page.getByTestId('raw-terminal').filter({ visible: true }).last();
+  await expect(visualTerminal).toContainText(/[$#]/);
+  await command(page, "i=0; while [ $i -lt 150 ]; do printf 'VISUAL_HISTORY_%s\\n' \"$i\"; i=$((i+1)); done", 'VISUAL_HISTORY_149');
+  await visualTerminal.click();
+  await page.keyboard.type("printf 'CURSOR_ALIGNMENT_0123456789'; read -r answer");
+  await page.keyboard.press('Enter');
+  const alignmentRow = visualTerminal.locator('[data-terminal-line]').filter({ hasText: /^CURSOR_ALIGNMENT_0123456789$/ });
+  await expect(alignmentRow).toHaveCount(1);
+  await expect(alignmentRow.getByTestId('terminal-cursor')).toHaveCount(1);
+  await expect.poll(() => alignmentRow.evaluate(row => {
+    const content = row.children[1];
+    const text = content.querySelector('span');
+    const range = document.createRange();
+    range.selectNodeContents(text);
+    return Math.abs(content.querySelector('[data-testid="terminal-cursor"]').getBoundingClientRect().left
+      - range.getBoundingClientRect().right);
+  })).toBeLessThan(1);
+  await page.keyboard.press('Enter');
+  await page.keyboard.type("rows=$(stty size); rows=${rows%% *}; printf '\\033[?25l\\033[H\\033[JREDRAW_HIDDEN'; read -r answer; printf '\\033[%s;1HREDRAW_SHOWN\\033[?25h' \"$rows\"");
+  await page.keyboard.press('Enter');
+  await expect(visualTerminal).toContainText('REDRAW_HIDDEN');
+  await expect(visualTerminal.getByTestId('terminal-cursor')).toHaveCount(0);
+  const visualScroller = visualTerminal.locator(':scope > div').first();
+  const hiddenGeometry = await visualScroller.evaluate(el => ({ top: el.scrollTop, height: el.scrollHeight }));
+  await page.screenshot({ path: join(artifacts, 'redraw-hidden.png') });
+  await page.keyboard.press('Enter');
+  await expect(visualTerminal).toContainText('REDRAW_SHOWN');
+  await expect(visualTerminal.getByTestId('terminal-cursor')).toHaveCount(1);
+  const shownGeometry = await visualScroller.evaluate(el => ({ top: el.scrollTop, height: el.scrollHeight }));
+  assert.deepEqual(shownGeometry, hiddenGeometry, 'home/erase and bottom-row redraw must not shift scrollback');
+  await page.screenshot({ path: join(artifacts, 'redraw-shown.png') });
+  console.log('[UI Test] PASS: child cursor hide/show and multi-frame redraw preserve scroll geometry');
+
   await expect(page.locator('vite-error-overlay')).toHaveCount(0);
   assert.deepEqual(errors, [], 'no browser runtime errors');
   assert.deepEqual(probeFailures, [], 'all MVP probes must pass; recorded failures are never skipped successes');

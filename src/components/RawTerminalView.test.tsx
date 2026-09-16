@@ -68,6 +68,43 @@ describe('RawTerminalView', () => {
     onSendSignal: vi.fn(),
   };
 
+  it('does not draw a caret hidden by the foreground application', () => {
+    render(<RawTerminalView {...base} isActive
+      lines={[{ id: 'row', spans: [{ text: 'TUI' }], timestamp: 0 }]}
+      cursor={{ row: 0, col: 1, visible: false }} />);
+    expect(screen.queryByTestId('terminal-cursor')).toBeNull();
+  });
+
+  it('restores detached scrollback on remount before following new output', () => {
+    resetScrollback('remount');
+    const lines = [{ id: 'line', spans: [{ text: 'tail' }], timestamp: 0 }];
+    const props = { ...base, sessionId: 'remount', isActive: true, lines };
+    const first = render(<RawTerminalView {...props} />);
+    const scroller = screen.getByTestId('raw-terminal').firstElementChild as HTMLDivElement;
+    Object.defineProperties(scroller, {
+      scrollHeight: { configurable: true, value: 1000 },
+      clientHeight: { configurable: true, value: 200 },
+    });
+    fireEvent.wheel(scroller, { deltaY: -100 });
+    scroller.scrollTop = 300;
+    fireEvent.scroll(scroller);
+    first.unmount();
+    render(<RawTerminalView {...props} />);
+    const restored = screen.getByTestId('raw-terminal').firstElementChild as HTMLDivElement;
+    expect(restored.scrollTop).toBe(300);
+    expect(stateOf('remount').detached).toBe(true);
+  });
+
+  it('keeps an unfocused split pane following newly arriving output', () => {
+    const first = [{ id: 'line', spans: [{ text: 'first' }], timestamp: 0 }];
+    const view = render(<RawTerminalView {...base} sessionId="background-follow" isActive={false} lines={first} />);
+    const scroller = screen.getByTestId('raw-terminal').firstElementChild as HTMLDivElement;
+    Object.defineProperty(scroller, 'scrollHeight', { configurable: true, value: 1000 });
+    view.rerender(<RawTerminalView {...base} sessionId="background-follow" isActive={false}
+      lines={[...first, { id: 'next', spans: [{ text: 'next' }], timestamp: 0 }]} />);
+    expect(scroller.scrollTop).toBe(1000);
+  });
+
   it('takes the keyboard as soon as it is the active pane', () => {
     // Without this the view mounted unfocused: its keydown handler could not be
     // reached, every keystroke fell through to the window shortcuts, and the
@@ -323,7 +360,7 @@ describe('RawTerminalView', () => {
 
     const cursorEl = screen.getByTestId('terminal-cursor');
     expect(cursorEl).toBeDefined();
-    expect(cursorEl.style.left).toBe('3ch');
+    expect(cursorEl.style.left).toBe('calc(var(--terminal-cell-width, 1ch) * 3)');
     // Ensure cursor is placed inside line-1
     const line1 = screen.getByTestId('raw-terminal').querySelector('[data-terminal-line="1"]');
     expect(line1?.contains(cursorEl)).toBe(true);

@@ -51,7 +51,15 @@ pub fn start(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let (mut rx, child) = app.shell().sidecar("doom-term-server")?.spawn()?;
+    // AppImage's loader paths are for the GUI, not host programs. Clear
+    // inheritance before supplying the sanitized snapshot so removed variables
+    // cannot leak back into the daemon, tmux server, or terminal children.
+    let (mut rx, child) = app
+        .shell()
+        .sidecar("doom-term-server")?
+        .env_clear()
+        .envs(crate::daemon_env::sanitize(std::env::vars_os()))
+        .spawn()?;
     app.manage(Daemon(Mutex::new(Some(child))));
 
     // The daemon logs through env_logger, which writes to stderr.
