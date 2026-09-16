@@ -39,14 +39,18 @@ pub fn telemetry(
             cwd.map(|c| pty::session::expand_path(&c).to_string_lossy().to_string())
                 .filter(|c| !c.trim().is_empty())
         })
-        .or_else(|| std::env::var("HOME").ok())
+        .or_else(|| pty::home_dir().map(|home| home.to_string_lossy().into_owned()))
         .unwrap_or_else(|| "/".to_string());
     // No game vocabulary in anything the UI can render: an unknown user
     // is unknown, not a "marine" on "phobos-base".
     let username = std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
         .unwrap_or_else(|_| "unknown".to_string());
-    let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "localhost".to_string());
+    // COMPUTERNAME is the Windows spelling; HOSTNAME is not set there. An
+    // unknown host is "localhost", never a guess at the machine's real name.
+    let hostname = std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .unwrap_or_else(|_| "localhost".to_string());
 
     let git_branch = pty::process_io::run_bounded(
         Path::new("git"),
@@ -145,8 +149,7 @@ pub fn browse(request_id: String, path: Option<String>) -> Value {
     let dir = if requested.is_dir() {
         requested
     } else {
-        std::env::var_os("HOME")
-            .map(PathBuf::from)
+        pty::home_dir()
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("/"))
     };

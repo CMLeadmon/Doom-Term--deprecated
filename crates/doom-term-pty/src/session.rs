@@ -36,7 +36,7 @@ use crate::tmux::{self, TmuxHandle};
  */
 pub fn anchor_working_directory() -> std::path::PathBuf {
     let current = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let home = home_dir();
     for candidate in anchor_candidates(home.as_deref()) {
         if candidate == current {
             return current;
@@ -64,14 +64,34 @@ fn anchor_candidates(home: Option<&std::path::Path>) -> Vec<std::path::PathBuf> 
     candidates
 }
 
+/// The user's home directory, by whichever name this platform gives it.
+///
+/// `HOME` is not a Windows variable. cmd.exe and PowerShell set `USERPROFILE`,
+/// and only MSYS/Git-Bash-style shells mirror it into `HOME`. Reading `HOME`
+/// alone meant every fallback built on it silently took its next branch on
+/// Windows: `resolve_cwd` started shells in the daemon's own directory,
+/// `credentials.rs` never found the Claude token, and `provision_cli_tools`
+/// returned without installing anything — each one looking like a different
+/// bug.
+///
+/// `HOME` is still asked first. A user who sets it means it, and on Unix it is
+/// the only answer.
+pub fn home_dir() -> Option<std::path::PathBuf> {
+    ["HOME", "USERPROFILE"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .find(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
 pub fn expand_path(path_str: &str) -> std::path::PathBuf {
     if path_str == "~" {
-        if let Ok(home) = std::env::var("HOME") {
-            return std::path::PathBuf::from(home);
+        if let Some(home) = home_dir() {
+            return home;
         }
     } else if let Some(rest) = path_str.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return std::path::PathBuf::from(home).join(rest);
+        if let Some(home) = home_dir() {
+            return home.join(rest);
         }
     }
     std::path::PathBuf::from(path_str)
@@ -90,7 +110,9 @@ pub struct SessionInfo {
 
 type OwnedChild = Arc<parking_lot::Mutex<Option<Box<dyn portable_pty::Child + Send + Sync>>>>;
 
-#[cfg(all(test, unix))]
+// Not `all(test, unix)`: the module also holds pure-function tests with no OS
+// dependency at all, and gating the file hid them from every Windows run.
+#[cfg(test)]
 mod tests;
 
 #[allow(dead_code)]
@@ -140,8 +162,8 @@ fn resolve_cwd(requested: Option<&str>) -> std::path::PathBuf {
             return expanded;
         }
     }
-    if let Ok(home) = std::env::var("HOME") {
-        return std::path::PathBuf::from(home);
+    if let Some(home) = home_dir() {
+        return home;
     }
     std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"))
 }
@@ -176,8 +198,8 @@ fn default_shell() -> String {
 
 fn augmented_path() -> Option<String> {
     augment_path(
-        &std::env::var("HOME").ok()?,
-        &std::env::var("PATH").unwrap_or_default(),
+        home_dir()?.as_path(),
+        &std::env::var_os("PATH").unwrap_or_default(),
     )
 }
 
@@ -192,26 +214,35 @@ fn augmented_path() -> Option<String> {
 /// `cargo test -p doom-term-pty` fail in roughly one run in four, on whichever
 /// of the three PTY tests happened to overlap. Take the environment as
 /// arguments and the test needs no global state at all.
-fn augment_path(home: &str, current_path: &str) -> Option<String> {
-    let local_bin = format!("{}/.local/bin", home);
-    let doom_bin = format!("{}/.doom-term/bin", home);
-    let parts: Vec<&str> = current_path.split(':').filter(|s| !s.is_empty()).collect();
+/// Prepend the user's own bin directories, in the platform's own spelling.
+///
+/// This split and rejoined on ':' and built paths with `format!("{}/...")`,
+/// which produces `C:\Users\me/.local/bin` joined with ':' on Windows — a
+/// PATH no Windows process can parse, silently handed to every shell we spawn.
+/// `split_paths`/`join_paths` and `Path::join` are the same code on Unix and
+/// correct on both.
+fn augment_path(home: &std::path::Path, current_path: &std::ffi::OsStr) -> Option<String> {
+    let local_bin = home.join(".local").join("bin");
+    let doom_bin = home.join(".doom-term").join("bin");
+    let parts: Vec<std::path::PathBuf> = std::env::split_paths(current_path)
+        .filter(|part| !part.as_os_str().is_empty())
+        .collect();
 
     let mut prepend = Vec::new();
-    if !parts.contains(&local_bin.as_str()) {
+    if !parts.contains(&local_bin) {
         prepend.push(local_bin);
     }
-    if !parts.contains(&doom_bin.as_str()) {
+    if !parts.contains(&doom_bin) {
         prepend.push(doom_bin);
     }
 
     if prepend.is_empty() {
-        None
-    } else {
-        let mut all = prepend;
-        all.extend(parts.into_iter().map(String::from));
-        Some(all.join(":"))
+        return None;
     }
+    prepend.extend(parts);
+    std::env::join_paths(prepend)
+        .ok()
+        .map(|joined| joined.to_string_lossy().into_owned())
 }
 
 fn prepare_command(cmd: &mut CommandBuilder, id: &str) {
