@@ -22,6 +22,25 @@ pub(crate) fn run(exe: &Path, args: &[String], input: &[u8], timeout: Duration) 
     )
 }
 
+/// The admission rules both implementations share.
+///
+/// Kept in one place deliberately: these are the bounds that make this function
+/// safe to call from a blocking worker, and two copies of them would drift.
+fn check_limits(input: &[u8], limits: HelperLimits) -> Result<()> {
+    anyhow::ensure!(
+        input.len() <= limits.input_bytes,
+        "Terminal helper input limit exceeded"
+    );
+    anyhow::ensure!(
+        limits.input_bytes <= crate::paste::MAX_PASTE_BYTES
+            && limits.output_bytes <= 8 * 1024 * 1024
+            && limits.timeout <= Duration::from_secs(30)
+            && !limits.timeout.is_zero(),
+        "Invalid terminal helper limits"
+    );
+    Ok(())
+}
+
 #[cfg(unix)]
 pub fn run_bounded(
     exe: &Path,
@@ -34,17 +53,7 @@ pub fn run_bounded(
     use std::process::{Command, Stdio};
     use std::time::Instant;
 
-    anyhow::ensure!(
-        input.len() <= limits.input_bytes,
-        "Terminal helper input limit exceeded"
-    );
-    anyhow::ensure!(
-        limits.input_bytes <= crate::paste::MAX_PASTE_BYTES
-            && limits.output_bytes <= 8 * 1024 * 1024
-            && limits.timeout <= Duration::from_secs(30)
-            && !limits.timeout.is_zero(),
-        "Invalid terminal helper limits"
-    );
+    check_limits(input, limits)?;
     let deadline = Instant::now() + limits.timeout;
     let mut child = Command::new(exe)
         .args(args)
@@ -140,14 +149,300 @@ pub fn run_bounded(
     result
 }
 
-#[cfg(not(unix))]
+/// Windows: a thread per pipe, because there is no O_NONBLOCK to set.
+///
+/// The Unix path sets both pipe descriptors non-blocking and pumps them from
+/// one thread. Windows anonymous pipes have no equivalent — there is no way to
+/// make an existing pipe handle return WouldBlock — so each direction gets its
+/// own thread and the deadline lives on the parent.
+///
+/// Both threads are guaranteed to finish. Killing the helper closes the handles
+/// it holds, so a blocked `read` returns EOF and a blocked `write` fails; that
+/// is what lets this join unconditionally instead of detaching threads that
+/// would outlive the call.
+///
+/// ── WHY THIS IS NOT A TMUX CONCESSION ──────────────────────────────────────
+///
+/// This function was named for tmux and stubbed out off-Unix, which hid that it
+/// is the crate's only bounded subprocess runner. `metadata.rs` runs
+/// `git rev-parse --abbrev-ref HEAD` through it, so the branch indicator was
+/// dark on Windows for a reason that had nothing to do with git, tmux, or
+/// Windows. Implementing it restores the branch. It does not conjure a tmux:
+/// `resolve_tmux` still finds no binary, and `durability_detail` still says so.
+#[cfg(windows)]
+pub fn run_bounded(
+    exe: &Path,
+    args: &[String],
+    input: &[u8],
+    limits: HelperLimits,
+) -> Result<Vec<u8>> {
+    use std::io::{ErrorKind, Read, Write};
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Instant;
+    use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
+
+    check_limits(input, limits)?;
+    let deadline = Instant::now() + limits.timeout;
+    let mut child = Command::new(exe)
+        .args(args)
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        // The closest analogue of the Unix `process_group(0)`: console control
+        // events aimed at us must not reach a helper.
+        .creation_flags(CREATE_NEW_PROCESS_GROUP)
+        .spawn()
+        .map_err(|_| anyhow::anyhow!("Terminal helper could not start"))?;
+
+    // Holds the helper's whole tree, so a stalled descendant holding a pipe
+    // open cannot outlive the deadline. This is the same guarantee `killpg`
+    // gives the Unix path.
+    let job = crate::job::JobObject::create_for(child.id()).ok();
+
+    let mut stdin = child.stdin.take();
+    let stdout = child.stdout.take();
+
+    let owned_input = input.to_vec();
+    let writer = std::thread::spawn(move || -> bool {
+        let Some(pipe) = stdin.as_mut() else {
+            return true;
+        };
+        let wrote = pipe.write_all(&owned_input).is_ok();
+        // Dropping closes the pipe, which is the child's EOF on stdin. Without
+        // this a helper that reads to EOF would wait for the deadline.
+        drop(stdin);
+        wrote
+    });
+
+    // Set when the reader gives up, so a helper blocked writing into a pipe
+    // nobody is draining costs a millisecond rather than the whole timeout.
+    let failed = Arc::new(AtomicBool::new(false));
+    let reader_failed = failed.clone();
+    let cap = limits.output_bytes;
+    let reader = std::thread::spawn(move || -> Result<Vec<u8>> {
+        let mut stdout = match stdout {
+            Some(pipe) => pipe,
+            None => return Ok(Vec::new()),
+        };
+        let mut output = Vec::new();
+        let mut buffer = [0u8; 65536];
+        loop {
+            match stdout.read(&mut buffer) {
+                Ok(0) => return Ok(output),
+                Ok(n) => {
+                    if output.len() + n > cap {
+                        reader_failed.store(true, Ordering::Relaxed);
+                        anyhow::bail!("Terminal helper exceeded output limit");
+                    }
+                    output.extend_from_slice(&buffer[..n]);
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(_) => {
+                    reader_failed.store(true, Ordering::Relaxed);
+                    anyhow::bail!("Terminal helper output failed; delivery is unknown");
+                }
+            }
+        }
+    });
+
+    let mut status = None;
+    let mut timed_out = false;
+    loop {
+        match child.try_wait() {
+            Ok(Some(done)) => {
+                status = Some(done);
+                break;
+            }
+            Ok(None) => {}
+            Err(_) => break,
+        }
+        if failed.load(Ordering::Relaxed) || Instant::now() >= deadline {
+            timed_out = !failed.load(Ordering::Relaxed);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    if status.is_none() {
+        // Ends the tree, which closes every pipe handle the helper holds and so
+        // unblocks both threads below.
+        if let Some(job) = &job {
+            let _ = job.terminate();
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    let wrote_all = writer.join().unwrap_or(false);
+    let output = reader
+        .join()
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("Terminal helper output failed; delivery is unknown")))?;
+
+    anyhow::ensure!(!timed_out, "Terminal helper timed out; delivery is unknown");
+    let status =
+        status.ok_or_else(|| anyhow::anyhow!("Terminal helper failed; delivery is unknown"))?;
+    anyhow::ensure!(
+        status.success() && wrote_all,
+        "Terminal helper failed; delivery is unknown"
+    );
+    Ok(output)
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn run_bounded(
     _exe: &Path,
     _args: &[String],
     _input: &[u8],
     _limits: HelperLimits,
 ) -> Result<Vec<u8>> {
-    anyhow::bail!("Bounded tmux helpers are unsupported on this platform")
+    anyhow::bail!("Bounded subprocess helpers are unsupported on this platform")
+}
+
+/// The Windows half of the same contract the Unix tests pin.
+///
+/// Arguments are passed already split rather than as one compound string:
+/// cmd.exe re-parses its own command line, and a test that depends on that
+/// re-parsing tests the quoting, not the runner.
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn cmd() -> &'static Path {
+        Path::new("cmd.exe")
+    }
+
+    fn args(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|p| (*p).to_string()).collect()
+    }
+
+    fn limits(timeout_ms: u64, output_bytes: usize) -> HelperLimits {
+        HelperLimits {
+            timeout: Duration::from_millis(timeout_ms),
+            input_bytes: 0,
+            output_bytes,
+        }
+    }
+
+    #[test]
+    fn a_helper_that_succeeds_returns_its_output() {
+        let out = run_bounded(cmd(), &args(&["/c", "echo", "probe"]), &[], limits(5000, 4096))
+            .expect("cmd.exe echo");
+        assert!(
+            String::from_utf8_lossy(&out).contains("probe"),
+            "{:?}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    #[test]
+    fn output_past_the_declared_budget_is_refused() {
+        let error = run_bounded(cmd(), &args(&["/c", "echo", "probe"]), &[], limits(5000, 2))
+            .unwrap_err();
+        assert!(error.to_string().contains("output limit"), "{error}");
+    }
+
+    #[test]
+    fn input_over_the_declared_budget_never_starts_the_helper() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("must-not-exist");
+        let error = run_bounded(
+            cmd(),
+            &args(&["/c", "copy", "nul", &marker.display().to_string()]),
+            b"x",
+            limits(5000, 4096),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("input limit"), "{error}");
+        assert!(!marker.exists(), "a refused helper must not have run");
+    }
+
+    #[test]
+    fn a_hanging_helper_is_killed_within_the_deadline() {
+        let started = Instant::now();
+        let error = run_bounded(
+            cmd(),
+            &args(&["/c", "ping", "-n", "30", "127.0.0.1"]),
+            &[],
+            limits(200, 65536),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error}");
+        // The real assertion: both pipe threads were joined. If either had been
+        // left blocked, this call would never have returned at all.
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn a_helper_that_never_reads_its_input_still_returns() {
+        // The writer thread blocks once the pipe buffer fills. Killing the tree
+        // is what unblocks it, so this pins the teardown path rather than the
+        // happy path.
+        let started = Instant::now();
+        let error = run_bounded(
+            cmd(),
+            &args(&["/c", "ping", "-n", "30", "127.0.0.1"]),
+            &vec![b'x'; 1024 * 1024],
+            HelperLimits {
+                timeout: Duration::from_millis(200),
+                input_bytes: 1024 * 1024,
+                output_bytes: 65536,
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn a_nonzero_exit_is_a_failure_not_an_empty_success() {
+        let error =
+            run_bounded(cmd(), &args(&["/c", "exit", "1"]), &[], limits(5000, 4096)).unwrap_err();
+        assert!(error.to_string().contains("failed"), "{error}");
+    }
+
+    #[test]
+    fn stdin_reaches_the_helper_and_its_answer_comes_back() {
+        // sort.exe reads to EOF, so this only passes if the writer thread
+        // closed the pipe after writing.
+        let out = run_bounded(
+            cmd(),
+            &args(&["/c", "sort"]),
+            b"b\r\na\r\n",
+            HelperLimits {
+                timeout: Duration::from_secs(5),
+                input_bytes: 64,
+                output_bytes: 4096,
+            },
+        )
+        .expect("sort round trip");
+        let text = String::from_utf8_lossy(&out);
+        let first = text.trim_start();
+        assert!(first.starts_with('a'), "{text:?}");
+    }
+
+    #[test]
+    fn the_git_branch_helper_shape_works_at_all() {
+        // metadata.rs runs exactly this shape through run_bounded, and it was
+        // the casualty nobody connected to the stub: the branch indicator was
+        // dark on Windows because a tmux-named function returned bail!().
+        let out = run_bounded(
+            Path::new("git"),
+            &args(&["--version"]),
+            &[],
+            limits(5000, 4096),
+        );
+        if let Ok(out) = out {
+            assert!(String::from_utf8_lossy(&out).contains("git version"));
+        }
+        // git may legitimately be absent; what must not happen is an
+        // unconditional bail! on the platform.
+    }
 }
 
 #[cfg(all(test, unix))]
