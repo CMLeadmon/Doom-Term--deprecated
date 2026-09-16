@@ -14,6 +14,7 @@ export interface AnsiSpan {
 
 export interface AnsiLine {
   id: string;
+  row?: number;
   spans: AnsiSpan[];
   isError?: boolean;
   timestamp: number;

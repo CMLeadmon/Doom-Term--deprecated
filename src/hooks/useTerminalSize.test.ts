@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { renderHook } from '@testing-library/react';
-import { useTerminalSize } from './useTerminalSize';
+import { useTerminalSize, resetSessionSizes } from './useTerminalSize';
 import { gridSize } from '../core/cellMetrics';
 import { ptyClient } from '../core/ptyClient';
 import { resizeEmulator } from '../core/emulatorRegistry';
@@ -35,6 +35,7 @@ function paneOf(width: number, height: number): HTMLElement {
 }
 
 beforeEach(() => {
+  resetSessionSizes();
   vi.stubGlobal('ResizeObserver', StubResizeObserver);
   // The hook coalesces on a frame; run the callback immediately in tests.
   vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {

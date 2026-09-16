@@ -293,4 +293,63 @@ describe('RawTerminalView', () => {
     w.mockRestore();
     h.mockRestore();
   });
+
+  it('never renders a cursor in an inactive pane', () => {
+    render(
+      <RawTerminalView
+        {...base}
+        isActive={false}
+        cursor={{ row: 0, col: 5 }}
+        lines={[{ id: 'line-0', row: 0, spans: [{ text: 'hello' }], timestamp: 0 }]}
+      />,
+    );
+    expect(screen.queryByTestId('terminal-cursor')).toBeNull();
+  });
+
+  it('renders a cursor when active and focused on the matching buffer row', () => {
+    render(
+      <RawTerminalView
+        {...base}
+        isActive
+        cursor={{ row: 1, col: 3 }}
+        lines={[
+          { id: 'line-0', row: 0, spans: [{ text: 'first' }], timestamp: 0 },
+          { id: 'line-1', row: 1, spans: [{ text: 'second' }], timestamp: 0 },
+        ]}
+      />,
+    );
+    const terminal = screen.getByTestId('raw-terminal');
+    fireEvent.focus(terminal);
+
+    const cursorEl = screen.getByTestId('terminal-cursor');
+    expect(cursorEl).toBeDefined();
+    expect(cursorEl.style.left).toBe('3ch');
+    // Ensure cursor is placed inside line-1
+    const line1 = screen.getByTestId('raw-terminal').querySelector('[data-terminal-line="1"]');
+    expect(line1?.contains(cursorEl)).toBe(true);
+  });
+
+  it('virtualizes large scrollback buffers while maintaining full scroll height', () => {
+    const manyLines = Array.from({ length: 300 }, (_, idx) => ({
+      id: `row-${idx}`,
+      row: idx,
+      spans: [{ text: `output line ${idx}` }],
+      timestamp: idx,
+    }));
+
+    render(
+      <RawTerminalView
+        {...base}
+        isActive
+        sessionId="virtual-test"
+        lines={manyLines}
+      />,
+    );
+
+    const terminal = screen.getByTestId('raw-terminal');
+    const renderedRows = terminal.querySelectorAll('[data-terminal-line]');
+    // Should render a windowed subset, not all 300 rows
+    expect(renderedRows.length).toBeLessThan(300);
+    expect(renderedRows.length).toBeGreaterThan(10);
+  });
 });

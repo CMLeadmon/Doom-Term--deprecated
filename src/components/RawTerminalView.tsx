@@ -54,6 +54,63 @@ export const GUTTER_PX = 16;
 /** Set by the first keystroke, ever. The keymap is a first-run thing. */
 export const KEYMAP_SEEN_KEY = 'DOOM_TERM_KEYMAP_SEEN_V1';
 
+const sessionScrollPositions = new Map<string, number>();
+
+export function resetSessionScrollPositions(): void {
+  sessionScrollPositions.clear();
+}
+
+interface TerminalLineRowProps {
+  line: AnsiLine;
+  index: number;
+  isMarked: boolean;
+  isCursorHere: boolean;
+  cursorCol?: number;
+}
+
+const TerminalLineRow = React.memo(function TerminalLineRow({
+  line,
+  index,
+  isMarked,
+  isCursorHere,
+  cursorCol = 0,
+}: TerminalLineRowProps) {
+  return (
+    <div
+      data-terminal-line={index}
+      className="grid"
+      style={{ gridTemplateColumns: `${GUTTER_PX}px 1fr` }}
+    >
+      <i
+        aria-hidden="true"
+        className="block w-1 h-[13px] mt-[3px]"
+        style={{ background: isMarked && !line.isWrapped ? 'var(--st-live)' : 'transparent' }}
+      />
+      <span className="whitespace-pre relative block">
+        {line.spans.map((span, spanIdx) => (
+          <span key={spanIdx} style={spanStyle(span, line.isError)}>
+            {span.text}
+          </span>
+        ))}
+        {isCursorHere && (
+          <i
+            aria-hidden="true"
+            data-testid="terminal-cursor"
+            className="absolute top-0 pointer-events-none"
+            style={{
+              left: `${cursorCol}ch`,
+              width: '1ch',
+              height: '100%',
+              background: 'var(--st-live)',
+              mixBlendMode: 'difference',
+            }}
+          />
+        )}
+      </span>
+    </div>
+  );
+});
+
 /**
  * Map a keydown to the bytes a PTY expects.
  *
@@ -180,11 +237,17 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
   // Not `agentKey` directly: when the agent exits and the shell returns to the
   // foreground that goes null, and every mark on lines that have not changed
   // would disappear with it. See markingAgent.
-  const marks = turnStarts(lines, markingAgent(sessionId, agentKey));
+  const activeMarkingAgent = markingAgent(sessionId, agentKey);
+  const marks = React.useMemo(
+    () => turnStarts(lines, activeMarkingAgent),
+    [lines, activeMarkingAgent],
+  );
   const quickTargets = React.useMemo(
     () => labelTargets(findQuickTargets(lines.slice(-200))),
     [lines],
   );
+
+  const [scrollTopState, setScrollTopState] = useState(0);
 
   // Take the keyboard as soon as this pane is the active one. A pass-through
   // terminal that is not focused is a terminal you cannot type into, and there
@@ -203,16 +266,20 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
     }
   }, [isActive, quickSelecting]);
 
-  // Follow the tail. useLayoutEffect, not useEffect: after paint the browser has
-  // already shown the new lines at the old offset, which is a visible jump.
+  // Follow the tail or restore scroll position on pane activation. useLayoutEffect,
+  // not useEffect: after paint the browser has already shown the new lines at the
+  // old offset, which is a visible jump / flash of stale scrollback.
   React.useLayoutEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
     if (sessionId) noteTotal(sessionId, lines.length);
-    // Only chase the tail while attached. Snapping a reader back to the bottom
-    // every time the agent emits is what makes reading back impossible.
-    if (!detachedRef.current) el.scrollTop = el.scrollHeight;
-  }, [lines, sessionId]);
+    if (!isActive) return;
+    if (!detachedRef.current) {
+      el.scrollTop = el.scrollHeight;
+    } else if (sessionId && sessionScrollPositions.has(sessionId)) {
+      el.scrollTop = sessionScrollPositions.get(sessionId)!;
+    }
+  }, [lines, sessionId, isActive]);
 
   /**
    * Leaving the tail is what puts the plate into transport mode. Read from a
@@ -233,9 +300,50 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
     }
     userScrollIntentRef.current = false;
     detachedRef.current = !atBottom;
-    if (atBottom) reattach(sessionId);
-    else detach(sessionId, Math.round((el.scrollTop / Math.max(1, el.scrollHeight)) * lines.length));
+    if (atBottom) {
+      reattach(sessionId);
+      sessionScrollPositions.delete(sessionId);
+    } else {
+      detach(sessionId, Math.round((el.scrollTop / Math.max(1, el.scrollHeight)) * lines.length));
+      sessionScrollPositions.set(sessionId, el.scrollTop);
+      setScrollTopState(el.scrollTop);
+    }
   };
+
+  const VIRTUAL_THRESHOLD = 120;
+  const ROW_HEIGHT_PX = 17;
+  const OVERSCAN = 35;
+
+  const { startRow, endRow, topPaddingPx, bottomPaddingPx } = React.useMemo(() => {
+    const count = lines.length;
+    if (count <= VIRTUAL_THRESHOLD) {
+      return { startRow: 0, endRow: count, topPaddingPx: 0, bottomPaddingPx: 0 };
+    }
+
+    const clientH = scrollRef.current?.clientHeight || 800;
+    const visibleCount = Math.ceil(clientH / ROW_HEIGHT_PX);
+
+    if (!detachedRef.current) {
+      const start = Math.max(0, count - visibleCount - OVERSCAN);
+      return {
+        startRow: start,
+        endRow: count,
+        topPaddingPx: start * ROW_HEIGHT_PX,
+        bottomPaddingPx: 0,
+      };
+    }
+
+    const firstVisible = Math.floor(scrollTopState / ROW_HEIGHT_PX);
+    const start = Math.max(0, firstVisible - OVERSCAN);
+    const end = Math.min(count, firstVisible + visibleCount + OVERSCAN);
+
+    return {
+      startRow: start,
+      endRow: end,
+      topPaddingPx: start * ROW_HEIGHT_PX,
+      bottomPaddingPx: (count - end) * ROW_HEIGHT_PX,
+    };
+  }, [lines.length, scrollTopState]);
 
   const copyText = React.useCallback(async (text: string) => {
     try {
@@ -336,13 +444,13 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
       ? stateOf(sessionId).line
       : Math.max(0, lines.length - 1);
     const target = stepTurn(marks, current, viewAction === 'previousTurn' ? -1 : 1);
-    const row = target === null
-      ? undefined
-      : scrollRef.current?.querySelector<HTMLElement>(`[data-terminal-line="${target}"]`);
-    if (target !== null && scrollRef.current && row) {
+    if (target !== null && scrollRef.current) {
       detachedRef.current = true;
       detach(sessionId, target);
-      scrollRef.current.scrollTop = Math.max(0, row.offsetTop - scrollRef.current.clientHeight / 4);
+      const row = scrollRef.current.querySelector<HTMLElement>(`[data-terminal-line="${target}"]`);
+      const offset = row ? row.offsetTop : target * 17;
+      scrollRef.current.scrollTop = Math.max(0, offset - scrollRef.current.clientHeight / 4);
+      setScrollTopState(scrollRef.current.scrollTop);
     }
   }, [copyText, lines, marks, readClipboard, sessionId]);
 
@@ -361,11 +469,11 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
     const st = stateOf(sessionId);
     if (!st.hits) return;
     const el = scrollRef.current;
-    const row = el.children[st.line] as HTMLElement | undefined;
-    if (row) {
-      detachedRef.current = true;
-      el.scrollTop = Math.max(0, row.offsetTop - el.clientHeight / 2);
-    }
+    const row = el.querySelector<HTMLElement>(`[data-terminal-line="${st.line}"]`);
+    detachedRef.current = true;
+    const offset = row ? row.offsetTop : st.line * 17;
+    el.scrollTop = Math.max(0, offset - el.clientHeight / 2);
+    setScrollTopState(el.scrollTop);
   });
 
   // Size from the grid container rather than the outer box. They are nearly the
@@ -548,61 +656,24 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
       >
         {recoveredHistory && <RecoveredHistory cache={recoveryCacheLines}
           cacheTruncated={recoveryCacheTruncated} history={recoveredHistory} />}
-        {lines.map((line, i) => (
-          // No break-all: a TUI's box drawing must not be split mid-frame.
-          <div
-            key={line.id}
-            data-terminal-line={i}
-            className="grid"
-            style={{ gridTemplateColumns: `${GUTTER_PX}px 1fr` }}
-          >
-            {/* Four pixels is the whole feature. No card, no border, no header
-                — you do not need blocks to have boundaries, you need marks. */}
-            <i
-              aria-hidden="true"
-              className="block w-1 h-[13px] mt-[3px]"
-              style={{ background: marks.has(i) && !line.isWrapped ? 'var(--st-live)' : 'transparent' }}
+        {topPaddingPx > 0 && <div style={{ height: `${topPaddingPx}px` }} aria-hidden="true" />}
+        {lines.slice(startRow, endRow).map((line, offset) => {
+          const i = startRow + offset;
+          const isCursorHere = isActive && hasFocus && cursor
+            ? (line.row !== undefined ? cursor.row === line.row : cursor.row === i)
+            : false;
+          return (
+            <TerminalLineRow
+              key={line.id}
+              line={line}
+              index={i}
+              isMarked={marks.has(i)}
+              isCursorHere={isCursorHere}
+              cursorCol={cursor?.col}
             />
-            <span className="whitespace-pre relative block">
-              {line.spans.map((span, spanIdx) => (
-                <span key={spanIdx} style={spanStyle(span, line.isError)}>
-                  {span.text}
-                </span>
-              ))}
-              {/*
-                  The caret.
-
-                  Positioned in `ch` rather than measured pixels: in a monospace
-                  face `1ch` IS the advance width, so the column lands exactly
-                  without a canvas measurement that would have to be redone on
-                  every font or zoom change. Vertically it is anchored inside
-                  its own row, so it cannot drift the way a `row * cellHeight`
-                  offset does once the quantised cell height and the real line
-                  box disagree.
-
-                  Filled when this pane has the keyboard, hollow when it does
-                  not — the convention Ghostty, kitty and WezTerm share, and the
-                  only thing on screen that distinguishes the pane you are
-                  typing into from the three you are not.
-              */}
-              {cursor && cursor.row === i && (
-                <i
-                  aria-hidden="true"
-                  data-testid="terminal-cursor"
-                  className="absolute top-0 pointer-events-none"
-                  style={{
-                    left: `${cursor.col}ch`,
-                    width: '1ch',
-                    height: '100%',
-                    background: hasFocus ? 'var(--st-live)' : 'transparent',
-                    boxShadow: hasFocus ? 'none' : 'inset 0 0 0 1px var(--st-live)',
-                    mixBlendMode: hasFocus ? 'difference' : 'normal',
-                  }}
-                />
-              )}
-            </span>
-          </div>
-        ))}
+          );
+        })}
+        {bottomPaddingPx > 0 && <div style={{ height: `${bottomPaddingPx}px` }} aria-hidden="true" />}
       </div>
 
       {/*
