@@ -279,9 +279,11 @@ pub fn run_bounded(
     }
 
     let wrote_all = writer.join().unwrap_or(false);
-    let output = reader
-        .join()
-        .unwrap_or_else(|_| Err(anyhow::anyhow!("Terminal helper output failed; delivery is unknown")))?;
+    let output = reader.join().unwrap_or_else(|_| {
+        Err(anyhow::anyhow!(
+            "Terminal helper output failed; delivery is unknown"
+        ))
+    })?;
 
     anyhow::ensure!(!timed_out, "Terminal helper timed out; delivery is unknown");
     let status =
@@ -331,8 +333,13 @@ mod windows_tests {
 
     #[test]
     fn a_helper_that_succeeds_returns_its_output() {
-        let out = run_bounded(cmd(), &args(&["/c", "echo", "probe"]), &[], limits(5000, 4096))
-            .expect("cmd.exe echo");
+        let out = run_bounded(
+            cmd(),
+            &args(&["/c", "echo", "probe"]),
+            &[],
+            limits(5000, 4096),
+        )
+        .expect("cmd.exe echo");
         assert!(
             String::from_utf8_lossy(&out).contains("probe"),
             "{:?}",
@@ -342,8 +349,8 @@ mod windows_tests {
 
     #[test]
     fn output_past_the_declared_budget_is_refused() {
-        let error = run_bounded(cmd(), &args(&["/c", "echo", "probe"]), &[], limits(5000, 2))
-            .unwrap_err();
+        let error =
+            run_bounded(cmd(), &args(&["/c", "echo", "probe"]), &[], limits(5000, 2)).unwrap_err();
         assert!(error.to_string().contains("output limit"), "{error}");
     }
 
@@ -375,7 +382,11 @@ mod windows_tests {
         assert!(error.to_string().contains("timed out"), "{error}");
         // The real assertion: both pipe threads were joined. If either had been
         // left blocked, this call would never have returned at all.
-        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
@@ -396,7 +407,11 @@ mod windows_tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("timed out"), "{error}");
-        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

@@ -5,6 +5,15 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { runInstaller } from './install.mjs';
+// The fixtures below are POSIX shell scripts and /usr/bin symlinks. What they
+// pin is platform-independent; the way they pin it is not, and translating a
+// `sh` fixture into `cmd` would test the translation. Linux CI is the gate for
+// this behaviour — these are skipped on Windows, not quietly passing there.
+const posixFixture =
+  process.platform === 'win32'
+    ? { skip: 'POSIX shell fixture; covered by the Linux CI job' }
+    : {};
+
 
 function fixture(t) {
   const root = mkdtempSync(join(tmpdir(), "doom-hook-test's-"));
@@ -56,7 +65,7 @@ test('install is additive and idempotent; removal preserves foreign and empty ma
   assert.deepEqual(JSON.parse(readFileSync(`${claude}.doom-term-backup`, 'utf8')), original);
 });
 
-test('installed command quotes a configuration root containing shell punctuation', t => {
+test('installed command quotes a configuration root containing shell punctuation', posixFixture, t => {
   const { root, claude } = fixture(t);
   writeFileSync(claude, '{}');
   runInstaller({ root });

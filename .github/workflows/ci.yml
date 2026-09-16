@@ -7,9 +7,40 @@ on:
     branches: [ main ]
 
 jobs:
-  test:
-    name: Test & Build
+  lint:
+    name: Format & lint
     runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      # Clippy is a ratchet: the lints that predate its adoption are allowed by
+      # name in the workspace Cargo.toml, so everything else is denied and new
+      # code cannot add to that list without someone deciding to.
+      - name: Lint
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+  test:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Windows is a supported platform, not a tolerated one. A failure there
+      # must be visible without taking the reference platform down with it.
+      fail-fast: false
+      matrix:
+        include:
+          - label: Linux (reference platform)
+            os: ubuntu-latest
+          - label: Windows
+            os: windows-latest
 
     steps:
       - name: Checkout repository
@@ -24,8 +55,18 @@ jobs:
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+          workspaces: |
+            .
+            src-tauri
+
       - name: Install dependencies
         run: npm ci
+
+      # ── Portable gate. Everything below this line runs on both platforms. ──
 
       - name: Run Node test runner & Vitest suite
         run: npm test
@@ -33,10 +74,42 @@ jobs:
       - name: Typecheck and build frontend
         run: npm run build
 
+      # Pure-JS pixel maths over node:zlib, with no native canvas and no OS font
+      # rasterisation, so the plate must come out byte-identical on both. If it
+      # ever does not, that is a real finding rather than a platform excuse.
       - name: Compare HUD pixels with the reference
         run: npm run hud:check
 
+      # ── Windows. ──────────────────────────────────────────────────────────
+
+      # The PTY crate is where every Windows-specific implementation lives: the
+      # process-tree foreground witness, the job object, the bounded subprocess
+      # runner, and a ConPTY test that drives a real pseudoconsole end to end.
+      #
+      # `--all-targets` is not decoration. Plain `cargo check` skips test code,
+      # and every Windows break found while writing this was IN a test: an
+      # ungated std::os::unix import, and POSIX fixture programs in tests that
+      # were never gated either.
+      - name: Check the whole workspace for this platform
+        if: runner.os == 'Windows'
+        run: cargo check --locked --all-targets
+
+      - name: Run PTY tests
+        if: runner.os == 'Windows'
+        run: cargo test --locked -p doom-term-pty
+
+      # The backend's own suite is not run here yet. Two of its tests
+      # (telemetry_tests, security_tests) drive $HOME and bwrap-isolated
+      # profile mounts and are Linux-shaped in substance, not merely in
+      # fixture. The backend's Windows-relevant logic — home_dir precedence,
+      # the hostname fallback, the idle watch — is unit-tested on Linux, and
+      # the step above proves the whole workspace compiles here. Extending the
+      # suite is tracked separately rather than guessed at.
+
+      # ── Linux, the reference platform. ────────────────────────────────────
+
       - name: Install browser and PTY test dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y vim-tiny bubblewrap libevent-dev libncurses-dev bison pkg-config
@@ -45,6 +118,7 @@ jobs:
       # Ubuntu's packaged tmux predates bracket_paste_flag (3.7). Pin the
       # tested release and verify GitHub's published asset digest before build.
       - name: Install child-paste-capable tmux
+        if: runner.os == 'Linux'
         run: |
           DOOM_TMUX_BUILD="$(mktemp -d)"
           curl --fail --location --retry 3 --max-time 120 \
@@ -62,6 +136,7 @@ jobs:
           echo "$DOOM_TMUX_BUILD/install/bin" >> "$GITHUB_PATH"
 
       - name: Run PTY and backend tests
+        if: runner.os == 'Linux'
         run: |
           # The telemetry fixture needs private profile/PID/network namespaces.
           # Ubuntu restricts unprofiled userns capabilities. Grant only the
@@ -71,12 +146,14 @@ jobs:
           cargo test --locked
 
       - name: Exercise the browser with an isolated PTY daemon
+        if: runner.os == 'Linux'
         run: npm run test:ui
 
       # Doom Term is a desktop app first, so the shell that ships it has to
       # build. It was never checked here, and had drifted far enough that its
       # declared icons did not exist.
       - name: Install Tauri system dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -84,7 +161,9 @@ jobs:
             librsvg2-dev libayatana-appindicator3-dev
 
       - name: Build the sidecar the desktop shell bundles
+        if: runner.os == 'Linux'
         run: npm run sidecar
 
       - name: Check Tauri shell compilation
+        if: runner.os == 'Linux'
         run: cargo check --locked --manifest-path src-tauri/Cargo.toml --all-targets

@@ -493,7 +493,10 @@ mod tests {
         let script = powershell_integration_script();
         assert!(script.contains("133;A"), "prompt start");
         assert!(script.contains("133;B"), "command start");
-        assert!(script.contains("133;D;$code"), "execution end with exit code");
+        assert!(
+            script.contains("133;D;$code"),
+            "execution end with exit code"
+        );
         assert!(
             script.contains("133;C"),
             "execution start, via the PSReadLine handler"
@@ -512,7 +515,10 @@ mod tests {
     #[test]
     fn powershell_integration_keeps_the_users_own_profile_and_prompt() {
         let script = powershell_integration_script();
-        assert!(script.contains("$PROFILE"), "must source the user's profile");
+        assert!(
+            script.contains("$PROFILE"),
+            "must source the user's profile"
+        );
         assert!(
             script.contains("__DoomTermInnerPrompt"),
             "must call through to whatever prompt was already installed"
@@ -527,6 +533,9 @@ mod tests {
             "without -NoExit the shell would run the script and quit: {:?}",
             launch.args
         );
-        assert_eq!(launch.args.iter().rev().nth(1).map(String::as_str), Some("-File"));
+        assert_eq!(
+            launch.args.iter().rev().nth(1).map(String::as_str),
+            Some("-File")
+        );
     }
 }

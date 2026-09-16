@@ -25,3 +25,6 @@ tempfile = "3.27"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["signal", "process", "term"] }
+
+[lints]
+workspace = true

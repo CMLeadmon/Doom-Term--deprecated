@@ -14,11 +14,21 @@
  * ordinary progress lines like `Compiling pkg-config v0.3.34`.
  */
 const ENVIRONMENT_MARKERS = [
+  // Linux: pkg-config cannot find a system development package.
   'was not found in the pkg-config search path',
   'could not find system library',
   'required by crate',
   'pkg-config exited with status code',
   'No package',
+  // Windows: nothing here says "pkg-config", so a missing toolchain read as a
+  // hard FAIL — the exact permissive-direction error this file exists to
+  // prevent, just pointed the other way. A runner without the MSVC build tools
+  // or the WebView2 SDK is a blocked environment, not a broken crate.
+  'failed to find tool',
+  'linker `link.exe` not found',
+  'Microsoft Visual Studio',
+  'MSVC build tools',
+  'WebView2',
 ];
 
 /**
@@ -37,6 +47,8 @@ export function classifyCargoFailure(status, output) {
   const reason =
     lines.find((line) => line.includes('The system library')) ??
     lines.find((line) => line.includes('was not found in the pkg-config search path')) ??
+    lines.find((line) => line.includes('failed to find tool')) ??
+    lines.find((line) => line.includes('linker `link.exe` not found')) ??
     lines.find((line) => ENVIRONMENT_MARKERS.some((marker) => line.includes(marker)));
 
   return { kind: 'blocked', reason };

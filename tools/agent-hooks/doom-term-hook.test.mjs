@@ -9,6 +9,15 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const script = fileURLToPath(new URL('./doom-term-hook.sh', import.meta.url));
+// The fixtures below are POSIX shell scripts and /usr/bin symlinks. What they
+// pin is platform-independent; the way they pin it is not, and translating a
+// `sh` fixture into `cmd` would test the translation. Linux CI is the gate for
+// this behaviour — these are skipped on Windows, not quietly passing there.
+const posixFixture =
+  process.platform === 'win32'
+    ? { skip: 'POSIX shell fixture; covered by the Linux CI job' }
+    : {};
+
 
 async function fixture(t) {
   const requests = [];
@@ -46,7 +55,7 @@ async function run(t, port, payload, { open = false, env = {} } = {}) {
   } finally { clearTimeout(timer); }
 }
 
-test('hook deadline includes stdin that never closes', { timeout: 8000 }, async t => {
+test('hook deadline includes stdin that never closes', { ...posixFixture, timeout: 8000 }, async t => {
   const { port, requests } = await fixture(t);
   const result = await run(t, port, '{"event":"Stop"}', { open: true });
   assert.equal(result.forcedEof, false, 'hook waited for EOF beyond its two-second budget');
@@ -55,7 +64,7 @@ test('hook deadline includes stdin that never closes', { timeout: 8000 }, async 
   assert.equal(requests.length, 0, 'an incomplete input stream must not post a partial event');
 });
 
-test('hook preserves the complete payload and exact pane header', async t => {
+test('hook preserves the complete payload and exact pane header', posixFixture, async t => {
   const { port, requests } = await fixture(t);
   const payload = '{"event":"Stop","cwd":"/fixture/中文"}\n\n';
   const result = await run(t, port, payload, { env: { DOOM_TERM_INCARNATION: 'a'.repeat(32) } });
@@ -68,14 +77,14 @@ test('hook preserves the complete payload and exact pane header', async t => {
   assert.equal(requests[0].url, '/hook/claude');
 });
 
-test('oversized hook payloads are dropped without posting a truncated event', async t => {
+test('oversized hook payloads are dropped without posting a truncated event', posixFixture, async t => {
   const { port, requests } = await fixture(t);
   const result = await run(t, port, JSON.stringify({ event: 'Stop', padding: 'x'.repeat(70000) }));
   assert.equal(result.code, 0);
   assert.equal(requests.length, 0);
 });
 
-test('without a deadline utility the hook returns without reading stdin or posting', async t => {
+test('without a deadline utility the hook returns without reading stdin or posting', posixFixture, async t => {
   const { port, requests } = await fixture(t);
   const path = mkdtempSync(join(tmpdir(), 'doom-hook-path-'));
   t.after(() => rmSync(path, { recursive: true, force: true }));
@@ -86,7 +95,7 @@ test('without a deadline utility the hook returns without reading stdin or posti
   assert.equal(requests.length, 0);
 });
 
-test('loopback hooks cannot be redirected through an inherited HTTP proxy', async t => {
+test('loopback hooks cannot be redirected through an inherited HTTP proxy', posixFixture, async t => {
   const target = await fixture(t);
   const proxy = await fixture(t);
   const result = await run(t, target.port, '{"event":"Stop"}', {
@@ -97,7 +106,7 @@ test('loopback hooks cannot be redirected through an inherited HTTP proxy', asyn
   assert.equal(proxy.requests.length, 0, 'hook payloads must not leave the loopback trust boundary');
 });
 
-test('user curl configuration cannot add another hook destination', async t => {
+test('user curl configuration cannot add another hook destination', posixFixture, async t => {
   const target = await fixture(t);
   const extra = await fixture(t);
   const root = mkdtempSync(join(tmpdir(), 'doom-hook-curl-'));
