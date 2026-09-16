@@ -1,6 +1,10 @@
 use super::*;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
+// Drives a real PTY through a POSIX fixture (/bin/cat, /bin/false, a #!/bin/sh
+// script). The behaviour is platform-independent; the fixture is not.
+#[cfg(unix)]
 #[test]
 fn a_display_client_exit_does_not_close_the_surviving_pane() {
     if std::env::var_os("DOOM_DISPLAY_EXIT_TEST_CHILD").is_none() {
@@ -54,6 +58,9 @@ fn a_display_client_exit_does_not_close_the_surviving_pane() {
     session.kill().unwrap();
 }
 
+// Drives a real PTY through a POSIX fixture (/bin/cat, /bin/false, a #!/bin/sh
+// script). The behaviour is platform-independent; the fixture is not.
+#[cfg(unix)]
 #[test]
 fn a_natural_durable_pane_exit_is_observed_as_process_closure() {
     if std::env::var_os("DOOM_DURABLE_EXIT_TEST_CHILD").is_none() {
@@ -124,6 +131,9 @@ fn a_natural_durable_pane_exit_is_observed_as_process_closure() {
     );
 }
 
+// Drives a real PTY through a POSIX fixture (/bin/cat, /bin/false, a #!/bin/sh
+// script). The behaviour is platform-independent; the fixture is not.
+#[cfg(unix)]
 #[test]
 fn a_reaped_direct_handle_cannot_signal_a_reused_numeric_pid() {
     if std::env::var_os("DOOM_DIRECT_KILL_TEST_CHILD").is_none() {
@@ -194,11 +204,29 @@ fn augmented_path_prepends_user_bins_when_missing() {
     // this test used to point HOME at `/custom/user` for as long as it ran, and
     // every PTY a concurrently running test spawned inherited that as its
     // working directory and failed to start. See `augment_path`.
-    let aug = augment_path("/custom/user", "/usr/bin:/bin").unwrap();
-    assert!(aug.starts_with("/custom/user/.local/bin:/custom/user/.doom-term/bin:/usr/bin:/bin"));
+    //
+    // The expectation is built with the platform's own separator rather than
+    // written out with ':' — the previous literal was the bug, not the test.
+    let home = std::path::Path::new(if cfg!(windows) {
+        r"C:\custom\user"
+    } else {
+        "/custom/user"
+    });
+    let existing = if cfg!(windows) {
+        std::path::PathBuf::from(r"C:\Windows\System32")
+    } else {
+        std::path::PathBuf::from("/usr/bin")
+    };
+    let current = std::env::join_paths([existing.clone()]).unwrap();
 
-    // When already in PATH, returns None
-    assert!(augment_path("/custom/user", &aug).is_none());
+    let aug = augment_path(home, &current).unwrap();
+    let parts: Vec<std::path::PathBuf> = std::env::split_paths(&aug).collect();
+    assert_eq!(parts[0], home.join(".local").join("bin"));
+    assert_eq!(parts[1], home.join(".doom-term").join("bin"));
+    assert!(parts.contains(&existing), "{parts:?}");
+
+    // Already present: nothing to prepend, so nothing is claimed.
+    assert!(augment_path(home, std::ffi::OsStr::new(&aug)).is_none());
 }
 
 #[test]
@@ -214,13 +242,10 @@ fn the_working_directory_is_anchored_somewhere_that_outlives_the_app() {
      *
      * The choice is tested, not the chdir: see the note on the function.
      */
-    let home = std::path::Path::new("/home/u");
+    let home = std::path::Path::new(if cfg!(windows) { r"C:\Users\u" } else { "/home/u" });
     assert_eq!(
         anchor_candidates(Some(home)),
-        vec![
-            std::path::PathBuf::from("/home/u"),
-            std::path::PathBuf::from("/"),
-        ]
+        vec![home.to_path_buf(), std::path::PathBuf::from("/")]
     );
 }
 

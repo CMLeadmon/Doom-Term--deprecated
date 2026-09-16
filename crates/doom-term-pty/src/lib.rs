@@ -22,4 +22,4 @@ pub use demuxer::{DemuxEvent, StreamDemuxer};
 pub use foreground::{
     classify_agent, detect_isolation, detect_worktree, foreground_command, AgentIdentity,
 };
-pub use session::{anchor_working_directory, expand_path, PtySession, SessionInfo};
+pub use session::{anchor_working_directory, expand_path, home_dir, PtySession, SessionInfo};

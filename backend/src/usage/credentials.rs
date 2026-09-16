@@ -7,11 +7,14 @@
 
 use std::path::PathBuf;
 
-/// `~/.claude/.credentials.json`, or None when `$HOME` is unset.
+/// `~/.claude/.credentials.json`, or None when there is no home directory.
+///
+/// Asks `pty::home_dir` rather than `$HOME` directly: on Windows the variable
+/// is `USERPROFILE`, and reading only `HOME` meant the Claude token was never
+/// found there — which surfaces as USAGE % stuck at `--` with no error.
 pub fn credentials_path() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok().filter(|h| !h.is_empty())?;
     Some(
-        PathBuf::from(home)
+        doom_term_pty::home_dir()?
             .join(".claude")
             .join(".credentials.json"),
     )

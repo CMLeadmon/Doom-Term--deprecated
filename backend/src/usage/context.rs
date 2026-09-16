@@ -243,8 +243,7 @@ pub fn transcripts_for(
 /// Where Claude Code keeps its transcripts.
 #[cfg(test)]
 fn transcript_root() -> Option<std::path::PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(std::path::PathBuf::from(home).join(".claude/projects"))
+    Some(doom_term_pty::home_dir()?.join(".claude").join("projects"))
 }
 
 /// What the plate can say about a session's context.

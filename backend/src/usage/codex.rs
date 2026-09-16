@@ -94,8 +94,7 @@ fn recorded_cwd(path: &std::path::Path) -> Option<String> {
 /// per-project directories, so the walk is by depth rather than by name.
 #[cfg(test)]
 fn sessions_root() -> Option<std::path::PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(std::path::PathBuf::from(home).join(".codex/sessions"))
+    Some(doom_term_pty::home_dir()?.join(".codex").join("sessions"))
 }
 
 /// Every recently-written rollout recorded in `cwd`, newest first.

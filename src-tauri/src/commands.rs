@@ -29,8 +29,8 @@ pub async fn browse_directory(path: Option<String>) -> Result<DirectoryListing, 
     let target_path = expand_path(&target_str);
     let dir = if target_path.exists() && target_path.is_dir() {
         target_path
-    } else if let Ok(home) = std::env::var("HOME") {
-        std::path::PathBuf::from(home)
+    } else if let Some(home) = doom_term_pty::home_dir() {
+        home
     } else {
         std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"))
     };

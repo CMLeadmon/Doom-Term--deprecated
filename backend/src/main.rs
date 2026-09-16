@@ -187,9 +187,8 @@ const CLI_ARTIFACT_SCRIPT: &str = include_str!("../../tools/agent-hooks/doom-ter
 const HOOK_SCRIPT: &str = include_str!("../../tools/agent-hooks/doom-term-hook.sh");
 
 fn provision_cli_tools() {
-    let home = match std::env::var("HOME") {
-        Ok(h) if !h.is_empty() => std::path::PathBuf::from(h),
-        _ => return,
+    let Some(home) = pty::home_dir() else {
+        return;
     };
 
     let targets = [
