@@ -128,7 +128,7 @@ tests its bash/zsh output as text), plus a `shell_name()` case for
 
 ---
 
-## Stage 6 — Bundle Microsoft's ConPTY
+## Stage 6 — Bundle Microsoft's ConPTY *(DEFERRED — see below)*
 
 **New**: `tools/build-conpty-sidecar.mjs` — fetch the
 `Microsoft.Windows.Console.ConPTY` NuGet package, verify against a pinned
@@ -147,6 +147,41 @@ it, and the old one should stop doing it.
 **Verify**: checksum match in CI; `list_files` on the built bundle shows both
 files beside `doom-term-server.exe`. Whether the sideload actually changes VT
 behaviour is a runtime fact — see "Honest limits".
+
+### Why this is deferred
+
+`portable-pty` resolves the sideload with `ConPtyFuncs::open(Path::new("conpty.dll"))`
+— a bare name, so the OS loader finds it only in the directory of the running
+executable. Tauri places `bundle.resources` under `$INSTDIR\resources\`; the
+map form appears to redirect to the `$RESOURCE` root, which on Windows is the
+executable's own directory, but that is inference from two partially
+conflicting sources and cannot be tested from a Linux host.
+
+The failure mode decides it. A misplaced DLL does not error — `open` fails,
+`load_conpty` falls back to `kernel32`, and everything behaves exactly as it
+does today. We would ship a megabyte of third-party binary, a pinned-hash
+network fetch to maintain and a license obligation, in exchange for a benefit
+that may silently not exist. That is worse than not shipping it.
+
+The user-visible cost of deferring is bounded and honest: on Windows builds
+older than the 1.22 ConPTY rewrite, a child's `ESC[?2004h` may not reach the
+demuxer, so **multiline** paste is refused. Single-line paste is unaffected,
+and a refusal is Axiom 3 behaving correctly rather than a corruption.
+
+### How to do it properly, when it is done
+
+Do not depend on Tauri's placement at all. Windows resolves a bare module name
+to an already-loaded module, so the daemon can preload the DLL by absolute path
+before `portable-pty`'s `lazy_static` ever runs:
+
+1. `sidecar_dir()` already computes the daemon's own directory. Search it, and
+   the `resources/` subdirectory beside it, for `conpty.dll`.
+2. `LoadLibraryW` on the absolute path that exists.
+3. `portable-pty`'s later `open("conpty.dll")` then resolves to that module.
+4. Log which ConPTY was loaded, so the answer is observable rather than assumed.
+
+That makes placement irrelevant, the outcome verifiable, and the fallback
+explicit. Tracked as an issue rather than guessed at here.
 
 ---
 
