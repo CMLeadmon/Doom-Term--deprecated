@@ -62,7 +62,7 @@ function lastInkedColumn(line: IBufferLine, probe: IBufferCell): number {
   return -1;
 }
 
-function lineToAnsi(line: IBufferLine, id: string, probe: IBufferCell): AnsiLine {
+function lineToAnsi(line: IBufferLine, id: string, probe: IBufferCell, row?: number): AnsiLine {
   const spans: AnsiSpan[] = [];
   let run: Attr | null = null;
   let text = '';
@@ -93,7 +93,7 @@ function lineToAnsi(line: IBufferLine, id: string, probe: IBufferCell): AnsiLine
   const plain = spans.map((s) => s.text).join('');
   if (spans.length === 0) spans.push({ text: ' ' });
 
-  return { id, spans, isError: looksLikeError(plain), timestamp: Date.now(), isWrapped: !!line.isWrapped };
+  return { id, row, spans, isError: looksLikeError(plain), timestamp: Date.now(), isWrapped: !!line.isWrapped };
 }
 
 /**
@@ -131,7 +131,7 @@ export function linesFrom(buffer: IBuffer, startLine: number): AnsiLine[] {
   for (let y = from; y <= to; y++) {
     const line = buffer.getLine(y);
     if (!line) continue;
-    out.push(lineToAnsi(line, `row-${y}`, probe));
+    out.push(lineToAnsi(line, `row-${y}`, probe, y));
   }
   return out;
 }

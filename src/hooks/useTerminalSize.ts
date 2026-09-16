@@ -18,6 +18,16 @@ import { ptyClient } from '../core/ptyClient';
  * shell is told it has columns it cannot reach and wraps early, which looks
  * exactly like an emulator bug and is not one.
  */
+const sessionGeometryCache = new Map<string, GridSize>();
+
+export function resetSessionSizes(): void {
+  sessionGeometryCache.clear();
+}
+
+export function forgetSessionSize(sessionId: string): void {
+  sessionGeometryCache.delete(sessionId);
+}
+
 export function useTerminalSize(
   ref: React.RefObject<HTMLElement | null>,
   sessionId: string | null,
@@ -29,7 +39,7 @@ export function useTerminalSize(
     const el = ref.current;
     if (!el || !sessionId) return;
 
-    last.current = null;
+    last.current = sessionGeometryCache.get(sessionId) ?? null;
     let frame = 0;
     let scheduled = false;
 
@@ -55,6 +65,7 @@ export function useTerminalSize(
         return;
       }
       last.current = next;
+      sessionGeometryCache.set(sessionId, next);
       // Desired geometry is coalesced while offline/catching up. Only an
       // ordered Resize record may reflow the live parser.
       ptyClient.resizeSession(sessionId, next.cols, next.rows);
