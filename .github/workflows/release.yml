@@ -32,8 +32,13 @@ jobs:
             os: macos-14
             target: aarch64-apple-darwin
             tolerated: false
+          # Cross-compiled FROM Apple Silicon, deliberately. A dedicated
+          # macos-13 runner sat queued for 20 minutes without ever starting —
+          # GitHub's Intel macOS capacity is effectively gone. Xcode on an arm64
+          # runner ships the x86_64 SDK, so the Intel slice builds here instead,
+          # and the sidecar script already handles `--target` cross-compilation.
           - label: macOS (Intel)
-            os: macos-13
+            os: macos-14
             target: x86_64-apple-darwin
             tolerated: false
           - label: Windows (x86_64) — degraded, see release notes
