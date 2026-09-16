@@ -17,9 +17,11 @@ jobs:
   bundle:
     name: ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
-    # Windows has never compiled here. Let it fail on its own without taking
-    # the platforms that do work down with it, and without cancelling siblings.
-    continue-on-error: ${{ matrix.tolerated }}
+    # Every target here is required. Windows was tolerated while it was
+    # unproven; run 35125159582 built and bundled it on the first attempt, and
+    # v0.1.0 ships its .msi and -setup.exe. A target that has succeeded must not
+    # be allowed to fail quietly — `fail-fast: false` already keeps one failure
+    # from cancelling its siblings, which is the part that was actually wanted.
     strategy:
       fail-fast: false
       matrix:
@@ -27,11 +29,9 @@ jobs:
           - label: Linux (x86_64)
             os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            tolerated: false
           - label: macOS (Apple Silicon)
             os: macos-14
             target: aarch64-apple-darwin
-            tolerated: false
           # Cross-compiled FROM Apple Silicon, deliberately. A dedicated
           # macos-13 runner sat queued for 20 minutes without ever starting —
           # GitHub's Intel macOS capacity is effectively gone. Xcode on an arm64
@@ -40,11 +40,9 @@ jobs:
           - label: macOS (Intel)
             os: macos-14
             target: x86_64-apple-darwin
-            tolerated: false
-          - label: Windows (x86_64) — degraded, see release notes
+          - label: Windows (x86_64)
             os: windows-latest
             target: x86_64-pc-windows-msvc
-            tolerated: true
 
     steps:
       - name: Checkout repository
