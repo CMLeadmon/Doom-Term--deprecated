@@ -1,5 +1,5 @@
 import { useEffect, useRef } from 'react';
-import { gridSize, measureCell, type GridSize } from '../core/cellMetrics';
+import { gridSize, measureCell, tracking, type GridSize } from '../core/cellMetrics';
 import { ptyClient } from '../core/ptyClient';
 
 /**
@@ -63,6 +63,10 @@ export function useTerminalSize(
       // CSS `ch` measures the first fallback font's zero glyph, which can differ
       // from the fallback that actually renders the terminal text.
       el.style.setProperty('--terminal-cell-width', `${cell.width}px`);
+      // ...and the TEXT is pulled onto that same integer metric, because the
+      // browser would otherwise advance every glyph by the font's fractional
+      // advance and walk out from under the caret. See `tracking`.
+      el.style.setProperty('--terminal-tracking', `${tracking(cell, cell.advance)}px`);
       const next = gridSize(usable, usableHeight, cell);
       // A no-op resize is not free: each one is a SIGWINCH, and a running agent
       // answers it by redrawing its whole frame. Only report real changes.

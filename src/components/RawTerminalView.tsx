@@ -56,6 +56,18 @@ export const KEYMAP_SEEN_KEY = 'DOOM_TERM_KEYMAP_SEEN_V1';
 
 const sessionScrollPositions = new Map<string, number>();
 
+/**
+ * How long a scroll gesture keeps the follow-write out of its own way.
+ *
+ * A `scroll` event is dispatched asynchronously, but a running agent re-renders
+ * this view every frame, so the follow effect routinely landed in the gap
+ * between the gesture and the event it produces. Touch and scrollbar drags
+ * cannot say which way they are going the way a wheel can, so they get a window
+ * instead — bounded, because a gesture that never moves anything must not stop
+ * the terminal following its own output forever.
+ */
+const SCROLL_INTENT_MS = 400;
+
 export function resetSessionScrollPositions(): void {
   sessionScrollPositions.clear();
 }
@@ -161,6 +173,17 @@ export function keyToBytes(e: {
     if (c === ']') return '\x1d';
   }
 
+  // Shift+Enter is "newline, do not submit" — the key every agent composer
+  // wants and the reason Claude Code otherwise makes you type a backslash
+  // before Enter. ESC CR is not a guess: it is the sequence Claude Code's own
+  // `/terminal-setup` writes into iTerm2, VS Code, Alacritty and Zed for this
+  // key, so an agent that understands Shift+Enter at all understands this.
+  // Alt+Enter is the same bytes because that is literally what Alt means here,
+  // and Enter was the one named key whose ESC prefix was being dropped.
+  if (e.key === 'Enter' && (e.shiftKey || e.altKey) && !e.ctrlKey && !e.metaKey) {
+    return '\x1b\r';
+  }
+
   if (NAMED[e.key] !== undefined) {
     // Shift+Tab is the back-tab an agent's field navigation listens for.
     if (e.key === 'Tab' && e.shiftKey) return '\x1b[Z';
@@ -204,7 +227,16 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
   const scrollRef = useRef<HTMLDivElement>(null);
   const [hasFocus, setHasFocus] = useState(false);
   const detachedRef = useRef(sessionId ? stateOf(sessionId).detached : false);
-  const userScrollIntentRef = useRef(false);
+  const scrollIntentAtRef = useRef(Number.NEGATIVE_INFINITY);
+  /**
+   * The absolute buffer row this pane's window started at last frame, and whose
+   * session it belongs to. See the trim compensation in the follow effect; row
+   * numbers from another session's buffer would describe nothing.
+   */
+  const firstRowRef = useRef<{ session: string | null; row: number | null }>({
+    session: sessionId,
+    row: null,
+  });
   /**
    * Search entry is a keyboard MODE, not a text box.
    *
@@ -271,19 +303,72 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
     }
   }, [isActive, quickSelecting]);
 
-  // Follow the tail or restore scroll position on pane activation. useLayoutEffect,
-  // not useEffect: after paint the browser has already shown the new lines at the
-  // old offset, which is a visible jump / flash of stale scrollback.
+  /** Is a scroll gesture still in flight? See SCROLL_INTENT_MS. */
+  const gesturing = () => performance.now() - scrollIntentAtRef.current < SCROLL_INTENT_MS;
+  const noteGesture = () => {
+    scrollIntentAtRef.current = performance.now();
+  };
+
+  /**
+   * Leave follow mode NOW, rather than when the scroll event eventually lands.
+   *
+   * The wheel is the one gesture that states its direction up front, and up is
+   * unambiguously "stop following". Doing it here rather than in the scroll
+   * handler is the whole fix for scrolling back through a running agent: the
+   * follow effect below can otherwise run first and put the reader straight
+   * back at the bottom.
+   */
+  const leaveTail = () => {
+    noteGesture();
+    if (detachedRef.current || !sessionId) return;
+    detachedRef.current = true;
+    // The line is approximate — the wheel fires before the browser has moved
+    // anything — and the scroll event corrects it a moment later. No offset is
+    // remembered here for the same reason: it would still read as the tail, and
+    // the follow effect would restore the reader to the bottom they just left.
+    const el = scrollRef.current;
+    const offset = el ? el.scrollTop / Math.max(1, el.scrollHeight) : 0;
+    detach(sessionId, Math.round(offset * lines.length));
+  };
+
+  // Follow the tail as output arrives. useLayoutEffect, not useEffect: after
+  // paint the browser has already shown the new lines at the old offset, which
+  // is a visible jump / flash of stale scrollback.
+  //
+  // Deliberately NOT keyed on `isActive`. Panes stay mounted, so the browser
+  // has kept the offset of the one you are switching to; re-running this on
+  // activation threw that away and reached for the newest output, which is the
+  // jump that made every switch look like a glitch.
   React.useLayoutEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
     if (sessionId) noteTotal(sessionId, lines.length);
+
+    // Scrollback trimming deletes rows from the TOP of the buffer, so every row
+    // below slides up by exactly that many line boxes. A detached reader is
+    // pinned to a pixel offset, so without this the text they are reading
+    // crawls away for as long as the agent keeps writing. The absolute buffer
+    // row rides on every line, so the count is measured, never guessed.
+    const firstRow = lines.length ? lines[0].row : undefined;
+    const previous = firstRowRef.current;
+    const previousFirstRow = previous.session === sessionId ? previous.row : null;
+    firstRowRef.current = { session: sessionId, row: firstRow ?? null };
+    if (detachedRef.current && sessionId && firstRow !== undefined && previousFirstRow !== null) {
+      const trimmed = firstRow - previousFirstRow;
+      const rowHeight = el.querySelector<HTMLElement>('[data-terminal-line]')?.offsetHeight ?? 0;
+      const saved = sessionScrollPositions.get(sessionId);
+      if (trimmed > 0 && rowHeight > 0 && saved !== undefined) {
+        sessionScrollPositions.set(sessionId, Math.max(0, saved - trimmed * rowHeight));
+      }
+    }
+
     if (!detachedRef.current) {
-      el.scrollTop = el.scrollHeight;
+      // A gesture in flight owns the viewport until its scroll event arrives.
+      if (!gesturing()) el.scrollTop = el.scrollHeight;
     } else if (sessionId && sessionScrollPositions.has(sessionId)) {
       el.scrollTop = sessionScrollPositions.get(sessionId)!;
     }
-  }, [lines, sessionId, isActive]);
+  }, [lines, sessionId]);
 
   /**
    * Leaving the tail is what puts the plate into transport mode. Read from a
@@ -297,12 +382,12 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
     // Resize/reconstruction can clamp scrollTop and emit a native scroll event
     // even though the reader never left follow mode. Treat detachment as user
     // intent, not as an incidental layout coordinate.
-    if (!atBottom && !detachedRef.current && !userScrollIntentRef.current) {
+    if (!atBottom && !detachedRef.current && !gesturing()) {
       el.scrollTop = el.scrollHeight;
       reattach(sessionId);
       return;
     }
-    userScrollIntentRef.current = false;
+    scrollIntentAtRef.current = Number.NEGATIVE_INFINITY;
     detachedRef.current = !atBottom;
     if (atBottom) {
       reattach(sessionId);
@@ -613,14 +698,31 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
       <div
         ref={scrollRef}
         onScroll={handleScroll}
-        onWheel={() => { userScrollIntentRef.current = true; }}
-        onTouchStart={() => { userScrollIntentRef.current = true; }}
+        // Up is unambiguous, so it detaches on the spot. Down only marks a
+        // gesture: at the tail it means nothing, and away from it the scroll
+        // event decides whether the reader has caught up.
+        onWheel={(event) => { if (event.deltaY < 0) leaveTail(); else noteGesture(); }}
+        onTouchStart={noteGesture}
         onPointerDown={(event) => {
-          if (event.target === event.currentTarget) userScrollIntentRef.current = true;
+          if (event.target === event.currentTarget) noteGesture();
         }}
         // The PTY uses whole-pixel rows. A fractional 17.875px line box
         // accumulated 37px of overflow and scrolled an editor's first row away.
         className="flex-1 p-3 overflow-y-auto font-mono text-[13px] leading-[17px] select-text"
+        style={{
+          // Columns are whole pixels for the same reason rows are. Without
+          // this the glyphs advance by the font's fractional 7.8px while the
+          // caret is placed on the 7px grid, and the two drift apart by a
+          // whole cell every nine columns. useTerminalSize sets the value from
+          // the advance it measured; see `tracking` in core/cellMetrics.
+          letterSpacing: 'var(--terminal-tracking, 0px)',
+          // Scroll anchoring is a heuristic for documents whose content shifts
+          // unpredictably. A terminal knows exactly how many rows scrollback
+          // just trimmed and the follow effect compensates for them itself;
+          // leaving the browser to guess as well put two corrections on the
+          // same pixels while an agent streamed.
+          overflowAnchor: 'none',
+        }}
       >
         {recoveredHistory && <RecoveredHistory cache={recoveryCacheLines}
           cacheTruncated={recoveryCacheTruncated} history={recoveredHistory} />}

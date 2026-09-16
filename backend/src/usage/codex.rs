@@ -147,6 +147,55 @@ pub fn rollouts_for(
     found.into_iter().map(|(_, path)| path).collect()
 }
 
+/// A rollout filename, as Codex writes it: `rollout-<timestamp>-<uuid>.jsonl`.
+///
+/// Matched on shape rather than on a hardcoded directory so a relocated
+/// `CODEX_HOME` still resolves. The file has to survive `scan_back` finding a
+/// real `token_count` record afterwards, so a coincidence of naming reports
+/// nothing rather than a wrong number.
+fn looks_like_a_rollout(path: &std::path::Path) -> bool {
+    path.extension().and_then(|e| e.to_str()) == Some("jsonl")
+        && path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| name.starts_with("rollout-"))
+}
+
+/// The rollout THIS pane's Codex process has open, per the kernel.
+///
+/// ── WHY THIS EXISTS ────────────────────────────────────────────────────────
+///
+/// Until 2026-09-08 this module fell back to scanning `~/.codex/sessions` and
+/// matching the `cwd` recorded in each file. That was removed for a good
+/// reason — a directory cannot prove which pane a rollout belongs to — but it
+/// left the hook hint as the *only* source, and the hook chain is not always
+/// there to be relied on:
+///
+///   - Codex's own hook schema types `transcript_path` as a NULLABLE string
+///     (verified against codex-cli 0.154.0), so a hook can fire and teach us
+///     nothing.
+///   - `PermissionRequest` never fires under `--yolo`, and `Stop` only fires
+///     when a turn ENDS, so nothing at all is known during the first turn —
+///     which is exactly when someone looks at the number.
+///   - The hook is bounded to 1.8 s on the agent's critical path and is
+///     allowed to give up. Giving up is correct; reporting '--' forever
+///     afterwards is not.
+///
+/// A file descriptor is not a directory scan. Codex holds its rollout open for
+/// the life of the session — verified on 2026-09-16 against a live codex-cli
+/// 0.154.0, whose fd 41 pointed at
+/// `~/.codex/sessions/2026/09/15/rollout-…jsonl` — so the kernel can say which
+/// rollout belongs to this pane's foreground process, and it cannot be
+/// ambiguous the way a directory is. More than one open rollout would be, so
+/// that reports nothing, exactly as two matching transcripts always have.
+fn open_rollout(process: doom_term_pty::foreground::ProcessIdentity) -> Option<std::path::PathBuf> {
+    let mut found = doom_term_pty::foreground::open_files(process)
+        .into_iter()
+        .filter(|path| looks_like_a_rollout(path));
+    let first = found.next()?;
+    found.next().is_none().then_some(first)
+}
+
 /// Context fill and rate limit for the Codex session running in `cwd`.
 ///
 /// Ambiguity is reported as nothing, exactly as the Claude path does: two Codex
@@ -157,7 +206,10 @@ pub fn reading(
     session_id: Option<&str>,
     process: Option<doom_term_pty::foreground::ProcessIdentity>,
 ) -> Option<(Reading, Option<f64>)> {
-    let path = super::hint::transcript_for("codex", cwd, session_id, process)?;
+    // The hook still wins when it has spoken: it names the file from inside the
+    // agent's own process. The descriptor is what answers when it has not.
+    let path = super::hint::transcript_for("codex", cwd, session_id, process)
+        .or_else(|| open_rollout(process?))?;
     let snapshot = scan_back(&path, snapshot_from_line)?;
     Some((
         Reading {
@@ -341,6 +393,49 @@ mod tests {
     }
 
     #[test]
+    fn only_a_rollout_shaped_filename_is_treated_as_one() {
+        // Codex holds a handful of files open — sqlite databases, a lock, its
+        // own log. Only its rollout is a transcript.
+        assert!(looks_like_a_rollout(std::path::Path::new(
+            "/home/u/.codex/sessions/2026/09/15/rollout-2026-09-15T21-06-00-01a0.jsonl"
+        )));
+        assert!(!looks_like_a_rollout(std::path::Path::new(
+            "/home/u/.codex/logs_2.sqlite"
+        )));
+        assert!(!looks_like_a_rollout(std::path::Path::new(
+            "/home/u/.codex/history.jsonl"
+        )));
+        assert!(!looks_like_a_rollout(std::path::Path::new(
+            "/home/u/.codex/sessions/rollout-2026-09-15.json"
+        )));
+    }
+
+    #[test]
+    fn the_descriptor_a_live_process_holds_names_its_own_rollout() {
+        // The end-to-end claim this path rests on, exercised against a real
+        // process and a real descriptor: hold a rollout open, and the kernel
+        // hands it back for that process and no other.
+        let dir = std::env::temp_dir().join("doom-term-codex-fd");
+        std::fs::create_dir_all(&dir).expect("probe dir");
+        let path = dir.join("rollout-2026-09-16T00-00-00-probe.jsonl");
+        std::fs::write(&path, format!("{}\n", one_line(TOKEN_COUNT))).expect("rollout");
+        let held = std::fs::File::open(&path).expect("hold it open");
+
+        let me = doom_term_pty::foreground::identify(std::process::id()).expect("our own identity");
+        assert_eq!(open_rollout(me).as_deref(), Some(path.as_path()));
+
+        // Two open rollouts are the ambiguous case, and ambiguity is '--'.
+        let second = dir.join("rollout-2026-09-16T00-00-01-probe.jsonl");
+        std::fs::write(&second, "{}\n").expect("second rollout");
+        let also_held = std::fs::File::open(&second).expect("hold it open too");
+        assert_eq!(open_rollout(me), None);
+
+        drop(also_held);
+        drop(held);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     #[ignore = "reads the real ~/.codex/sessions; run by hand"]
     fn probes_the_live_rollouts() {
         let cwd = std::env::var("DOOM_TERM_PROBE_CWD").unwrap_or_else(|_| {
@@ -358,6 +453,30 @@ mod tests {
                 "{:?}: {:?}",
                 path.file_name(),
                 scan_back(&path, snapshot_from_line)
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "inspects a live codex process; pass DOOM_TERM_PROBE_PID and run by hand"]
+    fn probes_the_descriptor_of_a_live_codex() {
+        // The end-to-end check for the path that replaced the directory scan:
+        // point it at a running `codex` and it must print that session's own
+        // rollout and its current numbers.
+        let pid: u32 = std::env::var("DOOM_TERM_PROBE_PID")
+            .expect("DOOM_TERM_PROBE_PID")
+            .parse()
+            .expect("a pid");
+        let identity = doom_term_pty::foreground::identify(pid).expect("a live process");
+        let rollout = open_rollout(identity);
+        println!("rollout held by {pid}: {rollout:?}");
+        if let Some(path) = rollout {
+            let snapshot = scan_back(&path, snapshot_from_line).expect("a token_count record");
+            println!(
+                "context {:.1}% of {}, rate {:?}",
+                100.0 * snapshot.used as f64 / snapshot.window as f64,
+                snapshot.window,
+                snapshot.rate
             );
         }
     }

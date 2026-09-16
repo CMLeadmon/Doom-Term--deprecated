@@ -34,19 +34,77 @@ pub struct ProcessIdentity {
     pub start_ticks: u64,
 }
 
-pub fn foreground_identity(shell_pid: u32) -> Option<ProcessIdentity> {
-    let shell_stat = std::fs::read_to_string(format!("/proc/{shell_pid}/stat")).ok()?;
-    let pid = u32::try_from(parse_tpgid(&shell_stat)?).ok()?;
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    // starttime is field 22; field 3 follows the final parenthesized comm.
-    let start_ticks = stat
+/// Start ticks for a pid: /proc/<pid>/stat field 22, which is field 3 after the
+/// final parenthesized comm. None when the process is gone.
+fn start_ticks(pid: u32) -> Option<u64> {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()?
         .rsplit_once(')')?
         .1
         .split_whitespace()
         .nth(19)?
         .parse()
-        .ok()?;
-    Some(ProcessIdentity { pid, start_ticks })
+        .ok()
+}
+
+/// One pid, as an identity. A pid on its own is not one: they are reused.
+pub fn identify(pid: u32) -> Option<ProcessIdentity> {
+    Some(ProcessIdentity {
+        pid,
+        start_ticks: start_ticks(pid)?,
+    })
+}
+
+pub fn foreground_identity(shell_pid: u32) -> Option<ProcessIdentity> {
+    let shell_stat = std::fs::read_to_string(format!("/proc/{shell_pid}/stat")).ok()?;
+    identify(u32::try_from(parse_tpgid(&shell_stat)?).ok()?)
+}
+
+/// How many descriptors we will look at before giving up on a process.
+///
+/// This runs on the telemetry poll, several times a second. A process holding
+/// more open files than this is not one we are going to describe usefully, and
+/// walking an unbounded directory there would be the most expensive thing the
+/// daemon does.
+const MAX_DESCRIPTORS: usize = 512;
+
+/// The regular files this exact process has open, per the kernel.
+///
+/// ── WHY A DESCRIPTOR AND NOT A DIRECTORY SCAN ──────────────────────────────
+///
+/// "Which transcript belongs to THIS pane" is an ownership question, and a
+/// directory cannot answer it: two agents in one repository write two matching
+/// files and nothing outside them can say which is which. A descriptor is the
+/// kernel's own bookkeeping — the file is open in that process and no other —
+/// so it settles the question the scan could only guess at.
+///
+/// `identity` is re-checked after the walk, so a pid recycled midway through
+/// cannot hand back another process's files. Anything that is not a plain
+/// existing file is skipped: sockets, pipes and anon inodes all appear here,
+/// and a deleted file's link still resolves to a path that reads as real.
+pub fn open_files(identity: ProcessIdentity) -> Vec<std::path::PathBuf> {
+    // Cheapest check first: a pid that is already someone else is not worth
+    // walking, and the walk is the expensive half.
+    if start_ticks(identity.pid) != Some(identity.start_ticks) {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(format!("/proc/{}/fd", identity.pid)) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for entry in entries.flatten().take(MAX_DESCRIPTORS) {
+        let Ok(path) = std::fs::read_link(entry.path()) else {
+            continue;
+        };
+        if path.is_absolute() && path.is_file() {
+            found.push(path);
+        }
+    }
+    // The pid may have been reused between naming it and reading it.
+    if start_ticks(identity.pid) != Some(identity.start_ticks) {
+        return Vec::new();
+    }
+    found
 }
 
 /// The command currently in the foreground of `shell_pid`'s terminal.
@@ -171,6 +229,41 @@ mod tests {
         // ')' and spaces, so the parse must split after the LAST ')'.
         let stat = "4242 (my )weird( proc) S 4240 4242 4242 34816 9001 4194304 …";
         assert_eq!(parse_tpgid(stat), Some(9001));
+    }
+
+    #[test]
+    fn open_files_reports_a_file_this_process_actually_holds_open() {
+        // The whole point of reading descriptors rather than scanning a
+        // directory: this answer is about ONE process, and the kernel is the
+        // one giving it.
+        let path = std::env::temp_dir().join("doom-term-open-files-probe.jsonl");
+        let handle = std::fs::File::create(&path).expect("probe file");
+        let me = identify(std::process::id()).expect("our own identity");
+
+        let open = open_files(me);
+        assert!(
+            open.iter().any(|found| found == &path),
+            "a file we are holding open must appear: {open:?}"
+        );
+
+        drop(handle);
+        std::fs::remove_file(&path).ok();
+        assert!(
+            !open_files(me).iter().any(|found| found == &path),
+            "a closed file must stop being reported"
+        );
+    }
+
+    #[test]
+    fn open_files_refuses_to_answer_for_a_process_that_is_not_the_one_named() {
+        // Start ticks are what separate a live agent from a recycled pid. A
+        // mismatched identity must yield nothing rather than another
+        // process's files.
+        let imposter = ProcessIdentity {
+            pid: std::process::id(),
+            start_ticks: u64::MAX,
+        };
+        assert!(open_files(imposter).is_empty());
     }
 
     #[test]

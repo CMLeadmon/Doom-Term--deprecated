@@ -103,6 +103,37 @@ impl StreamDemuxer {
         true
     }
 
+    /// What we owe a CSI probe, or None when the sequence is not one.
+    ///
+    /// `csi_str` is the record WITHOUT its leading `ESC [`, final byte included.
+    ///
+    /// The device attributes are @xterm/headless's own, because that is the
+    /// emulator actually behind this terminal — its `onData` is not wired back
+    /// to the PTY (see `core/commandDelivery.ts`), so a reply it generates goes
+    /// nowhere and this is the only place an answer can come from. Claiming
+    /// more than xterm implements would invite sequences it cannot draw.
+    ///
+    /// `CSI ? u`, the kitty keyboard protocol probe, is deliberately absent.
+    /// Answering it would claim a key encoding this terminal does not send, and
+    /// an agent that believed us would encode Escape and every modified key in
+    /// a form nothing here produces. Ignoring it while answering Primary DA is
+    /// how a terminal declines: the asker takes the DA reply as its NO.
+    fn csi_reply(csi_str: &str) -> Option<&'static str> {
+        match csi_str {
+            // Device Status Report. The demuxer does not model a cursor, so it
+            // reports the origin: an approximate answer costs a repaint,
+            // silence costs five seconds.
+            "6n" => Some("\x1b[1;1R"),
+            // ...and DSR 5 asks after the terminal's health, not the cursor.
+            "5n" => Some("\x1b[0n"),
+            // Primary DA: VT100 with Advanced Video Option.
+            "c" | "0c" => Some("\x1b[?1;2c"),
+            // Secondary DA: terminal id 0, firmware 276, cartridge 0.
+            ">c" | ">0c" => Some("\x1b[>0;276;0c"),
+            _ => None,
+        }
+    }
+
     pub fn process_bytes(&mut self, bytes: &[u8]) -> Vec<DemuxEvent> {
         if self.faulted {
             return Vec::new();
@@ -197,10 +228,11 @@ impl StreamDemuxer {
                         {
                             events.push(DemuxEvent::BracketedPasteMode { enabled: b == b'h' });
                         }
-                        if csi_str == "6n" {
-                            // Device Status Report. The demuxer does not model a
-                            // cursor, so it reports the origin: an approximate
-                            // answer costs a repaint, silence costs five seconds.
+                        if let Some(reply) = Self::csi_reply(csi_str) {
+                            // A probe is for the terminal, never for the screen.
+                            // Silence here is not free: the asker sits on its
+                            // own timeout, and some of them wait five seconds.
+                            self.pending_responses.extend_from_slice(reply.as_bytes());
                             is_query = true;
                         } else if csi_str == "?1049h" || csi_str == "?47h" || csi_str == "?1047h" {
                             if !self.tui_active {
@@ -226,9 +258,7 @@ impl StreamDemuxer {
                             }
                         }
                     }
-                    if is_query {
-                        self.pending_responses.extend_from_slice(b"\x1b[1;1R");
-                    } else {
+                    if !is_query {
                         output_chunk.push(0x1b);
                         output_chunk.push(b'[');
                         output_chunk.extend_from_slice(&self.csi_buf);
@@ -603,6 +633,62 @@ mod tests {
         demuxer.process_bytes(b"\x1b[6n");
         let reply = String::from_utf8(demuxer.take_responses()).unwrap();
         assert_eq!(reply, "\x1b[1;1R", "DSR must get a cursor position report");
+    }
+
+    #[test]
+    fn device_attributes_are_answered() {
+        // The last unanswered probe, and the expensive one: crossterm asks
+        // "do you speak the kitty keyboard protocol?" and uses the Primary DA
+        // reply as the NO. Silence here is what makes a `codex` start sit for
+        // two seconds before it draws anything. Answering as the emulator
+        // actually behind this really is — @xterm/headless — is the honest
+        // answer and the fast one.
+        for query in [&b"\x1b[c"[..], &b"\x1b[0c"[..]] {
+            let mut demuxer = StreamDemuxer::new();
+            demuxer.process_bytes(query);
+            assert_eq!(
+                String::from_utf8(demuxer.take_responses()).unwrap(),
+                "\x1b[?1;2c",
+                "Primary DA must be answered"
+            );
+        }
+        for query in [&b"\x1b[>c"[..], &b"\x1b[>0c"[..]] {
+            let mut demuxer = StreamDemuxer::new();
+            demuxer.process_bytes(query);
+            assert_eq!(
+                String::from_utf8(demuxer.take_responses()).unwrap(),
+                "\x1b[>0;276;0c",
+                "Secondary DA must be answered"
+            );
+        }
+    }
+
+    #[test]
+    fn a_device_status_report_says_the_terminal_is_well() {
+        let mut demuxer = StreamDemuxer::new();
+        demuxer.process_bytes(b"\x1b[5n");
+        assert_eq!(
+            String::from_utf8(demuxer.take_responses()).unwrap(),
+            "\x1b[0n",
+            "DSR 5 asks after our health, not our cursor"
+        );
+    }
+
+    #[test]
+    fn the_keyboard_protocol_probe_is_left_unanswered_rather_than_claimed() {
+        // We do not speak the kitty keyboard protocol, and saying otherwise
+        // would make an agent encode every ambiguous key — Escape included —
+        // in a form this terminal never sends. Ignoring `CSI ? u` while
+        // answering Primary DA is exactly how a terminal declines: the asker
+        // takes the DA reply as its NO and falls back, immediately.
+        let mut demuxer = StreamDemuxer::new();
+        demuxer.process_bytes(b"\x1b[?u");
+        assert!(demuxer.take_responses().is_empty());
+        demuxer.process_bytes(b"\x1b[c");
+        assert_eq!(
+            String::from_utf8(demuxer.take_responses()).unwrap(),
+            "\x1b[?1;2c"
+        );
     }
 
     #[test]

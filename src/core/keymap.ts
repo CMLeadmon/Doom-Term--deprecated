@@ -246,6 +246,11 @@ export const VIEW_BINDINGS: ViewBinding[] = [
     description: 'search this session',
   },
   { label: 'END', description: 'back to the newest line' },
+  // No action and no chord: this one is not the app's to intercept. It is
+  // listed because the overlay is the only place the keys are written down,
+  // and an agent composer that needs a newline is otherwise a guessing game.
+  // The encoding lives in `keyToBytes`; see there for why ESC CR.
+  { label: 'SHIFT+ENTER', description: 'newline without sending' },
 ];
 
 function isDigitKey(key: string): boolean {

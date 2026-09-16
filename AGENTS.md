@@ -33,6 +33,7 @@ These invariants are enforced by automated test suites in CI (`npm run test`):
   All text painted on `--ground` (`#14120f`) must achieve WCAG AA contrast ($\ge 4.5:1$), validated by [`src/styles/material.test.js`](src/styles/material.test.js).
 * **Integer Cell Metrics & Canvas Scaling**:
   - Cell dimensions in [`src/core/cellMetrics.ts`](src/core/cellMetrics.ts) are strictly quantized to whole pixels (`Math.max(1, Math.floor(raw))`). Terminal grid columns and rows are floored.
+  - **The rendered text must be pulled onto that same integer grid.** Quantizing the cell does not quantize the browser, which advances glyphs by the font's real fractional advance: the `font-mono` stack at 13px measures 7.80127px against a 7px cell, so text and the caret drift apart by a full cell every nine columns and a full row overflows its pane by a tenth of its width. `tracking()` returns the compensating letter-spacing, `useTerminalSize` publishes it as `--terminal-tracking`, and the terminal grid in [`RawTerminalView`](src/components/RawTerminalView.tsx) applies it. A new surface that renders terminal cells must do the same or it will drift.
   - The Status Bar canvas in [`src/hud/plate.js`](src/hud/plate.js) scales strictly at integer ratios (`2` or `3`). Fractional scaling is prohibited to prevent subpixel interpolation blur.
 * **No Runtime Icon Libraries**:
   Do not import icon packages (`lucide-react`, `@heroicons`, `react-icons`). Use pure Unicode/ASCII glyphs (`▸`, `▪`, `×`, `⚖`, `❖`, `⑂`, `^`, `v`).
@@ -74,10 +75,11 @@ graph TD
 1. **`crates/doom-term-pty/`**:
    - [`demuxer.rs`](crates/doom-term-pty/src/demuxer.rs): Slices PTY bytes, splices split UTF-8 multi-byte sequences, intercepts OSC 133 semantic marks and OSC 1337 agent states, and immediately answers terminal status queries (`CSI 6n`, `OSC 10/11`).
    - [`session.rs`](crates/doom-term-pty/src/session.rs) & [`tmux.rs`](crates/doom-term-pty/src/tmux.rs): Manages PTY pairs and private tmux sessions (`$TMPDIR/doom-term-tmux-$UID/socket`). Maintains a 500-event ring buffer per session; reconnecting rebinds the socket without spawning duplicate tmux clients or killing processes.
-   - [`foreground.rs`](crates/doom-term-pty/src/foreground.rs): Inspects Linux `/proc/<pid>/stat` to discover true foreground process group (`tpgid`), binary comm, and active agent classification (`claude`, `codex`, `gemini`, `agy`, etc.).
+   - [`foreground.rs`](crates/doom-term-pty/src/foreground.rs): Inspects Linux `/proc/<pid>/stat` to discover true foreground process group (`tpgid`), binary comm, and active agent classification (`claude`, `codex`, `gemini`, `agy`, etc.). `open_files` reads `/proc/<pid>/fd` for the same reason: a descriptor proves which file belongs to which pane, where a directory scan can only guess.
 2. **`backend/`**:
    - Standalone Tokio daemon listening on `127.0.0.1:1421`. Serves both WebSocket PTY clients and HTTP `POST /hook/:agent` events.
    - [`backend/src/usage/`](backend/src/usage/): Real-time token usage parser and context window calculator for Anthropic, OpenAI, and Gemini.
+   - **Transcript attribution is by evidence, never by directory.** A pane's transcript is resolved from the agent hook's own `transcript_path` ([`hint.rs`](backend/src/usage/hint.rs)) first, and otherwise from the rollout the pane's foreground process actually holds open ([`codex.rs`](backend/src/usage/codex.rs) — Codex keeps its `.jsonl` open for the life of the session, so `/proc/<pid>/fd` settles ownership the way a scan cannot). Two candidates is ambiguity and ambiguity is `--`. Do not restore a `cwd` scan: it cannot tell two agents in one repository apart.
 3. **`src-tauri/`**:
    - Native desktop application wrapper bundling `doom-term-server` as an external sidecar binary via `tools/build-sidecar.mjs`.
 4. **`src/core/`**:
@@ -117,8 +119,15 @@ The single source of truth for all bindings is [`src/core/keymap.ts`](src/core/k
 | `Ctrl+Shift+E` | Developer quick select (URL, file:line, git SHA, issue) |
 | `Ctrl+Shift+F` | Search session scrollback (`Ctrl+F` passes through) |
 | `End` | Return scrollback to newest line |
+| `Shift+Enter` / `Alt+Enter` | Newline without sending — encoded as `ESC CR`, never intercepted |
 
 **Rule**: Never bind unadorned `Ctrl+[A-Z]` to an application action. Those belongs exclusively to the running process.
+
+**Newline in an agent composer**: `Shift+Enter` is passed to the child as `ESC CR`
+(`\x1b\r`), which is the sequence Claude Code's own `/terminal-setup` installs
+into iTerm2, VS Code, Alacritty and Zed for this key. It is a pass-through
+encoding in [`keyToBytes`](src/components/RawTerminalView.tsx), not an app
+chord: nothing in the app consumes it, and plain `Enter` still submits.
 
 **Clipboard transport**: `Paste { request_id, id, text }` is separate from ordinary
 `Write`. `PasteResult { request_id, session_id, error }` is correlated on both ids.

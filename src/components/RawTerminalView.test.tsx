@@ -44,6 +44,28 @@ describe('keyToBytes', () => {
     expect(key({ key: 'w', ctrlKey: true })).toBe('\x17');
   });
 
+  it('encodes Shift+Enter as the newline an agent composer listens for', () => {
+    // ESC CR is not a guess. It is the sequence Claude Code's own
+    // `/terminal-setup` installs into iTerm2, VS Code, Alacritty and Zed for
+    // exactly this key — verified in the shipped 2.1.260 binary, which carries
+    // `{key:"shift+enter", command:"…sendSequence", args:{text:"\x1B\r"}}`.
+    // Plain Enter still submits, which is the whole point.
+    expect(key({ key: 'Enter', shiftKey: true })).toBe('\x1b\r');
+    expect(key({ key: 'Enter' })).toBe('\r');
+  });
+
+  it('encodes Alt+Enter the same way, because that is what Alt means', () => {
+    // Alt+key is ESC-prefixed everywhere else in this table; Enter was the one
+    // named key that silently dropped the prefix and submitted instead.
+    expect(key({ key: 'Enter', altKey: true })).toBe('\x1b\r');
+  });
+
+  it('leaves Ctrl+Enter to the process', () => {
+    // Ctrl+Enter has no legacy encoding, and inventing one would put bytes on
+    // the wire that no agent asked for.
+    expect(key({ key: 'Enter', ctrlKey: true })).toBe('\r');
+  });
+
   it('encodes Shift+Tab as back-tab, not a plain tab', () => {
     expect(key({ key: 'Tab' })).toBe('\t');
     expect(key({ key: 'Tab', shiftKey: true })).toBe('\x1b[Z');
@@ -134,6 +156,92 @@ describe('RawTerminalView', () => {
     expect(scroller.scrollTop).toBe(300);
     expect(stateOf('follow').detached).toBe(true);
     resetScrollback('follow');
+  });
+
+  it('releases the tail on the wheel itself, not on the scroll event that follows', () => {
+    // A `scroll` event is dispatched asynchronously, but a running agent
+    // re-renders this view every frame. Output landing in the gap between the
+    // wheel and the scroll event used to run the follow effect while the view
+    // still believed it was attached, which yanked the reader straight back to
+    // the bottom and then swallowed the intent flag. Scrolling up during a
+    // build was a fight you could not win.
+    resetScrollback('race');
+    const lines = [{ id: 'a', row: 0, spans: [{ text: 'a' }], timestamp: 0 }];
+    const props = { ...base, sessionId: 'race', isActive: true };
+    const view = render(<RawTerminalView {...props} lines={lines} />);
+    const scroller = screen.getByTestId('raw-terminal').firstElementChild as HTMLDivElement;
+    Object.defineProperties(scroller, {
+      scrollHeight: { configurable: true, value: 1000 },
+      clientHeight: { configurable: true, value: 100 },
+    });
+
+    fireEvent.wheel(scroller, { deltaY: -100 });
+    scroller.scrollTop = 300;
+    expect(stateOf('race').detached).toBe(true);
+
+    // The agent writes another line before the scroll event is delivered.
+    view.rerender(
+      <RawTerminalView {...props} lines={[...lines, { id: 'b', row: 1, spans: [{ text: 'b' }], timestamp: 0 }]} />,
+    );
+    expect(scroller.scrollTop).toBe(300);
+
+    fireEvent.scroll(scroller);
+    expect(scroller.scrollTop).toBe(300);
+    expect(stateOf('race').detached).toBe(true);
+    resetScrollback('race');
+  });
+
+  it('leaves the viewport alone when a pane merely becomes the active one', () => {
+    // Panes stay mounted, so the browser has kept this one's scroll offset.
+    // Re-running the follow effect on activation threw that away and reached
+    // for the newest output, which is the jump you saw on every switch.
+    resetScrollback('switch');
+    const lines = [{ id: 'a', row: 0, spans: [{ text: 'a' }], timestamp: 0 }];
+    const props = { ...base, sessionId: 'switch', lines };
+    const view = render(<RawTerminalView {...props} isActive={false} />);
+    const scroller = screen.getByTestId('raw-terminal').firstElementChild as HTMLDivElement;
+    Object.defineProperties(scroller, {
+      scrollHeight: { configurable: true, value: 1000 },
+      clientHeight: { configurable: true, value: 100 },
+    });
+    scroller.scrollTop = 250;
+
+    view.rerender(<RawTerminalView {...props} isActive />);
+    expect(scroller.scrollTop).toBe(250);
+    resetScrollback('switch');
+  });
+
+  it('holds a detached reader on the same text while scrollback trims above them', () => {
+    // xterm drops the oldest row once the buffer passes its 5000-line limit, so
+    // every row below slides up one line box. A reader pinned to a pixel offset
+    // watched the text they were reading crawl away for as long as the agent
+    // kept writing. The absolute buffer row is on every line, so the count is
+    // measured rather than guessed.
+    const rowHeight = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'offsetHeight');
+    Object.defineProperty(HTMLElement.prototype, 'offsetHeight', { configurable: true, value: 17 });
+    try {
+      resetScrollback('trim');
+      const props = { ...base, sessionId: 'trim', isActive: true };
+      const row = (n: number) => ({ id: `row-${n}`, row: n, spans: [{ text: `${n}` }], timestamp: 0 });
+      const view = render(<RawTerminalView {...props} lines={[row(0), row(1), row(2)]} />);
+      const scroller = screen.getByTestId('raw-terminal').firstElementChild as HTMLDivElement;
+      Object.defineProperties(scroller, {
+        scrollHeight: { configurable: true, value: 1000 },
+        clientHeight: { configurable: true, value: 100 },
+      });
+      fireEvent.wheel(scroller, { deltaY: -100 });
+      scroller.scrollTop = 300;
+      fireEvent.scroll(scroller);
+      expect(stateOf('trim').detached).toBe(true);
+
+      // Two rows fall off the top: the window now starts at buffer row 2.
+      view.rerender(<RawTerminalView {...props} lines={[row(2), row(3), row(4)]} />);
+      expect(scroller.scrollTop).toBe(300 - 2 * 17);
+      resetScrollback('trim');
+    } finally {
+      if (rowHeight) Object.defineProperty(HTMLElement.prototype, 'offsetHeight', rowHeight);
+      else delete (HTMLElement.prototype as unknown as Record<string, unknown>).offsetHeight;
+    }
   });
 
   it('does not steal the keyboard when it is not the active pane', () => {

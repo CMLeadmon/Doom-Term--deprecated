@@ -119,10 +119,26 @@ fn default_shell() -> String {
 }
 
 fn augmented_path() -> Option<String> {
-    let home = std::env::var("HOME").ok()?;
+    augment_path(
+        &std::env::var("HOME").ok()?,
+        &std::env::var("PATH").unwrap_or_default(),
+    )
+}
+
+/// Pure, and pure for a reason.
+///
+/// This was tested by setting HOME and PATH with `std::env::set_var`, which is
+/// process-global and therefore visible to every other test running at the same
+/// time. `resolve_cwd` reads HOME, so for the length of that one test every PTY
+/// another test spawned was told to start in `/custom/user`; the child chdir'd
+/// into a directory that does not exist and died with "No such file or
+/// directory" naming a program that was plainly there. That is what made
+/// `cargo test -p doom-term-pty` fail in roughly one run in four, on whichever
+/// of the three PTY tests happened to overlap. Take the environment as
+/// arguments and the test needs no global state at all.
+fn augment_path(home: &str, current_path: &str) -> Option<String> {
     let local_bin = format!("{}/.local/bin", home);
     let doom_bin = format!("{}/.doom-term/bin", home);
-    let current_path = std::env::var("PATH").unwrap_or_default();
     let parts: Vec<&str> = current_path.split(':').filter(|s| !s.is_empty()).collect();
 
     let mut prepend = Vec::new();
@@ -408,10 +424,24 @@ impl PtySession {
                 .context("Failed to take PTY writer")?,
         ));
         // Complete all fallible descriptor setup before starting the process.
-        let child = pair
-            .slave
-            .spawn_command(cmd)
-            .context("Failed to spawn command in PTY")?;
+        // Name the program in the error: "No such file or directory" with no
+        // subject is not a diagnosis, and this is the one failure a user hits
+        // when their shell, or tmux, is not where we were told it would be.
+        let program = cmd.get_argv().first().cloned().unwrap_or_default();
+        // The directory goes in too. The child chdir()s into it before it
+        // execs, so a working directory that has gone away reports itself as
+        // "No such file or directory" against a program that is plainly there.
+        let in_dir = cmd
+            .get_cwd()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default();
+        let child = pair.slave.spawn_command(cmd).with_context(|| {
+            format!(
+                "Failed to spawn {} in PTY (cwd {})",
+                std::path::Path::new(&program).display(),
+                in_dir.display()
+            )
+        })?;
         let child_pid = child.process_id();
         let shell_pid_direct = child_pid;
         let child: OwnedChild = Arc::new(parking_lot::Mutex::new(Some(child)));
