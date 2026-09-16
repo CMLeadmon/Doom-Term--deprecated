@@ -70,13 +70,30 @@ pub async fn browse_directory(path: Option<String>) -> Result<DirectoryListing, 
     })
 }
 
+/// Tell the user an agent is waiting on them, on whichever desktop they are on.
+///
+/// This was a `notify-send` spawn behind `cfg(target_os = "linux")`, so on
+/// Windows and macOS it returned `Ok(())` having done nothing at all — a
+/// success that was not one, and invisible precisely because it reported
+/// success. `PermissionRequest` is the event that makes an agent sit and wait;
+/// a notification that silently never fires is the difference between noticing
+/// that and not.
+///
+/// A failure to notify is reported, not swallowed. The caller treats it as
+/// advisory — a desktop that refuses notifications is a preference, not a
+/// fault — but it must be able to tell the two apart.
 #[tauri::command]
-pub async fn send_desktop_notification(title: String, body: String) -> Result<(), String> {
-    #[cfg(target_os = "linux")]
-    {
-        let _ = std::process::Command::new("notify-send")
-            .args(["-a", "Doom Term", "-u", "normal", &title, &body])
-            .spawn();
-    }
-    Ok(())
+pub async fn send_desktop_notification(
+    app: tauri::AppHandle,
+    title: String,
+    body: String,
+) -> Result<(), String> {
+    use tauri_plugin_notification::NotificationExt;
+
+    app.notification()
+        .builder()
+        .title(title)
+        .body(body)
+        .show()
+        .map_err(|error| error.to_string())
 }
