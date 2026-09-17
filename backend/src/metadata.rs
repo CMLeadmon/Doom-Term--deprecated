@@ -21,6 +21,17 @@ pub fn telemetry(
     // reports the move and the app describes the wrong directory for as
     // long as the agent runs. CONTEXT % is looked up BY directory, so
     // that showed up as a permanent '--' next to a running agent.
+    // The far end's own answers, if this session has a far end.
+    //
+    // Everything below used to be computed from the daemon's machine
+    // unconditionally. Over SSH that is not where the work is: $HOSTNAME is the
+    // laptop's, `git -C` runs against a path that exists only on the remote,
+    // and the foreground process is `ssh`. Where a remote has reported, its
+    // answer is the answer; where it has not, the field is unknown. The local
+    // value is NOT a fallback — it is an answer about a different computer, and
+    // Axiom 3 has no category for "true of something else".
+    let remote = session.as_ref().and_then(|s| s.remote_enrichment());
+
     let observed = session.as_ref().and_then(|s| s.current_cwd());
 
     // Observed, then asked for, then HOME — and never the daemon's own
@@ -34,7 +45,10 @@ pub fn telemetry(
     // directory that belongs to a mount which is unmounted when the app exits.
     // HOME is the same last resort `resolve_cwd` uses when it spawns a shell,
     // so the two agree about where "nowhere in particular" is.
-    let current_dir = observed
+    let current_dir = remote
+        .as_ref()
+        .and_then(|r| r.cwd.clone())
+        .or(observed)
         .or_else(|| {
             cwd.map(|c| pty::session::expand_path(&c).to_string_lossy().to_string())
                 .filter(|c| !c.trim().is_empty())
@@ -43,16 +57,29 @@ pub fn telemetry(
         .unwrap_or_else(|| "/".to_string());
     // No game vocabulary in anything the UI can render: an unknown user
     // is unknown, not a "marine" on "phobos-base".
-    let username = std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| "unknown".to_string());
+    let username = match remote.as_ref() {
+        Some(r) => r.user.clone().unwrap_or_else(|| "unknown".to_string()),
+        None => std::env::var("USER")
+            .or_else(|_| std::env::var("USERNAME"))
+            .unwrap_or_else(|_| "unknown".to_string()),
+    };
     // COMPUTERNAME is the Windows spelling; HOSTNAME is not set there. An
     // unknown host is "localhost", never a guess at the machine's real name.
-    let hostname = std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("COMPUTERNAME"))
-        .unwrap_or_else(|_| "localhost".to_string());
+    let hostname = match remote.as_ref() {
+        // A remote that did not name itself is unknown, not localhost — saying
+        // "localhost" of another machine is the original bug in miniature.
+        Some(r) => r.host.clone().unwrap_or_else(|| "unknown".to_string()),
+        None => std::env::var("HOSTNAME")
+            .or_else(|_| std::env::var("COMPUTERNAME"))
+            .unwrap_or_else(|_| "localhost".to_string()),
+    };
 
-    let git_branch = pty::process_io::run_bounded(
+    let git_branch = if let Some(r) = remote.as_ref() {
+        // The snippet reports its own branch or reports nothing. Running
+        // `git -C` here would ask this machine about a path on another one.
+        r.branch.clone()
+    } else {
+        pty::process_io::run_bounded(
         Path::new("git"),
         &[
             "-C".into(),
@@ -68,19 +95,25 @@ pub fn telemetry(
             output_bytes: 4096,
         },
     )
-    .ok()
-    .and_then(|bytes| String::from_utf8(bytes).ok())
-    .map(|s| s.trim().to_string())
-    .filter(|s| !s.is_empty());
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    };
 
     // Who is actually running in THIS session, per the kernel — not per
     // the tab title, and not per whichever session sorted first. An id
     // the daemon does not know describes nothing, so the agent is
     // unknown rather than borrowed from another tab.
-    let agent = session
-        .as_ref()
-        .and_then(|s| s.foreground_command())
-        .and_then(|comm| pty::classify_agent(&comm));
+    let agent = match remote.as_ref() {
+        // The remote classifies its own foreground, in the same vocabulary.
+        // /proc here would answer `ssh`, which is a transport and not an agent.
+        Some(r) => r.agent.as_deref().and_then(pty::classify_agent),
+        None => session
+            .as_ref()
+            .and_then(|s| s.foreground_command())
+            .and_then(|comm| pty::classify_agent(&comm)),
+    };
 
     // Only for an agent whose transcripts we can read, and only ever
     // against its OWN vendor's files — reporting Codex's pane against
@@ -95,7 +128,12 @@ pub fn telemetry(
         .as_ref()
         .and_then(|s| s.shell_pid())
         .and_then(pty::foreground::foreground_identity);
-    let (context, agent_rate) = match agent.as_ref().map(|a| a.key) {
+    let (context, agent_rate) = if remote.is_some() {
+        // A shell snippet cannot read a transcript's token accounting, and the
+        // /proc fd that settles attribution is on the other machine. Unknown.
+        (None, None)
+    } else {
+        match agent.as_ref().map(|a| a.key) {
         Some("claude") => (
             usage::context::context_fraction(&current_dir, session_id.as_deref(), process),
             None,
@@ -106,7 +144,8 @@ pub fn telemetry(
                 None => (None, None),
             }
         }
-        _ => (None, None),
+            _ => (None, None),
+        }
     };
 
     let is_worktree = pty::detect_worktree(std::path::Path::new(&current_dir));
@@ -128,16 +167,21 @@ pub fn telemetry(
         // Read-only: whatever the refresh loop last managed to learn.
         // Reported only for the agent it belongs to — showing Claude's
         // quota while Codex is in the foreground would be a mislabel.
-        rate_used: match agent.as_ref().map(|a| a.key) {
-            Some("claude") => usage.cached(),
-            Some("codex") => agent_rate,
-            _ => None,
+        rate_used: if remote.is_some() {
+            None
+        } else {
+            match agent.as_ref().map(|a| a.key) {
+                Some("claude") => usage.cached(),
+                Some("codex") => agent_rate,
+                _ => None,
+            }
         },
         context_used: context.as_ref().map(|c| c.fraction),
         // Empty means the source did not name a model — Codex's token
         // event does not. Absent, not guessed: this field has only ever
         // held what was read.
         agent_model: context.map(|c| c.model).filter(|m| !m.is_empty()),
+        remote,
     }
 }
 

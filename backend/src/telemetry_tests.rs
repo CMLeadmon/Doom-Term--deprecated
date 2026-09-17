@@ -340,3 +340,139 @@ async fn a_new_agent_process_in_the_same_pane_does_not_inherit_the_old_transcrip
         "a different foreground process needs its own hook"
     );
 }
+
+/// Drive a real enrichment frame through a real PTY.
+///
+/// The fixture's "agent" is a copy of /bin/cat, so anything written in comes
+/// straight back out — through the real demuxer, into the real session state.
+/// Nothing here is stubbed but the agent's own behaviour.
+fn report_remote(fixture: &Fixture, id: &str, json: &str) {
+    use base64::Engine as _;
+    let payload = base64::engine::general_purpose::STANDARD.encode(json);
+    let session = fixture.sessions.read().get(id).cloned().unwrap();
+    session
+        // The trailing newline is load-bearing: the PTY is in canonical mode and
+        // `cat` does not flush a line until it sees one, so without it nothing
+        // is ever echoed back through the demuxer.
+        .write(format!("\x1b]1337;SetUserVar=doomterm={payload}\x07\n").as_bytes())
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if session.remote_enrichment().is_some() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("the session never observed the enrichment frame");
+}
+
+fn telemetry_for(fixture: &Fixture, id: &str) -> ServerMessage {
+    let session = fixture.sessions.read().get(id).cloned();
+    metadata::telemetry(None, Some(id.to_string()), session, &fixture.usage)
+}
+
+#[tokio::test]
+async fn a_remote_session_reports_the_remote_and_never_the_local_machine() {
+    let fixture = Fixture::new();
+    let pane = fixture.pane("claude", "remote");
+    report_remote(
+        &fixture,
+        &pane,
+        r#"{"v":1,"host":"devbox","user":"someone","branch":"main"}"#,
+    );
+    let ServerMessage::Telemetry {
+        hostname,
+        username,
+        git_branch,
+        remote,
+        ..
+    } = telemetry_for(&fixture, &pane)
+    else {
+        panic!("missing telemetry response")
+    };
+    assert_eq!(hostname, "devbox", "reported the daemon's own host");
+    assert_eq!(username, "someone");
+    assert_eq!(git_branch.as_deref(), Some("main"));
+    assert_eq!(remote.unwrap().host.as_deref(), Some("devbox"));
+}
+
+#[tokio::test]
+async fn a_field_the_remote_did_not_report_is_unknown_not_the_local_value() {
+    // The whole point. This repository has a branch and this machine has a
+    // hostname; neither is true of the machine the work is on.
+    let fixture = Fixture::new();
+    let pane = fixture.pane("claude", "sparse");
+    report_remote(&fixture, &pane, r#"{"v":1,"host":"devbox"}"#);
+    let ServerMessage::Telemetry {
+        git_branch,
+        username,
+        ..
+    } = telemetry_for(&fixture, &pane)
+    else {
+        panic!("missing telemetry response")
+    };
+    assert_eq!(git_branch, None, "the local branch stood in for the remote's");
+    assert_eq!(username, "unknown", "the local user stood in for the remote's");
+}
+
+#[tokio::test]
+async fn a_remote_session_cannot_report_context_or_rate() {
+    // Both are transcript-derived and the transcript is on the other machine.
+    let fixture = Fixture::new();
+    let pane = fixture.pane("claude", "nocontext");
+    fixture.hook("claude", Some(&pane), 20000).await;
+    report_remote(&fixture, &pane, r#"{"v":1,"host":"devbox","agent":"claude"}"#);
+    let ServerMessage::Telemetry {
+        context_used,
+        rate_used,
+        agent_key,
+        ..
+    } = telemetry_for(&fixture, &pane)
+    else {
+        panic!("missing telemetry response")
+    };
+    assert_eq!(context_used, None, "invented a context reading across a transport");
+    assert_eq!(rate_used, None);
+    // ...but the agent the REMOTE named is still reported.
+    assert_eq!(agent_key.as_deref(), Some("claude"));
+}
+
+#[tokio::test]
+async fn a_local_session_is_completely_unchanged() {
+    let fixture = Fixture::new();
+    let pane = fixture.pane("claude", "local");
+    let ServerMessage::Telemetry {
+        remote, hostname, ..
+    } = telemetry_for(&fixture, &pane)
+    else {
+        panic!("missing telemetry response")
+    };
+    assert!(remote.is_none());
+    assert!(!hostname.is_empty());
+}
+
+#[tokio::test]
+async fn the_remote_block_survives_the_hand_injected_incarnation() {
+    // recovery.rs serializes the Telemetry variant and THEN assigns
+    // reply["data"]["incarnation"] by hand — a field the enum does not declare.
+    // ptyClient rejects any telemetry whose incarnation does not match, so a
+    // new field that failed to coexist with that injection would be dropped on
+    // the client with no error anywhere.
+    let fixture = Fixture::new();
+    let pane = fixture.pane("claude", "wire");
+    report_remote(&fixture, &pane, r#"{"v":1,"host":"devbox","branch":"main"}"#);
+    let message = telemetry_for(&fixture, &pane);
+
+    let mut reply = serde_json::to_value(&message).unwrap();
+    reply["data"]["incarnation"] = serde_json::json!("abc");
+
+    assert_eq!(reply["event"], "Telemetry");
+    assert_eq!(reply["data"]["incarnation"], "abc");
+    assert_eq!(reply["data"]["remote"]["host"], "devbox");
+    assert_eq!(reply["data"]["git_branch"], "main");
+    // ...and a local session serializes the block as an explicit null rather
+    // than omitting it, so the client can tell "local" from "not reported".
+    let local = fixture.pane("claude", "wire-local");
+    let plain = serde_json::to_value(telemetry_for(&fixture, &local)).unwrap();
+    assert!(plain["data"]["remote"].is_null());
+}

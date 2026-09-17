@@ -124,6 +124,13 @@ pub struct PtySession {
     writer: Arc<parking_lot::Mutex<Box<dyn Write + Send>>>,
     /// Serializes direct-child mode observations with paste admission/delivery.
     paste_mode: Arc<parking_lot::Mutex<bool>>,
+    /// The last thing a shell on the far end of a transport said about itself.
+    ///
+    /// None for a local session, and for a remote one that has not reported
+    /// yet. Its presence changes how `metadata::telemetry` reads every other
+    /// field, so "has not reported yet" and "is local" must stay the same
+    /// answer: both mean nothing has been observed.
+    remote: Arc<parking_lot::Mutex<Option<crate::remote::RemoteEnrichment>>>,
     running: Arc<AtomicBool>,
     retired: Arc<AtomicBool>,
     child: OwnedChild,
@@ -552,6 +559,9 @@ impl PtySession {
         let master = Arc::new(parking_lot::Mutex::new(pair.master));
         let paste_mode = Arc::new(parking_lot::Mutex::new(false));
         let reader_paste_mode = paste_mode.clone();
+        let remote: Arc<parking_lot::Mutex<Option<crate::remote::RemoteEnrichment>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        let reader_remote = remote.clone();
 
         let running = Arc::new(AtomicBool::new(true));
         let running_clone = running.clone();
@@ -622,6 +632,15 @@ impl PtySession {
                             _ => None,
                         }) {
                             *reader_paste_mode.lock() = enabled;
+                        }
+                        // Last one wins: the frame is emitted once per prompt,
+                        // so the newest is the only one that still describes
+                        // where the shell is.
+                        if let Some(data) = events.iter().rev().find_map(|event| match event {
+                            DemuxEvent::RemoteEnrichment { data } => Some(data.clone()),
+                            _ => None,
+                        }) {
+                            *reader_remote.lock() = Some(data);
                         }
 
                         for event in events {
@@ -723,6 +742,7 @@ impl PtySession {
             master,
             writer,
             paste_mode,
+            remote,
             running,
             retired,
             child,
@@ -779,6 +799,11 @@ impl PtySession {
     ///
     /// Under tmux the pane's own record is the fallback: it tracks `cd` even
     /// when /proc is unreadable, and it is what `list-panes` reports.
+    /// What the far end last reported, or None for a local session.
+    pub fn remote_enrichment(&self) -> Option<crate::remote::RemoteEnrichment> {
+        self.remote.lock().clone()
+    }
+
     pub fn current_cwd(&self) -> Option<String> {
         if let Some(dir) = self.shell_pid().and_then(crate::foreground::foreground_cwd) {
             return Some(dir);

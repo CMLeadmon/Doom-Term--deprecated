@@ -132,6 +132,12 @@ pub enum ServerMessage {
         /// binary name, which is why this field did not exist before and why
         /// inventing one was ruled out.
         agent_model: Option<String>,
+        /// What the shell on the far end of a transport reported, or None for a
+        /// local session.
+        ///
+        /// Its presence changes how every sibling field must be read: a remote
+        /// session's unreported branch is unknown, never the daemon's own.
+        remote: Option<doom_term_pty::remote::RemoteEnrichment>,
     },
     DirectoryListing {
         request_id: String,
