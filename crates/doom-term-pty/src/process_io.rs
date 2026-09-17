@@ -253,13 +253,23 @@ pub fn run_bounded(
     let mut status = None;
     let mut timed_out = false;
     loop {
-        match child.try_wait() {
-            Ok(Some(done)) => {
-                status = Some(done);
-                break;
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(Some(done)) => status = Some(done),
+                Ok(None) => {}
+                Err(_) => break,
             }
-            Ok(None) => {}
-            Err(_) => break,
+        }
+        // A child exiting is not the end of its output.
+        //
+        // EOF on the pipe needs EVERY write handle closed, and a descendant
+        // that inherited stdout holds one open after the helper itself is gone.
+        // Breaking on `try_wait` alone left the reader with no EOF, the
+        // deadline already behind us, and an unbounded `join` below — so a
+        // helper that spawned anything and exited hung the caller forever.
+        // Wait for the pipes to drain, not merely for the process to go.
+        if status.is_some() && reader.is_finished() && writer.is_finished() {
+            break;
         }
         if failed.load(Ordering::Relaxed) || Instant::now() >= deadline {
             timed_out = !failed.load(Ordering::Relaxed);
@@ -268,14 +278,27 @@ pub fn run_bounded(
         std::thread::sleep(Duration::from_millis(1));
     }
 
-    if status.is_none() {
-        // Ends the tree, which closes every pipe handle the helper holds and so
-        // unblocks both threads below.
+    // Terminate whenever anything is still outstanding — a live child, or a
+    // pipe held open by something the child left behind. Ending the job closes
+    // every handle in the tree, which is what lets the joins below return.
+    if status.is_none() || !reader.is_finished() || !writer.is_finished() {
         if let Some(job) = &job {
             let _ = job.terminate();
         }
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    // The threads still have to notice those handles closing, and this wait is
+    // bounded because an unbounded one is the exact hang the loop above was
+    // fixed to prevent. If a handle somehow outlives the job we would rather
+    // report the failure we already have than block on output nobody will read.
+    let settle = Instant::now() + Duration::from_millis(500);
+    while (!reader.is_finished() || !writer.is_finished()) && Instant::now() < settle {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    if !reader.is_finished() || !writer.is_finished() {
+        anyhow::bail!("Terminal helper timed out; delivery is unknown");
     }
 
     let wrote_all = writer.join().unwrap_or(false);
