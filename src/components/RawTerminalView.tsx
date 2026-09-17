@@ -6,6 +6,10 @@ import { useTerminalSize } from '../hooks/useTerminalSize';
 import { markingAgent, stepTurn, turnStarts, turnText } from '../core/turnMarks';
 import { noteTotal, detach, reattach, runSearch, stepHit, stateOf } from '../core/scrollback';
 import {
+  TAIL, anchorAt, indexOfAnchor, easeScroll, type ViewportAnchor,
+} from '../core/viewportAnchor';
+import { rowWindow } from '../core/rowWindow';
+import {
   BINDINGS,
   VIEW_BINDINGS,
   isAppChord,
@@ -54,23 +58,37 @@ export const GUTTER_PX = 16;
 /** Set by the first keystroke, ever. The keymap is a first-run thing. */
 export const KEYMAP_SEEN_KEY = 'DOOM_TERM_KEYMAP_SEEN_V1';
 
-const sessionScrollPositions = new Map<string, number>();
+/**
+ * The anchor each session was last left on.
+ *
+ * Panes unmount on a workspace switch, and a reader who had scrolled back
+ * should find their place again. This replaces a map of raw scrollTop pixels,
+ * which could not survive the buffer trimming underneath it.
+ */
+const sessionAnchors = new Map<string, ViewportAnchor>();
+
+export function resetSessionAnchors(): void {
+  sessionAnchors.clear();
+}
 
 /**
- * How long a scroll gesture keeps the follow-write out of its own way.
+ * How long a scroll gesture counts as the reader's intent.
  *
- * A `scroll` event is dispatched asynchronously, but a running agent re-renders
- * this view every frame, so the follow effect routinely landed in the gap
- * between the gesture and the event it produces. Touch and scrollbar drags
- * cannot say which way they are going the way a wheel can, so they get a window
- * instead — bounded, because a gesture that never moves anything must not stop
- * the terminal following its own output forever.
+ * Much smaller a job than it used to be. This no longer keeps the follow effect
+ * out of its own way — anchoring on a line did that — it only answers "was this
+ * scroll event the user's?". A resize or a reconstruction can clamp scrollTop
+ * and emit a scroll event that nobody asked for, and treating that as a
+ * decision to stop following would strand the reader mid-buffer.
  */
 const SCROLL_INTENT_MS = 400;
 
-export function resetSessionScrollPositions(): void {
-  sessionScrollPositions.clear();
-}
+/**
+ * Rows kept in the DOM beyond the viewport, each side.
+ *
+ * Enough that a fast scroll does not outrun the render, small enough that a
+ * full buffer is not in the document. The whole 5000-line buffer used to be.
+ */
+const OVERSCAN_ROWS = 20;
 
 interface TerminalLineRowProps {
   line: AnsiLine;
@@ -259,17 +277,19 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
   const containerRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const [hasFocus, setHasFocus] = useState(false);
-  const detachedRef = useRef(sessionId ? stateOf(sessionId).detached : false);
-  const scrollIntentAtRef = useRef(Number.NEGATIVE_INFINITY);
   /**
-   * The absolute buffer row this pane's window started at last frame, and whose
-   * session it belongs to. See the trim compensation in the follow effect; row
-   * numbers from another session's buffer would describe nothing.
+   * Where the reader is, as a LINE.
+   *
+   * A ref rather than state: the layout effect below must see the current value
+   * without re-running on every scroll event.
    */
-  const firstRowRef = useRef<{ session: string | null; row: number | null }>({
-    session: sessionId,
-    row: null,
-  });
+  const anchorRef = useRef<ViewportAnchor>(
+    (sessionId && sessionAnchors.get(sessionId)) || TAIL,
+  );
+  const scrollIntentAtRef = useRef(Number.NEGATIVE_INFINITY);
+  /** Target of an in-flight eased scroll, and its frame handle. */
+  const scrollTarget = useRef<number | null>(null);
+  const scrollFrame = useRef(0);
   /**
    * Search entry is a keyboard MODE, not a text box.
    *
@@ -289,6 +309,9 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
   const [keymapSeen, setKeymapSeen] = useState(
     () => typeof localStorage !== 'undefined' && !!localStorage.getItem(KEYMAP_SEEN_KEY),
   );
+  /** Index of the row at the top of the viewport, and the measured line box. */
+  const [firstVisible, setFirstVisible] = useState(0);
+  const [rowHeight, setRowHeight] = useState(0);
   const [searching, setSearching] = useState(false);
   const [quickSelecting, setQuickSelecting] = useState(false);
   const [clipboardNotice, setClipboardNotice] = useState<string | null>(null);
@@ -336,100 +359,163 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
     }
   }, [isActive, quickSelecting]);
 
+  // Only what the reader can see, plus overscan. See `rowWindow`.
+  const viewportRows = rowHeight > 0
+    ? Math.ceil((scrollRef.current?.clientHeight ?? 0) / rowHeight)
+    : 0;
+  const win = rowWindow({
+    firstVisible,
+    viewportRows,
+    overscan: OVERSCAN_ROWS,
+    total: lines.length,
+    rowHeight,
+  });
+
   /** Is a scroll gesture still in flight? See SCROLL_INTENT_MS. */
   const gesturing = () => performance.now() - scrollIntentAtRef.current < SCROLL_INTENT_MS;
-  const noteGesture = () => {
-    scrollIntentAtRef.current = performance.now();
+  const noteGesture = () => { scrollIntentAtRef.current = performance.now(); };
+
+  /** Remember where this session was left, so a remount finds it again. */
+  const setAnchor = (next: ViewportAnchor) => {
+    anchorRef.current = next;
+    if (!sessionId) return;
+    if (next.mode === 'tail') sessionAnchors.delete(sessionId);
+    else sessionAnchors.set(sessionId, next);
+  };
+
+  /** The row currently at the top of the viewport, and its offset into it. */
+  const topRow = (el: HTMLElement): { index: number; offsetPx: number } | null => {
+    const rows = el.querySelectorAll<HTMLElement>('[data-terminal-line]');
+    for (let i = 0; i < rows.length; i++) {
+      if (rows[i].offsetTop + rows[i].offsetHeight > el.scrollTop) {
+        return { index: Number(rows[i].dataset.terminalLine), offsetPx: rows[i].offsetTop - el.scrollTop };
+      }
+    }
+    return null;
   };
 
   /**
-   * Leave follow mode NOW, rather than when the scroll event eventually lands.
+   * Leave the tail NOW, rather than when the scroll event eventually lands.
    *
-   * The wheel is the one gesture that states its direction up front, and up is
-   * unambiguously "stop following". Doing it here rather than in the scroll
-   * handler is the whole fix for scrolling back through a running agent: the
-   * follow effect below can otherwise run first and put the reader straight
-   * back at the bottom.
+   * Anchoring on a line did not make this unnecessary, and believing it did was
+   * a mistake worth recording. In tail mode the layout effect still pins
+   * scrollTop to scrollHeight on every `lines` change, so output arriving in
+   * the gap between the wheel and its asynchronous scroll event runs the follow
+   * effect while the view still believes it is following — and the reader is
+   * yanked back to the bottom. The wheel is the one gesture that states its
+   * direction up front, so up acts immediately.
    */
   const leaveTail = () => {
-    noteGesture();
-    if (detachedRef.current || !sessionId) return;
-    detachedRef.current = true;
-    // The line is approximate — the wheel fires before the browser has moved
-    // anything — and the scroll event corrects it a moment later. No offset is
-    // remembered here for the same reason: it would still read as the tail, and
-    // the follow effect would restore the reader to the bottom they just left.
     const el = scrollRef.current;
-    const offset = el ? el.scrollTop / Math.max(1, el.scrollHeight) : 0;
-    detach(sessionId, Math.round(offset * lines.length));
+    if (!el || !sessionId || anchorRef.current.mode === 'row') return;
+    const top = topRow(el);
+    const line = top ? lines[top.index] : undefined;
+    if (!line) return;
+    setAnchor(anchorAt(line.id, top!.offsetPx));
+    setFirstVisible(top!.index);
+    detach(sessionId, top!.index);
   };
 
-  // Follow the tail as output arrives. useLayoutEffect, not useEffect: after
-  // paint the browser has already shown the new lines at the old offset, which
-  // is a visible jump / flash of stale scrollback.
-  //
-  // Deliberately NOT keyed on `isActive`. Panes stay mounted, so the browser
-  // has kept the offset of the one you are switching to; re-running this on
-  // activation threw that away and reached for the newest output, which is the
-  // jump that made every switch look like a glitch.
+  /**
+   * Follow the tail, or hold the anchored line, as output arrives.
+   *
+   * useLayoutEffect, not useEffect: after paint the browser has already shown
+   * the new lines at the old offset, which is a visible flash of stale
+   * scrollback.
+   *
+   * The trim compensation that used to live here is gone, and it is worth
+   * recording why rather than leaving a gap. It never ran. `getLines()` always
+   * calls `linesFrom(buffer, 0, ...)`, so `lines[0].row` was always 0 and the
+   * trimmed delta was always `0 - 0`; its unit test passed only by hand-feeding
+   * a first row `getLines()` cannot produce. A reader was therefore never
+   * compensated at all, and once the buffer filled the text crawled away under
+   * them — the exact failure those sixty lines were written to prevent.
+   *
+   * Anchoring on a line needs no compensation, because a line does not move.
+   */
   React.useLayoutEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
     if (sessionId) noteTotal(sessionId, lines.length);
 
-    // Scrollback trimming deletes rows from the TOP of the buffer, so every row
-    // below slides up by exactly that many line boxes. A detached reader is
-    // pinned to a pixel offset, so without this the text they are reading
-    // crawls away for as long as the agent keeps writing. The absolute buffer
-    // row rides on every line, so the count is measured, never guessed.
-    const firstRow = lines.length ? lines[0].row : undefined;
-    const previous = firstRowRef.current;
-    const previousFirstRow = previous.session === sessionId ? previous.row : null;
-    firstRowRef.current = { session: sessionId, row: firstRow ?? null };
-    if (detachedRef.current && sessionId && firstRow !== undefined && previousFirstRow !== null) {
-      const trimmed = firstRow - previousFirstRow;
-      const rowHeight = el.querySelector<HTMLElement>('[data-terminal-line]')?.offsetHeight ?? 0;
-      const saved = sessionScrollPositions.get(sessionId);
-      if (trimmed > 0 && rowHeight > 0 && saved !== undefined) {
-        sessionScrollPositions.set(sessionId, Math.max(0, saved - trimmed * rowHeight));
-      }
+    // One real measurement is enough; the line box is fixed at 17px by the
+    // grid's own class and only a font load can change it.
+    if (!rowHeight) {
+      const measured = el.querySelector<HTMLElement>('[data-terminal-line]')?.offsetHeight ?? 0;
+      if (measured > 0) setRowHeight(measured);
     }
 
-    if (!detachedRef.current) {
-      // A gesture in flight owns the viewport until its scroll event arrives.
-      if (!gesturing()) el.scrollTop = el.scrollHeight;
-    } else if (sessionId && sessionScrollPositions.has(sessionId)) {
-      el.scrollTop = sessionScrollPositions.get(sessionId)!;
+    const anchor = anchorRef.current;
+    if (anchor.mode === 'tail') {
+      // The window has to follow the tail too, or the rows the reader is
+      // about to see are not in the DOM to scroll to.
+      if (lines.length && win.end < lines.length) setFirstVisible(lines.length - 1);
+      el.scrollTop = el.scrollHeight;
+      return;
     }
-  }, [lines, sessionId]);
+    const index = indexOfAnchor(anchor, lines);
+    if (index === null) {
+      // The anchored line was trimmed out from under the reader. Returning to
+      // the tail is the honest answer: the text they were reading is gone, and
+      // landing them somewhere else would be a guess dressed up as a position.
+      setAnchor(TAIL);
+      if (sessionId) reattach(sessionId);
+      el.scrollTop = el.scrollHeight;
+      return;
+    }
+    const row = el.querySelector<HTMLElement>(`[data-terminal-line="${index}"]`);
+    if (row) el.scrollTop = Math.max(0, row.offsetTop - anchor.offsetPx);
+  }, [lines, sessionId, rowHeight, win.end]);
 
   /**
-   * Leaving the tail is what puts the plate into transport mode. Read from a
-   * ref rather than state so the layout effect above sees the current value
-   * without re-running on every scroll event.
+   * Adopt whatever line is at the top of the viewport as the anchor.
+   *
+   * Leaving the tail is also what puts the plate into transport mode.
    */
   const handleScroll = () => {
     const el = scrollRef.current;
     if (!el || !sessionId) return;
     const atBottom = el.scrollHeight - (el.scrollTop + el.clientHeight) < 24;
-    // Resize/reconstruction can clamp scrollTop and emit a native scroll event
-    // even though the reader never left follow mode. Treat detachment as user
-    // intent, not as an incidental layout coordinate.
-    if (!atBottom && !detachedRef.current && !gesturing()) {
+    if (atBottom) {
+      setAnchor(TAIL);
+      setFirstVisible(Math.max(0, lines.length - 1));
+      reattach(sessionId);
+      return;
+    }
+    // A scroll nobody asked for is not a decision to stop following. Resize and
+    // reconstruction both clamp scrollTop and emit one, and honouring those
+    // stranded the reader mid-buffer with nothing on screen to explain it.
+    if (anchorRef.current.mode === 'tail' && !gesturing()) {
       el.scrollTop = el.scrollHeight;
       reattach(sessionId);
       return;
     }
     scrollIntentAtRef.current = Number.NEGATIVE_INFINITY;
-    detachedRef.current = !atBottom;
-    if (atBottom) {
-      reattach(sessionId);
-      sessionScrollPositions.delete(sessionId);
-    } else {
-      detach(sessionId, Math.round((el.scrollTop / Math.max(1, el.scrollHeight)) * lines.length));
-      sessionScrollPositions.set(sessionId, el.scrollTop);
-    }
+    const top = topRow(el);
+    const line = top ? lines[top.index] : undefined;
+    if (!top || !line) return;
+    setFirstVisible(top.index);
+    setAnchor(anchorAt(line.id, top.offsetPx));
+    detach(sessionId, top.index);
   };
+
+  /** One frame of eased scrolling toward whatever the wheel asked for. */
+  const stepScroll = React.useCallback(() => {
+    const el = scrollRef.current;
+    const target = scrollTarget.current;
+    if (!el || target === null) { scrollFrame.current = 0; return; }
+    const reduced = typeof window !== 'undefined'
+      && !!window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+    const next = easeScroll(el.scrollTop, target, 16, reduced);
+    el.scrollTop = next;
+    if (next === target) { scrollTarget.current = null; scrollFrame.current = 0; return; }
+    scrollFrame.current = requestAnimationFrame(stepScroll);
+  }, []);
+
+  useEffect(() => () => {
+    if (scrollFrame.current) cancelAnimationFrame(scrollFrame.current);
+    scrollFrame.current = 0;
+  }, []);
 
   const copyText = React.useCallback(async (text: string) => {
     try {
@@ -531,7 +617,9 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
       : Math.max(0, lines.length - 1);
     const target = stepTurn(marks, current, viewAction === 'previousTurn' ? -1 : 1);
     if (target !== null && scrollRef.current) {
-      detachedRef.current = true;
+      const line = lines[target];
+      if (line) setAnchor(anchorAt(line.id, 0));
+      setFirstVisible(target);
       detach(sessionId, target);
       const row = scrollRef.current.querySelector<HTMLElement>(`[data-terminal-line="${target}"]`);
       if (row) {
@@ -557,7 +645,8 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
     const el = scrollRef.current;
     const row = el.querySelector<HTMLElement>(`[data-terminal-line="${st.line}"]`);
     if (row) {
-      detachedRef.current = true;
+      const hit = lines[st.line];
+      if (hit) setAnchor(anchorAt(hit.id, 0));
       el.scrollTop = Math.max(0, row.offsetTop - el.clientHeight / 2);
     }
   });
@@ -660,9 +749,10 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
 
     // End returns you to the tail. The old design put this on a pulsing plate
     // button floating in the middle of the pane; it is a key and a readout now.
-    if (e.key === 'End' && detachedRef.current && sessionId) {
+    if (e.key === 'End' && anchorRef.current.mode === 'row' && sessionId) {
       e.preventDefault();
-      detachedRef.current = false;
+      setAnchor(TAIL);
+      setFirstVisible(Math.max(0, lines.length - 1));
       reattach(sessionId);
       if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
       return;
@@ -693,6 +783,13 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
     if (!row || !Number.isInteger(index)) return;
 
     const region = commandRegion(lines, index, marks);
+    // A region is computed on the lines ARRAY and may span rows the window does
+    // not currently hold. Bring them in and let the next click land, rather
+    // than silently selecting nothing.
+    if (region.start < win.start || region.end >= win.end) {
+      setFirstVisible(Math.max(0, region.start));
+      return;
+    }
     const start = scrollRef.current?.querySelector<HTMLElement>(`[data-terminal-line="${region.start}"]`);
     const end = scrollRef.current?.querySelector<HTMLElement>(`[data-terminal-line="${region.end}"]`);
     const selection = window.getSelection();
@@ -731,16 +828,29 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
       <div
         ref={scrollRef}
         onScroll={handleScroll}
-        // Up is unambiguous, so it detaches on the spot. Down only marks a
-        // gesture: at the tail it means nothing, and away from it the scroll
-        // event decides whether the reader has caught up.
-        onWheel={(event) => { if (event.deltaY < 0) leaveTail(); else noteGesture(); }}
+        /*
+           The wheel drives an eased target rather than the browser's own jump.
+           There is no gesture window any more and no wheel pre-empt: both
+           existed only to beat the follow effect to the viewport, and a tail
+           anchor no longer moves a reader who has left it.
+        */
+        onWheel={(event) => {
+          const el = scrollRef.current;
+          if (!el) return;
+          noteGesture();
+          if (event.deltaY < 0) leaveTail();
+          event.preventDefault();
+          const from = scrollTarget.current ?? el.scrollTop;
+          const limit = Math.max(0, el.scrollHeight - el.clientHeight);
+          scrollTarget.current = Math.max(0, Math.min(limit, from + event.deltaY));
+          if (!scrollFrame.current) scrollFrame.current = requestAnimationFrame(stepScroll);
+        }}
+        // The PTY uses whole-pixel rows. A fractional 17.875px line box
+        // accumulated 37px of overflow and scrolled an editor's first row away.
         onTouchStart={noteGesture}
         onPointerDown={(event) => {
           if (event.target === event.currentTarget) noteGesture();
         }}
-        // The PTY uses whole-pixel rows. A fractional 17.875px line box
-        // accumulated 37px of overflow and scrolled an editor's first row away.
         className="flex-1 p-3 overflow-y-auto font-mono text-[13px] leading-[17px] select-text"
         style={{
           // Columns are whole pixels for the same reason rows are. Without
@@ -749,6 +859,8 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
           // whole cell every nine columns. useTerminalSize sets the value from
           // the advance it measured; see `tracking` in core/cellMetrics.
           letterSpacing: 'var(--terminal-tracking, 0px)',
+          // A gesture at the tail must not bounce the window behind it.
+          overscrollBehavior: 'contain',
           // Scroll anchoring is a heuristic for documents whose content shifts
           // unpredictably. A terminal knows exactly how many rows scrollback
           // just trimmed and the follow effect compensates for them itself;
@@ -759,7 +871,9 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
       >
         {recoveredHistory && <RecoveredHistory cache={recoveryCacheLines}
           cacheTruncated={recoveryCacheTruncated} history={recoveredHistory} />}
-        {lines.map((line, i) => {
+        <div aria-hidden="true" style={{ height: `${win.padTopPx}px` }} />
+        {lines.slice(win.start, win.end).map((line, offset) => {
+          const i = win.start + offset;
           const isCursorHere = isActive && cursor && cursor.visible !== false
             ? (line.row !== undefined ? cursor.row === line.row : cursor.row === i)
             : false;
@@ -777,6 +891,7 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
             />
           );
         })}
+        <div aria-hidden="true" style={{ height: `${win.padBottomPx}px` }} />
       </div>
 
       {/*

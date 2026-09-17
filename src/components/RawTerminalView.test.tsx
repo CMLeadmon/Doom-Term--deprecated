@@ -1,7 +1,7 @@
 import { render, screen, fireEvent, act } from '@testing-library/react';
 import { useState } from 'react';
 import { describe, it, expect, vi, beforeAll } from 'vitest';
-import { RawTerminalView, keyToBytes } from './RawTerminalView';
+import { RawTerminalView, keyToBytes, resetSessionAnchors } from './RawTerminalView';
 import { ptyClient } from '../core/ptyClient';
 import { resetScrollback, stateOf } from '../core/scrollback';
 
@@ -82,6 +82,42 @@ describe('keyToBytes', () => {
   });
 });
 
+/**
+ * Give terminal rows a real 17px line box at their index's offset.
+ *
+ * jsdom lays nothing out, so every offsetTop and offsetHeight is 0 — and the
+ * anchor is resolved from exactly those. Without this the view can never work
+ * out which line is at the top of the viewport.
+ */
+function withRowGeometry(run: () => void) {
+  const H = 17;
+  const height = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'offsetHeight');
+  const top = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'offsetTop');
+  Object.defineProperty(HTMLElement.prototype, 'offsetHeight', {
+    configurable: true,
+    get(this: HTMLElement) { return this.dataset?.terminalLine !== undefined ? H : 0; },
+  });
+  Object.defineProperty(HTMLElement.prototype, 'offsetTop', {
+    configurable: true,
+    get(this: HTMLElement) {
+      const n = this.dataset?.terminalLine;
+      return n === undefined ? 0 : Number(n) * H;
+    },
+  });
+  try { run(); } finally {
+    if (height) Object.defineProperty(HTMLElement.prototype, 'offsetHeight', height);
+    else delete (HTMLElement.prototype as unknown as Record<string, unknown>).offsetHeight;
+    if (top) Object.defineProperty(HTMLElement.prototype, 'offsetTop', top);
+    else delete (HTMLElement.prototype as unknown as Record<string, unknown>).offsetTop;
+  }
+}
+
+/** Production-shaped lines: absolute ids, consecutive from `from`. */
+const win = (from: number, count: number) =>
+  Array.from({ length: count }, (_, k) => ({
+    id: `L${from + k}`, row: from + k, spans: [{ text: `${from + k}` }], timestamp: 0,
+  }));
+
 describe('RawTerminalView', () => {
   const base = {
     lines: [],
@@ -97,24 +133,36 @@ describe('RawTerminalView', () => {
     expect(screen.queryByTestId('terminal-cursor')).toBeNull();
   });
 
-  it('restores detached scrollback on remount before following new output', () => {
+  it('restores a detached reader to the same LINE on remount', () => {
+    // The pixel map this replaces could not survive the buffer trimming
+    // underneath it; a line number can.
     resetScrollback('remount');
-    const lines = [{ id: 'line', spans: [{ text: 'tail' }], timestamp: 0 }];
-    const props = { ...base, sessionId: 'remount', isActive: true, lines };
-    const first = render(<RawTerminalView {...props} />);
-    const scroller = screen.getByTestId('raw-terminal').firstElementChild as HTMLDivElement;
-    Object.defineProperties(scroller, {
-      scrollHeight: { configurable: true, value: 1000 },
-      clientHeight: { configurable: true, value: 200 },
+    resetSessionAnchors();
+    withRowGeometry(() => {
+      const props = { ...base, sessionId: 'remount', isActive: true, lines: win(0, 20) };
+      const first = render(<RawTerminalView {...props} />);
+      const scroller = screen.getByTestId('raw-terminal').firstElementChild as HTMLDivElement;
+      Object.defineProperties(scroller, {
+        scrollHeight: { configurable: true, value: 340 },
+        clientHeight: { configurable: true, value: 100 },
+      });
+      fireEvent.wheel(scroller, { deltaY: -100 });
+      scroller.scrollTop = 85;                    // line L5 at the top
+      fireEvent.scroll(scroller);
+      expect(stateOf('remount').detached).toBe(true);
+      first.unmount();
+
+      render(<RawTerminalView {...props} />);
+      const restored = screen.getByTestId('raw-terminal').firstElementChild as HTMLDivElement;
+      Object.defineProperties(restored, {
+        scrollHeight: { configurable: true, value: 340 },
+        clientHeight: { configurable: true, value: 100 },
+      });
+      expect(restored.scrollTop).toBe(85);
+      expect(stateOf('remount').detached).toBe(true);
     });
-    fireEvent.wheel(scroller, { deltaY: -100 });
-    scroller.scrollTop = 300;
-    fireEvent.scroll(scroller);
-    first.unmount();
-    render(<RawTerminalView {...props} />);
-    const restored = screen.getByTestId('raw-terminal').firstElementChild as HTMLDivElement;
-    expect(restored.scrollTop).toBe(300);
-    expect(stateOf('remount').detached).toBe(true);
+    resetScrollback('remount');
+    resetSessionAnchors();
   });
 
   it('keeps an unfocused split pane following newly arriving output', () => {
@@ -136,59 +184,64 @@ describe('RawTerminalView', () => {
   });
 
   it('keeps following the tail across layout scrolls until the user explicitly scrolls', () => {
+    // A resize or a reconstruction clamps scrollTop and emits a scroll event
+    // nobody asked for. Treating that as a decision to stop following would
+    // strand the reader mid-buffer with nothing on screen to explain it.
     resetScrollback('follow');
-    render(<RawTerminalView {...base} sessionId="follow" isActive lines={[
-      { id: 'line', spans: [{ text: 'tail' }], timestamp: 0 },
-    ]} />);
-    const scroller = screen.getByTestId('raw-terminal').firstElementChild as HTMLDivElement;
-    Object.defineProperties(scroller, {
-      scrollHeight: { configurable: true, value: 1000 },
-      clientHeight: { configurable: true, value: 100 },
-    });
-    scroller.scrollTop = 400;
-    fireEvent.scroll(scroller);
-    expect(scroller.scrollTop).toBe(1000);
-    expect(stateOf('follow').detached).toBe(false);
+    resetSessionAnchors();
+    withRowGeometry(() => {
+      render(<RawTerminalView {...base} sessionId="follow" isActive lines={win(0, 20)} />);
+      const scroller = screen.getByTestId('raw-terminal').firstElementChild as HTMLDivElement;
+      Object.defineProperties(scroller, {
+        scrollHeight: { configurable: true, value: 340 },
+        clientHeight: { configurable: true, value: 100 },
+      });
+      scroller.scrollTop = 120;
+      fireEvent.scroll(scroller);                 // no gesture preceded it
+      expect(scroller.scrollTop).toBe(340);
+      expect(stateOf('follow').detached).toBe(false);
 
-    fireEvent.wheel(scroller, { deltaY: -100 });
-    scroller.scrollTop = 300;
-    fireEvent.scroll(scroller);
-    expect(scroller.scrollTop).toBe(300);
-    expect(stateOf('follow').detached).toBe(true);
+      fireEvent.wheel(scroller, { deltaY: -100 });
+      scroller.scrollTop = 85;
+      fireEvent.scroll(scroller);
+      expect(scroller.scrollTop).toBe(85);
+      expect(stateOf('follow').detached).toBe(true);
+    });
     resetScrollback('follow');
+    resetSessionAnchors();
   });
 
   it('releases the tail on the wheel itself, not on the scroll event that follows', () => {
     // A `scroll` event is dispatched asynchronously, but a running agent
     // re-renders this view every frame. Output landing in the gap between the
-    // wheel and the scroll event used to run the follow effect while the view
-    // still believed it was attached, which yanked the reader straight back to
-    // the bottom and then swallowed the intent flag. Scrolling up during a
-    // build was a fight you could not win.
+    // wheel and the scroll event runs the follow effect while the view still
+    // believes it is at the tail, which yanks the reader straight back down.
+    // Anchoring on a line did NOT make this unnecessary: tail mode still pins
+    // scrollTop to scrollHeight on every frame.
     resetScrollback('race');
-    const lines = [{ id: 'a', row: 0, spans: [{ text: 'a' }], timestamp: 0 }];
-    const props = { ...base, sessionId: 'race', isActive: true };
-    const view = render(<RawTerminalView {...props} lines={lines} />);
-    const scroller = screen.getByTestId('raw-terminal').firstElementChild as HTMLDivElement;
-    Object.defineProperties(scroller, {
-      scrollHeight: { configurable: true, value: 1000 },
-      clientHeight: { configurable: true, value: 100 },
+    resetSessionAnchors();
+    withRowGeometry(() => {
+      const props = { ...base, sessionId: 'race', isActive: true };
+      const view = render(<RawTerminalView {...props} lines={win(0, 20)} />);
+      const scroller = screen.getByTestId('raw-terminal').firstElementChild as HTMLDivElement;
+      Object.defineProperties(scroller, {
+        scrollHeight: { configurable: true, value: 340 },
+        clientHeight: { configurable: true, value: 100 },
+      });
+      scroller.scrollTop = 85;
+      fireEvent.wheel(scroller, { deltaY: -100 });
+      expect(stateOf('race').detached).toBe(true);
+
+      // The agent writes another line before the scroll event is delivered.
+      view.rerender(<RawTerminalView {...props} lines={win(0, 21)} />);
+      expect(scroller.scrollTop).toBe(85);
+
+      fireEvent.scroll(scroller);
+      expect(scroller.scrollTop).toBe(85);
+      expect(stateOf('race').detached).toBe(true);
     });
-
-    fireEvent.wheel(scroller, { deltaY: -100 });
-    scroller.scrollTop = 300;
-    expect(stateOf('race').detached).toBe(true);
-
-    // The agent writes another line before the scroll event is delivered.
-    view.rerender(
-      <RawTerminalView {...props} lines={[...lines, { id: 'b', row: 1, spans: [{ text: 'b' }], timestamp: 0 }]} />,
-    );
-    expect(scroller.scrollTop).toBe(300);
-
-    fireEvent.scroll(scroller);
-    expect(scroller.scrollTop).toBe(300);
-    expect(stateOf('race').detached).toBe(true);
     resetScrollback('race');
+    resetSessionAnchors();
   });
 
   it('leaves the viewport alone when a pane merely becomes the active one', () => {
@@ -211,37 +264,33 @@ describe('RawTerminalView', () => {
     resetScrollback('switch');
   });
 
-  it('holds a detached reader on the same text while scrollback trims above them', () => {
-    // xterm drops the oldest row once the buffer passes its 5000-line limit, so
-    // every row below slides up one line box. A reader pinned to a pixel offset
-    // watched the text they were reading crawl away for as long as the agent
-    // kept writing. The absolute buffer row is on every line, so the count is
-    // measured rather than guessed.
-    const rowHeight = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'offsetHeight');
-    Object.defineProperty(HTMLElement.prototype, 'offsetHeight', { configurable: true, value: 17 });
-    try {
-      resetScrollback('trim');
+  it('holds a detached reader on the same line while scrollback trims above them', () => {
+    // The compensation this replaces never ran. getLines() always calls
+    // linesFrom(buffer, 0, ...), so lines[0].row was always 0 and the trimmed
+    // delta was always 0 - 0; the old test passed only by hand-feeding a first
+    // row getLines() cannot produce. A reader was never compensated at all.
+    resetScrollback('trim');
+    resetSessionAnchors();
+    withRowGeometry(() => {
       const props = { ...base, sessionId: 'trim', isActive: true };
-      const row = (n: number) => ({ id: `row-${n}`, row: n, spans: [{ text: `${n}` }], timestamp: 0 });
-      const view = render(<RawTerminalView {...props} lines={[row(0), row(1), row(2)]} />);
+      const view = render(<RawTerminalView {...props} lines={win(0, 20)} />);
       const scroller = screen.getByTestId('raw-terminal').firstElementChild as HTMLDivElement;
       Object.defineProperties(scroller, {
-        scrollHeight: { configurable: true, value: 1000 },
+        scrollHeight: { configurable: true, value: 340 },
         clientHeight: { configurable: true, value: 100 },
       });
       fireEvent.wheel(scroller, { deltaY: -100 });
-      scroller.scrollTop = 300;
+      scroller.scrollTop = 85;                    // line L5 at the top
       fireEvent.scroll(scroller);
       expect(stateOf('trim').detached).toBe(true);
 
-      // Two rows fall off the top: the window now starts at buffer row 2.
-      view.rerender(<RawTerminalView {...props} lines={[row(2), row(3), row(4)]} />);
-      expect(scroller.scrollTop).toBe(300 - 2 * 17);
-      resetScrollback('trim');
-    } finally {
-      if (rowHeight) Object.defineProperty(HTMLElement.prototype, 'offsetHeight', rowHeight);
-      else delete (HTMLElement.prototype as unknown as Record<string, unknown>).offsetHeight;
-    }
+      // Five lines trimmed: the window now begins at L5, so L5 is index 0 and
+      // the same TEXT is at the top of the viewport at a different pixel.
+      view.rerender(<RawTerminalView {...props} lines={win(5, 20)} />);
+      expect(scroller.scrollTop).toBe(0);
+    });
+    resetScrollback('trim');
+    resetSessionAnchors();
   });
 
   it('does not steal the keyboard when it is not the active pane', () => {
