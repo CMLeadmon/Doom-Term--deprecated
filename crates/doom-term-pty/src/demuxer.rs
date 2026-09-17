@@ -47,6 +47,10 @@ pub struct StreamDemuxer {
     in_string: bool,
     /// An ESC seen inside a string, which may be the first half of `ESC \`.
     string_esc: bool,
+    /// Continuation bytes still owed to a UTF-8 character inside a string.
+    /// See the terminator check: `0x9c` is both the 8-bit ST and a perfectly
+    /// ordinary continuation byte — U+2714 is `e2 9c 94`.
+    string_utf8_left: u8,
     string_len: usize,
     tui_active: bool,
     /// Bytes owed back to the PTY. A terminal that stays silent when asked a
@@ -94,6 +98,7 @@ impl StreamDemuxer {
             csi_buf: Vec::with_capacity(64),
             in_string: false,
             string_esc: false,
+            string_utf8_left: 0,
             string_len: 0,
             tui_active: false,
             pending_responses: Vec::new(),
@@ -166,9 +171,32 @@ impl StreamDemuxer {
 
             // A control string runs to its terminator and reaches nobody.
             if self.in_string {
+                // Mid-character: this byte belongs to a UTF-8 sequence and must
+                // not be examined. "Opaque" does not mean "not text" — the
+                // payload this exists to swallow is JSON, and an OSC 7 inside a
+                // tmux envelope carries a path.
+                if self.string_utf8_left > 0 {
+                    self.string_utf8_left -= 1;
+                    self.string_len += 1;
+                    i += 1;
+                    continue;
+                }
                 if self.string_len == MAX_CONTROL_LEN {
-                    events.push(self.control_fault());
-                    return events;
+                    // Deliberately NOT a fault.
+                    //
+                    // `control_fault` sets `faulted` for the life of this
+                    // demuxer while the reader goes on draining the PTY, so the
+                    // session renders nothing ever again and simply looks hung.
+                    // Sixel arrives as DCS and has no chunking convention, so
+                    // an over-long body is something that legitimately happens.
+                    // Giving up on the string lets the remainder print, which is
+                    // what happened before DCS was understood at all: ugly,
+                    // visible, and recoverable.
+                    self.in_string = false;
+                    self.string_esc = false;
+                    self.string_utf8_left = 0;
+                    self.string_len = 0;
+                    continue;   // re-handle this byte in ground state
                 }
                 self.string_len += 1;
                 let escaped = self.string_esc;
@@ -181,11 +209,25 @@ impl StreamDemuxer {
                     } else if b == 0x1b {
                         self.string_esc = true;
                     }
-                } else if b == 0x9c || b == 0x07 {
-                    // 8-bit ST, and BEL accepted leniently as it is for OSC.
+                } else if b == 0x9c {
+                    // The 8-bit ST, reachable only outside a character. BEL is
+                    // NOT accepted: that leniency has only ever applied to OSC,
+                    // and honouring it here let one byte of opaque payload close
+                    // the string early — including the BEL our own shell
+                    // integration puts inside its tmux passthrough envelope at
+                    // every single prompt.
                     self.in_string = false;
                 } else if b == 0x1b {
                     self.string_esc = true;
+                } else if b >= 0xc0 {
+                    // A UTF-8 lead byte. Skip the continuations it owns.
+                    self.string_utf8_left = if b >= 0xf0 {
+                        3
+                    } else if b >= 0xe0 {
+                        2
+                    } else {
+                        1
+                    };
                 }
                 i += 1;
                 continue;
@@ -390,8 +432,12 @@ impl StreamDemuxer {
         self.faulted = true;
         self.osc_buf = Vec::new();
         self.csi_buf = Vec::new();
+        self.in_esc = false;
+        self.in_osc = false;
+        self.in_csi = false;
         self.in_string = false;
         self.string_esc = false;
+        self.string_utf8_left = 0;
         self.string_len = 0;
         self.utf8_tail.clear();
         self.pending_responses.clear();
@@ -518,6 +564,94 @@ mod tests {
     }
 
     #[test]
+    fn a_bel_inside_a_control_string_is_payload_not_a_terminator() {
+        // BEL-as-terminator is an xterm leniency that has only ever applied to
+        // OSC. Honouring it for DCS/SOS/PM/APC lets one byte of opaque payload
+        // close the string early — and the real ST then leaks too, because it
+        // is parsed in ground state.
+        let mut demuxer = StreamDemuxer::new();
+        let text = screen_text(&demuxer.process_bytes(b"before\x1bPpay\x07load\x1b\\after"));
+        assert_eq!(text, "beforeafter");
+    }
+
+    #[test]
+    fn our_own_tmux_wrapped_payload_survives_its_embedded_bel() {
+        // shell_integration's __doom_term_osc BEL-terminates the inner OSC
+        // BEFORE wrapping it in the DCS passthrough envelope, at every prompt.
+        // This is the exact byte shape it emits for an OSC 133;D marker.
+        let mut demuxer = StreamDemuxer::new();
+        let text = screen_text(
+            &demuxer.process_bytes(b"before\x1bPtmux;\x1b\x1b]133;D;0\x07\x1b\\after"),
+        );
+        assert_eq!(text, "beforeafter");
+    }
+
+    #[test]
+    fn a_utf8_continuation_byte_0x9c_inside_a_string_is_not_a_terminator() {
+        // U+2714 is e2 9c 94. Its middle byte is the 8-bit ST. A DCS body is
+        // not always binary — the payload this whole change exists to swallow
+        // is JSON text — so 0x9c must only close a string when it is not
+        // continuing a character.
+        let mut demuxer = StreamDemuxer::new();
+        let mut input = b"before\x1bP".to_vec();
+        input.extend_from_slice("\u{2714}".as_bytes());
+        input.extend_from_slice(b"payload\x1b\\after");
+        let text = screen_text(&demuxer.process_bytes(&input));
+        assert_eq!(text, "beforeafter");
+    }
+
+    #[test]
+    fn an_overlong_control_string_degrades_instead_of_killing_the_connection() {
+        // Sixel arrives as DCS and has no chunking convention. Before this
+        // change an oversized body printed as garbage — ugly, recoverable.
+        // Faulting instead sets `faulted` for the life of the demuxer, and the
+        // reader keeps draining the PTY while nothing ever reaches the screen
+        // again: the session looks hung.
+        let mut demuxer = StreamDemuxer::new();
+        let mut input = b"\x1bP".to_vec();
+        input.extend(std::iter::repeat(b'?').take(crate::stream::MAX_RECORD_BYTES + 16));
+        demuxer.process_bytes(&input);
+        let after = screen_text(&demuxer.process_bytes(b"ordinary output\r\n"));
+        assert!(
+            after.contains("ordinary output"),
+            "the connection stopped rendering entirely: {after:?}"
+        );
+    }
+
+    #[test]
+    fn no_single_payload_byte_can_close_a_control_string_early() {
+        // The property the hand-written cases kept failing: only a real ST ends
+        // a string. Sweeping every byte value catches an accidental leniency
+        // the way BEL and the 8-bit ST both slipped through — each was one byte
+        // value nobody thought to try.
+        for byte in 0u8..=255 {
+            if byte == 0x1b || byte == 0x9c {
+                continue;   // the two that legitimately participate in an ST
+            }
+            let mut demuxer = StreamDemuxer::new();
+            let input = [b"A\x1bPpay".as_slice(), &[byte], b"load\x1b\\B".as_slice()].concat();
+            let text = screen_text(&demuxer.process_bytes(&input));
+            assert_eq!(
+                text, "AB",
+                "byte {byte:#04x} closed the string early or leaked payload"
+            );
+        }
+    }
+
+    #[test]
+    fn a_lead_byte_shields_every_continuation_it_owns() {
+        // Two, three and four byte characters whose continuations include 0x9c.
+        for ch in ['\u{71c}', '\u{2714}', '\u{1F71C}'] {
+            let mut demuxer = StreamDemuxer::new();
+            let mut input = b"A\x1bP".to_vec();
+            input.extend_from_slice(ch.to_string().as_bytes());
+            input.extend_from_slice(b"\x1b\\B");
+            let text = screen_text(&demuxer.process_bytes(&input));
+            assert_eq!(text, "AB", "U+{:04X} leaked out of a control string", ch as u32);
+        }
+    }
+
+    #[test]
     fn a_warp_bootstrap_frame_never_reaches_the_renderer() {
         // Observed on a remote whose ~/.bashrc carries Warp's auto-warpify
         // snippet. ESC P fell through the ESC catch-all, so the payload printed
@@ -599,17 +733,22 @@ mod tests {
     }
 
     #[test]
-    fn an_unterminated_control_string_faults_rather_than_growing_forever() {
+    fn an_unterminated_control_string_is_bounded_and_does_not_swallow_forever() {
+        // The requirement is that a malformed string cannot consume the session
+        // silently. It used to be met by faulting, which met it too well: the
+        // fault is permanent and the connection then renders nothing at all.
+        // Giving up on the string is bounded AND recoverable.
         let mut demuxer = StreamDemuxer::new();
         let mut input = b"\x1bP".to_vec();
         input.extend(std::iter::repeat(b'x').take(crate::stream::MAX_RECORD_BYTES + 16));
-        let events = demuxer.process_bytes(&input);
-        assert!(events.iter().any(|e| matches!(
-            e,
-            DemuxEvent::StreamFault {
-                reason: crate::stream::StreamFault::ControlTooLong
-            }
-        )));
+        input.extend_from_slice(b"TAIL");
+        let text = screen_text(&demuxer.process_bytes(&input));
+        assert!(text.ends_with("TAIL"), "the stream never recovered: {:?}", &text[text.len().saturating_sub(40)..]);
+        assert!(
+            text.len() < crate::stream::MAX_RECORD_BYTES + 64,
+            "unbounded: {} bytes reached the screen",
+            text.len()
+        );
     }
 
     #[test]
