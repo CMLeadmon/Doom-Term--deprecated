@@ -181,4 +181,23 @@ export interface SystemTelemetryData {
   context_used?: number | null;
   /** The model the agent is running, read from its transcript. Never inferred. */
   agent_model?: string | null;
+  /**
+   * What a shell on the far end of a transport reported, or null when the
+   * session is local.
+   *
+   * Its presence changes how every sibling field must be read: a remote
+   * session's unreported branch is unknown, never this machine's own.
+   */
+  remote?: RemoteEnrichment | null;
+}
+
+/** The far end's own answers. Every field optional; absent means unknown. */
+export interface RemoteEnrichment {
+  host?: string | null;
+  user?: string | null;
+  shell?: string | null;
+  cwd?: string | null;
+  branch?: string | null;
+  agent?: string | null;
+  busy?: boolean | null;
 }

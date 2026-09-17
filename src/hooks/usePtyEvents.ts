@@ -1,6 +1,6 @@
 import { useEffect } from 'react';
 import { ProjectWorkspace, SessionNode } from '../types/sessionTree';
-import { AnsiLine, ScreenCursor } from '../types/terminal';
+import { AnsiLine, ScreenCursor, SystemTelemetryData } from '../types/terminal';
 import { getEmulator, onScreenParsed } from '../core/emulatorRegistry';
 import { noteOutput } from '../core/activityMonitor';
 import { attentionQueue } from '../core/attentionQueue';
@@ -84,6 +84,39 @@ export function advanceReportedTuiState(
 }
 
 const reportedTuiState = new Map<string, ReportedTuiState>();
+
+/**
+ * One telemetry frame applied to the app's view of a session.
+ *
+ * Pure and exported so the merge rule tests without a socket — `test/setup.ts`
+ * replaces globalThis.WebSocket with a stub that throws on send(), so anything
+ * reaching one fails loudly rather than passing quietly.
+ *
+ * THE RULE: when `remote` is present every field reads from it, and a field the
+ * remote did not report is unknown. The local value is not a degraded version
+ * of the remote answer — it is an answer about a different computer.
+ */
+export function applyTelemetry(previous: AppTelemetry, data: SystemTelemetryData): AppTelemetry {
+  const remote = data.remote ?? null;
+  return {
+    ...previous,
+    sessionId: data.session_id ?? undefined,
+    cwd: data.current_dir,
+    // A directory that is not a repository has no branch, and neither does a
+    // remote that did not report one. Do not invent either.
+    branch: (remote ? remote.branch : data.git_branch) ?? '',
+    isolation: data.isolation,
+    agent: data.agent_key ?? 'shell',
+    agentName: data.agent_name ?? undefined,
+    remoteHost: remote?.host ?? undefined,
+    // null means the daemon could not observe it. Leave it undefined so pct()
+    // renders '--'; `?? 0` here would invent a fresh quota.
+    rateUsed: data.rate_used ?? undefined,
+    contextUsed: data.context_used ?? undefined,
+    model: data.agent_model ?? undefined,
+    agentBusy: remote?.busy ?? previous.agentBusy,
+  };
+}
 
 /** Drop only daemon-derived observations; local controls and attention state survive. */
 export function clearObservedTelemetry(previous: AppTelemetry, sessionId: string): AppTelemetry {
@@ -292,21 +325,7 @@ export function usePtyEvents(setWorkspace: WorkspaceUpdater, setTelemetry: Telem
       }
 
       if ((data.session_id ?? '') !== ptyClient.getSessionId()) return;
-      setTelemetry((prev) => ({
-        ...prev,
-        sessionId: data.session_id ?? undefined,
-        cwd: data.current_dir,
-        // A directory that is not a repository has no branch. Do not invent one.
-        branch: data.git_branch ?? '',
-        isolation: data.isolation,
-        agent: data.agent_key ?? 'shell',
-        agentName: data.agent_name ?? undefined,
-        // null means the daemon could not observe it. Leave it undefined so
-        // pct() renders '--'; `?? 0` here would invent a fresh quota.
-        rateUsed: data.rate_used ?? undefined,
-        contextUsed: data.context_used ?? undefined,
-        model: data.agent_model ?? undefined,
-      }));
+      setTelemetry((prev) => applyTelemetry(prev, data));
     });
 
     const unbindTeleUnavailable = ptyClient.onTelemetryUnavailable((sessionId) => {

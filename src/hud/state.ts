@@ -37,6 +37,8 @@ export interface AppTelemetry {
   model?: string;
   cwd?: string;
   branch?: string;
+  /** Set only for a session whose shell is on another machine. */
+  remoteHost?: string;
   /** Sound FX active, notifications enabled, system alert — in that order. */
   chips?: [boolean, boolean, boolean];
   tokens?: { in: number; out: number; cache: number; limit: [number, number, number, number] };
@@ -117,6 +119,11 @@ export function toPlateState(app: AppTelemetry, phase?: number) {
 
   let modeText = app.isolation ? ENVIRONMENT[app.isolation] : '--';
   let modeLabel = 'ENV';
+
+  // A remote session's environment is the remote's, and the one thing worth
+  // the cell's width is WHICH machine. This read HOST for every SSH session,
+  // which was true of the laptop and useless about where the work was.
+  if (app.remoteHost) modeText = truncateLeft(`@${app.remoteHost}`.toUpperCase(), 8);
 
   if (app.pendingApproval) {
     modeText = 'WAIT';

@@ -134,3 +134,29 @@ test('the row phase is withheld when nothing is actually working', () => {
   assert.equal(toPlateState({ agentBusy: false, waiting: quiet }, 0.25).phase, undefined);
   assert.equal(toPlateState({ agentBusy: false, waiting: [] }, 0.25).phase, undefined);
 });
+
+test('a remote session names the remote in the ENV cell', () => {
+  // It read HOST for every SSH session, which was true of the laptop and
+  // useless about the machine the work was on.
+  const state = toPlateState({ isolation: 'host', remoteHost: 'devbox' });
+  assert.equal(state.modeIndicator, '@DEVBOX');
+  assert.equal(state.modeLabel, 'ENV');
+});
+
+test('a local session still reports its isolation', () => {
+  assert.equal(toPlateState({ isolation: 'host' }).modeIndicator, 'HOST');
+  assert.equal(toPlateState({ isolation: 'worktree' }).modeIndicator, 'TREE');
+  assert.equal(toPlateState({ isolation: 'sandbox' }).modeIndicator, 'CTNR');
+});
+
+test('a long remote host is truncated from the left, keeping what identifies it', () => {
+  const state = toPlateState({ isolation: 'host', remoteHost: 'build-runner-eu-west-2' });
+  assert.ok(state.modeIndicator.length <= 8);
+  assert.ok(state.modeIndicator.endsWith('WEST-2'));
+});
+
+test('a pending approval still outranks the remote host', () => {
+  // WAIT is the one thing more urgent than which machine you are on.
+  const state = toPlateState({ isolation: 'host', remoteHost: 'devbox', pendingApproval: true });
+  assert.equal(state.modeIndicator, 'WAIT');
+});
