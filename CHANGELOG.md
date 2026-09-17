@@ -13,6 +13,34 @@ where it is not.
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-09-17
+
+A fix for the feature 0.3.0 shipped. Remote enrichment tore down the session
+the moment it was actually used, so 0.3.0 should be skipped.
+
+### Fixed
+
+- **A remote reporting itself disconnected the pane.** `DemuxEvent` gained a
+  `RemoteEnrichment` variant in 0.3.0 and the daemon emitted it on every remote
+  prompt, but the client's v2 stream validator had no case for it and fell
+  through to `invalid()`, which throws. The attachment failed, the connection
+  tore down, and every in-flight write rejected with "Connection disconnected;
+  delivery is unknown. Check before retrying." It reproduced only for someone
+  who had installed the remote snippet — which is to say, only for someone
+  using the feature.
+
+  The Rust enum and the TypeScript parser are one wire format and nothing
+  enforced that. A contract test now reads the variant list out of
+  `demuxer.rs` and fails until the parser and a sample exist for each, so the
+  next variant cannot ship half-wired.
+
+`install.mjs --remote` is unaffected: it inlines the snippet between tagged
+markers rather than sourcing a file, so it has no missing-file failure mode.
+
+### Known limitations
+
+Unchanged from 0.3.0, which this release's notes do not repeat.
+
 ## [0.3.0] — 2026-09-17
 
 Doom Term learns that the machine its daemon runs on is not always the machine

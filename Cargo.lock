@@ -1009,7 +1009,7 @@ dependencies = [
 
 [[package]]
 name = "doom-term"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "doom-term-pty",
  "env_logger",
@@ -1026,7 +1026,7 @@ dependencies = [
 
 [[package]]
 name = "doom-term-pty"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1044,7 +1044,7 @@ dependencies = [
 
 [[package]]
 name = "doom-term-server"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

@@ -9,7 +9,13 @@ export type StreamEvent =
   | { type: 'BracketedPasteMode'; payload: { enabled: boolean } }
   | { type: 'AgentState'; payload: { state: string } }
   | { type: 'Cwd'; payload: { path: string } }
+  | { type: 'RemoteEnrichment'; payload: { data: RemoteEnrichment } }
   | { type: 'StreamFault'; payload: { reason: StreamFault } };
+/** What a shell on the far end of a transport reported about itself. */
+export interface RemoteEnrichment {
+  host: string | null; user: string | null; shell: string | null;
+  cwd: string | null; branch: string | null; agent: string | null; busy: boolean | null;
+}
 export type StreamPayload =
   | { type: 'Event'; payload: StreamEvent }
   | { type: 'Resize'; payload: { cols: number; rows: number } }
@@ -74,6 +80,20 @@ export function parseStreamDescriptor(value: unknown): StreamDescriptor {
     initial_cols: grid.cols, initial_rows: grid.rows,
     durable: boolean(input.durable) });
 }
+/** Every field optional on the wire; an absent one is unknown, never a default. */
+function optionalText(value: unknown): string | null {
+  return value === null || value === undefined ? null : text(value);
+}
+function remoteEnrichment(value: unknown): RemoteEnrichment {
+  const input = object(value);
+  return {
+    host: optionalText(input.host), user: optionalText(input.user),
+    shell: optionalText(input.shell), cwd: optionalText(input.cwd),
+    branch: optionalText(input.branch), agent: optionalText(input.agent),
+    busy: input.busy === null || input.busy === undefined ? null : boolean(input.busy),
+  };
+}
+
 function parseEvent(value: unknown): StreamEvent {
   const event = object(value);
   switch (event.type) {
@@ -84,6 +104,7 @@ function parseEvent(value: unknown): StreamEvent {
     case 'BracketedPasteMode': return { type: event.type, payload: { enabled: boolean(object(event.payload).enabled) } };
     case 'AgentState': return { type: event.type, payload: { state: text(object(event.payload).state) } };
     case 'Cwd': return { type: event.type, payload: { path: text(object(event.payload).path) } };
+    case 'RemoteEnrichment': return { type: event.type, payload: { data: remoteEnrichment(object(event.payload).data) } };
     case 'StreamFault': return { type: event.type, payload: { reason: fault(object(event.payload).reason) } };
     default: return invalid();
   }
