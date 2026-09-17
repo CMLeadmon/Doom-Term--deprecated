@@ -13,6 +13,105 @@ where it is not.
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-09-17
+
+Doom Term learns that the machine its daemon runs on is not always the machine
+the work is on. Everything it reported — host, branch, agent, directory — was
+computed locally and unconditionally, so an SSH session was described in terms
+of the laptop it was opened from. It now reports what the far end says, and
+`--` for whatever the far end did not say.
+
+The terminal's viewport also stops tracking the reader by scroll pixel, which
+is what made scrolling sticky, history jumble, and a full buffer crawl away
+under anyone reading it.
+
+Observed on a Windows build connected to a Linux development machine.
+
+### Added
+
+- **Remote enrichment over the existing PTY.** A shell on the far end reports
+  its own host, user, shell, directory and branch once per prompt, and the
+  status plate draws those instead of this machine's. The frame is iTerm2's
+  documented `SetUserVar`, not a private escape sequence, so the same snippet
+  is inert in iTerm2, kitty and WezTerm — they set a variable they ignore —
+  rather than printing in every terminal that is not Doom Term.
+  `node tools/agent-hooks/install.mjs --remote` installs it on a host you are
+  already connected to, additively and reversibly, with the same
+  `doom-term-hook` tagging the agent hooks use.
+- **Predictive local echo.** Over a slow link a keystroke is drawn immediately
+  in `--st-idle` and retired when the child confirms it. It engages only above
+  a measured 30 ms round trip, never on the alternate screen, and never for
+  `vim`, `vi`, `nano` or `tmux` — VS Code's rules, which have the field
+  evidence. An unconfirmed cell is visibly not a confirmed one, which is the
+  whole basis on which it sits beside Axiom 3: the uncertainty is stated. What
+  is *sent* to the child is unchanged, byte for byte.
+- **A window titlebar in the four materials**, replacing the OS chrome, with
+  the agent marks folded into it and `−` `□` `×` drawn as Unicode glyphs. This
+  amends Axiom 2 in the open: the Status Plate remains the only persistent
+  *application* chrome, and window management gets a strip. It removes one
+  piece of floating chrome — the old agents indicator sat over the terminal
+  and never had an exception.
+- **Smooth scrolling.** The wheel drives an eased, frame-rate-independent
+  scroll that honours `prefers-reduced-motion`. There was previously none of
+  any kind.
+- **Row virtualization.** Only the visible rows plus overscan are in the DOM.
+  The whole 5000-line buffer used to be, reconciled on every frame of a
+  streaming agent and on every keystroke, before an echo could paint.
+
+### Fixed
+
+- **A remote's shell bootstrap printed itself on connect.** The demuxer modelled
+  OSC and CSI and nothing else, so `ESC P` fell through to a catch-all that
+  emitted the introducer as text and returned to ground — printing every byte
+  of the payload. A machine whose `~/.bashrc` carries Warp's snippet rendered
+  its JSON hook on screen at every connect. DCS, SOS, PM and APC are now
+  consumed to their terminator. BEL does not terminate them: that leniency has
+  only ever applied to OSC, and honouring it let one byte of payload close a
+  string early — including the BEL Doom Term's own shell integration puts
+  inside its tmux passthrough envelope at every prompt.
+- **Scrollback jumbled, and a detached reader drifted.** Line ids were the
+  absolute buffer index and shifted every time scrollback trimmed, so React
+  re-associated rows with different content. The compensation meant to defend
+  against this had never executed: `getLines()` always starts at buffer index
+  0, so the trimmed delta was always `0 - 0`, and its unit test passed only by
+  feeding a shape `getLines()` cannot produce. Lines are now numbered
+  absolutely, counted from the buffer's own trim event.
+- **The reader was pinned by scroll pixel, not by line**, which is why
+  scrolling back through a running agent fought you and why the viewport
+  stuck to the bottom.
+- **`CONTEXT %`, `USAGE %`, `BRANCH` and `ENV` described the wrong machine**
+  over SSH. A field the remote did not report is now unknown rather than
+  answered locally.
+- **A keystroke typed before a session finished attaching was discarded
+  silently.** It is reported instead. No queue and no replay: bytes held now
+  would land in whatever the child is doing by the time it is ready.
+- **Scrollback search moved the viewport nowhere** once rows were windowed.
+- **An `agy` session drew Antigravity's mark in the shell's tan**, because the
+  colour table had no entry for the binary name even though the mark table did.
+
+### Known limitations
+
+- **The sticky first character is not closed.** One of its two causes — input
+  discarded before attachment — is fixed. The other is that the demuxer answers
+  every `CSI 6n` cursor-position probe with the origin, whatever the cursor is
+  doing, so an agent laying out its composer from that reply erases a cell the
+  caret is not in. Removing the fabricated answer alone would be worse: nothing
+  else can answer, and the asker would sit on a five-second timeout. Both halves
+  must land together.
+- **The instrumented `ssh` launch has no caller.** Its arguments cannot reach
+  session creation yet, so remote enrichment is reached through the rc-file
+  route above rather than automatically.
+- **Window resize and Snap Layouts on Windows are unverified.** Tauri loses
+  resize with `decorations: false` even when `resizable` is true
+  (tauri-apps/tauri#8519); `tauri-plugin-decorum` is registered to keep both,
+  and it compiles, but nothing here has confirmed it behaves on a real Windows
+  desktop.
+- **Context and rate limits stay `--` across a transport.** Both are read from
+  an agent's transcript, and the transcript is on the other machine.
+- Trim counting reads a private `@xterm/headless` interface. It is guarded: if
+  that interface changes, line numbers degrade to buffer indices rather than
+  going silently wrong.
+
 ## [0.2.0] — 2026-09-17
 
 Windows becomes a supported platform rather than a published degraded build,

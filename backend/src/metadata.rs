@@ -80,21 +80,21 @@ pub fn telemetry(
         r.branch.clone()
     } else {
         pty::process_io::run_bounded(
-        Path::new("git"),
-        &[
-            "-C".into(),
-            current_dir.clone(),
-            "rev-parse".into(),
-            "--abbrev-ref".into(),
-            "HEAD".into(),
-        ],
-        &[],
-        pty::process_io::HelperLimits {
-            timeout: Duration::from_secs(2),
-            input_bytes: 0,
-            output_bytes: 4096,
-        },
-    )
+            Path::new("git"),
+            &[
+                "-C".into(),
+                current_dir.clone(),
+                "rev-parse".into(),
+                "--abbrev-ref".into(),
+                "HEAD".into(),
+            ],
+            &[],
+            pty::process_io::HelperLimits {
+                timeout: Duration::from_secs(2),
+                input_bytes: 0,
+                output_bytes: 4096,
+            },
+        )
         .ok()
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .map(|s| s.trim().to_string())
@@ -134,16 +134,16 @@ pub fn telemetry(
         (None, None)
     } else {
         match agent.as_ref().map(|a| a.key) {
-        Some("claude") => (
-            usage::context::context_fraction(&current_dir, session_id.as_deref(), process),
-            None,
-        ),
-        Some("codex") => {
-            match usage::codex::reading(&current_dir, session_id.as_deref(), process) {
-                Some((reading, rate)) => (Some(reading), rate),
-                None => (None, None),
+            Some("claude") => (
+                usage::context::context_fraction(&current_dir, session_id.as_deref(), process),
+                None,
+            ),
+            Some("codex") => {
+                match usage::codex::reading(&current_dir, session_id.as_deref(), process) {
+                    Some((reading, rate)) => (Some(reading), rate),
+                    None => (None, None),
+                }
             }
-        }
             _ => (None, None),
         }
     };
@@ -181,7 +181,7 @@ pub fn telemetry(
         // event does not. Absent, not guessed: this field has only ever
         // held what was read.
         agent_model: context.map(|c| c.model).filter(|m| !m.is_empty()),
-        remote,
+        remote: remote.map(Box::new),
     }
 }
 

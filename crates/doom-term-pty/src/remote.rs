@@ -114,7 +114,8 @@ mod tests {
         // otherwise — the cwd here even carries a space, which is why it is a
         // better fixture than anything I would have invented.
         let captured = "eyJ2IjoxLCJob3N0IjoiU0VSNi1NQVgiLCJ1c2VyIjoiY2xlYWRtb24iLCJzaGVsbCI6ImJhc2giLCJjd2QiOiIvdmFyL2hvbWUvY2xlYWRtb24vUHJvamVjdHMvRG9vbSBUZXJtIiwiYnJhbmNoIjoiZmVhdC9yZW1vdGUtZW5oYW5jZW1lbnQifQ==";
-        let got = parse_frame(captured).expect("the shipped snippet must produce a parseable frame");
+        let got =
+            parse_frame(captured).expect("the shipped snippet must produce a parseable frame");
         assert!(got.host.is_some(), "the snippet reported no host");
         assert!(got.user.is_some(), "the snippet reported no user");
         assert_eq!(got.shell.as_deref(), Some("bash"));
@@ -180,7 +181,9 @@ mod tests {
     fn a_refused_field_refuses_the_whole_frame() {
         // Not "keep the good fields": half a remote identity beside half of the
         // local machine's reads as a coherent answer and is not one.
-        let got = parse_frame(&encode("{\"v\":1,\"host\":\"devbox\",\"user\":\"c\\u0007ml\"}"));
+        let got = parse_frame(&encode(
+            "{\"v\":1,\"host\":\"devbox\",\"user\":\"c\\u0007ml\"}",
+        ));
         assert!(got.is_none());
     }
 }

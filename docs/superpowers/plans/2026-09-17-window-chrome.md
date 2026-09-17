@@ -56,7 +56,7 @@ strips, no sidebars, no floating toolbars — and this plan removes one.
 2026-09-17 with webkit2gtk-4.1 2.52.3, glib 2.84.4, dbus-1 1.16.0, cargo 1.98.0:
 
 ```bash
-podman exec --user cleadmon -w "/var/home/cleadmon/Projects/Doom Term" \
+podman exec --user "$USER" -w "$PWD" \
   doom-tauri bash -lc '<command>'
 ```
 
@@ -528,7 +528,7 @@ which currently holds exactly `"core:default"`, `"shell:default"`,
 - [ ] **Step 2: Compile in the toolbox**
 
 ```bash
-podman exec --user cleadmon -w "/var/home/cleadmon/Projects/Doom Term" \
+podman exec --user "$USER" -w "$PWD" \
   doom-tauri bash -lc 'cargo check --manifest-path src-tauri/Cargo.toml'
 ```
 Expected: compiles. A missing system package here is an ENVIRONMENT BLOCK, not
@@ -539,7 +539,7 @@ investigated rather than worked around.
 - [ ] **Step 3: Run the spike and record the answer**
 
 ```bash
-podman exec --user cleadmon -w "/var/home/cleadmon/Projects/Doom Term" \
+podman exec --user "$USER" -w "$PWD" \
   doom-tauri bash -lc 'npm run tauri dev'
 ```
 With `decorations: false` in `tauri.conf.json:22` and
@@ -687,7 +687,7 @@ Expected: typecheck, test, build, hud:check, cargo:check, cargo:test all pass.
 - [ ] **Step 2: Run the Tauri check in the toolbox, not on the host**
 
 ```bash
-podman exec --user cleadmon -w "/var/home/cleadmon/Projects/Doom Term" \
+podman exec --user "$USER" -w "$PWD" \
   doom-tauri bash -lc 'npm run check:tauri'
 ```
 Expected: pass. On the bare host this step prints ENVIRONMENT BLOCK, which is

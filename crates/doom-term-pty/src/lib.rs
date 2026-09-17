@@ -5,7 +5,6 @@
 //! Both consume the same bounded journal and exact attachment primitives;
 //! transport callbacks do not live in this crate.
 
-pub mod remote;
 pub mod demuxer;
 pub mod foreground;
 /// Windows only: the process-tree equivalent of a Unix process group.
@@ -13,6 +12,7 @@ pub mod foreground;
 pub mod job;
 pub mod paste;
 pub mod process_io;
+pub mod remote;
 mod runtime_files;
 pub mod session;
 pub mod shell_integration;

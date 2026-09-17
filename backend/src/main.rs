@@ -137,7 +137,12 @@ pub enum ServerMessage {
         ///
         /// Its presence changes how every sibling field must be read: a remote
         /// session's unreported branch is unknown, never the daemon's own.
-        remote: Option<doom_term_pty::remote::RemoteEnrichment>,
+        /// Boxed to keep this variant from dwarfing every other one — clippy's
+        /// large_enum_variant, which every ServerMessage would otherwise pay
+        /// for. Option<Box<T>> rather than clippy's suggested Box<Option<T>>:
+        /// it keeps the null niche, does not allocate for a local session, and
+        /// serializes identically either way.
+        remote: Option<Box<doom_term_pty::remote::RemoteEnrichment>>,
     },
     DirectoryListing {
         request_id: String,

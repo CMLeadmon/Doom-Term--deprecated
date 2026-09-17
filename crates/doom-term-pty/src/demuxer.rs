@@ -3,18 +3,34 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum DemuxEvent {
-    Output { data: String },
+    Output {
+        data: String,
+    },
     PromptStart,
     CommandStart,
     ExecutionStart,
-    ExecutionEnd { exit_code: Option<i32> },
-    TuiMode { active: bool },
-    BracketedPasteMode { enabled: bool },
-    AgentState { state: String },
-    Cwd { path: String },
+    ExecutionEnd {
+        exit_code: Option<i32>,
+    },
+    TuiMode {
+        active: bool,
+    },
+    BracketedPasteMode {
+        enabled: bool,
+    },
+    AgentState {
+        state: String,
+    },
+    Cwd {
+        path: String,
+    },
     /// What the shell on the far end of a transport reported about itself.
-    RemoteEnrichment { data: crate::remote::RemoteEnrichment },
-    StreamFault { reason: crate::stream::StreamFault },
+    RemoteEnrichment {
+        data: crate::remote::RemoteEnrichment,
+    },
+    StreamFault {
+        reason: crate::stream::StreamFault,
+    },
 }
 
 /// A malformed unterminated control record must not grow forever or turn its
@@ -198,7 +214,7 @@ impl StreamDemuxer {
                     self.string_esc = false;
                     self.string_utf8_left = 0;
                     self.string_len = 0;
-                    continue;   // re-handle this byte in ground state
+                    continue; // re-handle this byte in ground state
                 }
                 self.string_len += 1;
                 let escaped = self.string_esc;
@@ -589,9 +605,8 @@ mod tests {
         // BEFORE wrapping it in the DCS passthrough envelope, at every prompt.
         // This is the exact byte shape it emits for an OSC 133;D marker.
         let mut demuxer = StreamDemuxer::new();
-        let text = screen_text(
-            &demuxer.process_bytes(b"before\x1bPtmux;\x1b\x1b]133;D;0\x07\x1b\\after"),
-        );
+        let text =
+            screen_text(&demuxer.process_bytes(b"before\x1bPtmux;\x1b\x1b]133;D;0\x07\x1b\\after"));
         assert_eq!(text, "beforeafter");
     }
 
@@ -618,7 +633,10 @@ mod tests {
         // again: the session looks hung.
         let mut demuxer = StreamDemuxer::new();
         let mut input = b"\x1bP".to_vec();
-        input.extend(std::iter::repeat(b'?').take(crate::stream::MAX_RECORD_BYTES + 16));
+        input.extend(std::iter::repeat_n(
+            b'?',
+            crate::stream::MAX_RECORD_BYTES + 16,
+        ));
         demuxer.process_bytes(&input);
         let after = screen_text(&demuxer.process_bytes(b"ordinary output\r\n"));
         assert!(
@@ -635,7 +653,7 @@ mod tests {
         // value nobody thought to try.
         for byte in 0u8..=255 {
             if byte == 0x1b || byte == 0x9c {
-                continue;   // the two that legitimately participate in an ST
+                continue; // the two that legitimately participate in an ST
             }
             let mut demuxer = StreamDemuxer::new();
             let input = [b"A\x1bPpay".as_slice(), &[byte], b"load\x1b\\B".as_slice()].concat();
@@ -656,7 +674,11 @@ mod tests {
             input.extend_from_slice(ch.to_string().as_bytes());
             input.extend_from_slice(b"\x1b\\B");
             let text = screen_text(&demuxer.process_bytes(&input));
-            assert_eq!(text, "AB", "U+{:04X} leaked out of a control string", ch as u32);
+            assert_eq!(
+                text, "AB",
+                "U+{:04X} leaked out of a control string",
+                ch as u32
+            );
         }
     }
 
@@ -666,8 +688,8 @@ mod tests {
         let payload = base64::engine::general_purpose::STANDARD
             .encode(r#"{"v":1,"host":"devbox","branch":"main"}"#);
         let mut demuxer = StreamDemuxer::new();
-        let events =
-            demuxer.process_bytes(format!("a\x1b]1337;SetUserVar=doomterm={payload}\x07b").as_bytes());
+        let events = demuxer
+            .process_bytes(format!("a\x1b]1337;SetUserVar=doomterm={payload}\x07b").as_bytes());
         assert_eq!(screen_text(&events), "ab");
         let found = events.iter().find_map(|e| match e {
             DemuxEvent::RemoteEnrichment { data } => Some(data.clone()),
@@ -721,7 +743,10 @@ mod tests {
             !text.contains("SourcedRcFileForWarp"),
             "DCS payload reached the screen: {text:?}"
         );
-        assert!(!text.contains("$f"), "DCS payload reached the screen: {text:?}");
+        assert!(
+            !text.contains("$f"),
+            "DCS payload reached the screen: {text:?}"
+        );
         assert_eq!(text, "beforeafter");
     }
 
@@ -798,10 +823,17 @@ mod tests {
         // Giving up on the string is bounded AND recoverable.
         let mut demuxer = StreamDemuxer::new();
         let mut input = b"\x1bP".to_vec();
-        input.extend(std::iter::repeat(b'x').take(crate::stream::MAX_RECORD_BYTES + 16));
+        input.extend(std::iter::repeat_n(
+            b'x',
+            crate::stream::MAX_RECORD_BYTES + 16,
+        ));
         input.extend_from_slice(b"TAIL");
         let text = screen_text(&demuxer.process_bytes(&input));
-        assert!(text.ends_with("TAIL"), "the stream never recovered: {:?}", &text[text.len().saturating_sub(40)..]);
+        assert!(
+            text.ends_with("TAIL"),
+            "the stream never recovered: {:?}",
+            &text[text.len().saturating_sub(40)..]
+        );
         assert!(
             text.len() < crate::stream::MAX_RECORD_BYTES + 64,
             "unbounded: {} bytes reached the screen",

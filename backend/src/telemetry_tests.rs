@@ -411,8 +411,14 @@ async fn a_field_the_remote_did_not_report_is_unknown_not_the_local_value() {
     else {
         panic!("missing telemetry response")
     };
-    assert_eq!(git_branch, None, "the local branch stood in for the remote's");
-    assert_eq!(username, "unknown", "the local user stood in for the remote's");
+    assert_eq!(
+        git_branch, None,
+        "the local branch stood in for the remote's"
+    );
+    assert_eq!(
+        username, "unknown",
+        "the local user stood in for the remote's"
+    );
 }
 
 #[tokio::test]
@@ -421,7 +427,11 @@ async fn a_remote_session_cannot_report_context_or_rate() {
     let fixture = Fixture::new();
     let pane = fixture.pane("claude", "nocontext");
     fixture.hook("claude", Some(&pane), 20000).await;
-    report_remote(&fixture, &pane, r#"{"v":1,"host":"devbox","agent":"claude"}"#);
+    report_remote(
+        &fixture,
+        &pane,
+        r#"{"v":1,"host":"devbox","agent":"claude"}"#,
+    );
     let ServerMessage::Telemetry {
         context_used,
         rate_used,
@@ -431,7 +441,10 @@ async fn a_remote_session_cannot_report_context_or_rate() {
     else {
         panic!("missing telemetry response")
     };
-    assert_eq!(context_used, None, "invented a context reading across a transport");
+    assert_eq!(
+        context_used, None,
+        "invented a context reading across a transport"
+    );
     assert_eq!(rate_used, None);
     // ...but the agent the REMOTE named is still reported.
     assert_eq!(agent_key.as_deref(), Some("claude"));
@@ -460,7 +473,11 @@ async fn the_remote_block_survives_the_hand_injected_incarnation() {
     // the client with no error anywhere.
     let fixture = Fixture::new();
     let pane = fixture.pane("claude", "wire");
-    report_remote(&fixture, &pane, r#"{"v":1,"host":"devbox","branch":"main"}"#);
+    report_remote(
+        &fixture,
+        &pane,
+        r#"{"v":1,"host":"devbox","branch":"main"}"#,
+    );
     let message = telemetry_for(&fixture, &pane);
 
     let mut reply = serde_json::to_value(&message).unwrap();

@@ -375,7 +375,10 @@ mod tests {
         let script = super::remote_enrichment_snippet();
         assert!(script.contains("DOOM_TERM_BOOTSTRAPPED"));
         assert!(script.contains("SetUserVar=doomterm="));
-        assert!(script.contains("\"v\":1"), "schema version must match remote.rs");
+        assert!(
+            script.contains("\"v\":1"),
+            "schema version must match remote.rs"
+        );
     }
 
     #[test]
@@ -385,8 +388,12 @@ mod tests {
 
     #[test]
     fn a_remote_launch_carries_the_snippet_and_the_users_own_arguments() {
-        let launch = super::ssh_launch(&["devbox".to_string(), "-p".to_string(), "2222".to_string()]);
-        assert!(launch.args.iter().any(|a| a.contains("DOOM_TERM_BOOTSTRAPPED")));
+        let launch =
+            super::ssh_launch(&["devbox".to_string(), "-p".to_string(), "2222".to_string()]);
+        assert!(launch
+            .args
+            .iter()
+            .any(|a| a.contains("DOOM_TERM_BOOTSTRAPPED")));
         assert!(launch.args.contains(&"devbox".to_string()));
         assert!(launch.args.contains(&"2222".to_string()));
         assert!(launch.args.contains(&"-t".to_string()));
