@@ -94,7 +94,8 @@ test('every interpolated value is JSON-escaped', () => {
   }
 });
 
-test('a symlinked rc file is patched through, not replaced', () => {
+// Creating a symlink on Windows needs developer mode or elevation.
+test('a symlinked rc file is patched through, not replaced', { skip: process.platform === 'win32' }, () => {
   // rename(2) replaces the link, not its target, so a dotfiles-managed rc file
   // would be orphaned and silently re-linked away on the next apply.
   const store = mkdtempSync(join(tmpdir(), 'doom-dotfiles-'));
@@ -109,7 +110,9 @@ test('a symlinked rc file is patched through, not replaced', () => {
     'the real file was never patched');
 });
 
-test('the rc file keeps its own permissions', () => {
+// POSIX permission bits only. Windows' chmod toggles a read-only flag and
+// nothing else, and this route targets remote Linux hosts anyway.
+test('the rc file keeps its own permissions', { skip: process.platform === 'win32' }, () => {
   // These files routinely carry exported tokens, and this route targets shared
   // hosts. Widening 0600 to 0644 exposes them to every other local user.
   const root = mkdtempSync(join(tmpdir(), 'doom-remote-mode-'));

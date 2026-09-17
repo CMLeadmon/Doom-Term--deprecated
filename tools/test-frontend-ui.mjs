@@ -822,6 +822,21 @@ try {
   console.error(`[UI Test] FAIL: ${error.stack || error.message}`);
   if (page && !page.isClosed()) {
     console.error(`[UI Test] terminal evidence: ${(await page.getByTestId('raw-terminal').allInnerTexts()).join('\n').slice(-6000)}`);
+    // The rendered window, not just the text: with only a slice of rows in the
+    // document, "the text is missing" and "the reader is looking elsewhere" are
+    // different failures and read identically from innerText alone.
+    console.error('[UI Test] window state: ' + JSON.stringify(await page.getByTestId('raw-terminal').evaluate((element) => {
+      const scroll = element.firstElementChild;
+      const idx = [...element.querySelectorAll('[data-terminal-line]')]
+        .map((r) => Number(r.dataset.terminalLine));
+      return {
+        scrollTop: scroll?.scrollTop,
+        scrollHeight: scroll?.scrollHeight,
+        clientHeight: scroll?.clientHeight,
+        atTail: scroll ? scroll.scrollHeight - (scroll.scrollTop + scroll.clientHeight) < 24 : null,
+        renderedFirst: idx[0], renderedLast: idx[idx.length - 1], renderedCount: idx.length,
+      };
+    })));
     await page.screenshot({ path: join(artifacts, 'failure.png') });
   }
   process.exitCode = 1;
