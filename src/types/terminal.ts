@@ -32,7 +32,14 @@ export interface AnsiSpan {
  * need it and three hand-copied literals is how they drift apart.
  */
 export interface ScreenCursor {
-  /** Index into the lines array. */
+  /**
+   * Absolute line number since the session began, monotonic across trimming —
+   * the same space as `AnsiLine.row`, which is what this is compared against.
+   *
+   * NOT an index into the lines array, and it never was: `getCursor()` has
+   * always returned `baseY + cursorY`. The comment that said otherwise was
+   * wrong for as long as it existed.
+   */
   row: number;
   /** Column, in cells. */
   col: number;
@@ -52,7 +59,16 @@ export interface ScreenCursor {
 }
 
 export interface AnsiLine {
+  /** `L<row>`. Stable for the life of the line; see `row`. */
   id: string;
+  /**
+   * Absolute line number since the session began, counting lines already
+   * trimmed out of scrollback. Fixed for the life of the line, which is what
+   * makes it usable as a React key and as a reader's scroll anchor.
+   *
+   * Distinct from the `data-terminal-line` DOM attribute and from
+   * `scrollback.ts`'s `line`/`total`, which are both array indices.
+   */
   row?: number;
   spans: AnsiSpan[];
   isError?: boolean;

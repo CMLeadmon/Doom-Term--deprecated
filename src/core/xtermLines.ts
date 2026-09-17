@@ -158,11 +158,21 @@ function lastUsedLine(buffer: IBuffer, probe: IBufferCell): number {
 /**
  * Rows from `startLine` to the last one holding anything.
  *
- * The id is the absolute buffer line. It shifts by one each time scrollback
- * trims, which costs a re-render of the rows below; a monotonic id would need a
- * line-creation event xterm does not expose.
+ * The id and `row` are the ABSOLUTE line number: how many lines this session
+ * has produced before this one, counting the ones already trimmed away. They do
+ * not move when scrollback trims, so a React key keeps naming the same content
+ * and a reader's anchor keeps naming the same text.
+ *
+ * `trimmed` comes from `XtermScreen.trimmedCount()`, which measures it with a
+ * marker — the line-creation event xterm does not expose is not needed, because
+ * a marker already tracks a line as the buffer moves underneath it.
  */
-export function linesFrom(buffer: IBuffer, startLine: number, previous: AnsiLine[] = []): AnsiLine[] {
+export function linesFrom(
+  buffer: IBuffer,
+  startLine: number,
+  previous: AnsiLine[] = [],
+  trimmed = 0,
+): AnsiLine[] {
   const out: AnsiLine[] = [];
   const probe = buffer.getNullCell();
   const from = Math.max(0, startLine);
@@ -170,11 +180,16 @@ export function linesFrom(buffer: IBuffer, startLine: number, previous: AnsiLine
   for (let y = from; y <= to; y++) {
     const line = buffer.getLine(y);
     if (!line) continue;
-    const next = lineToAnsi(line, `row-${y}`, probe, y);
+    // ABSOLUTE, not the buffer index. `y` shifts by one every time scrollback
+    // trims, so a React key built from it named different content one frame
+    // later and the whole list below was re-associated. `trimmed + y` is fixed
+    // for the life of the line.
+    const absolute = trimmed + y;
+    const next = lineToAnsi(line, `L${absolute}`, probe, absolute);
     const old = previous[y - from];
     // Preserve immutable row identity so React.memo can skip unchanged history.
     // Compare attributes as well as text: an SGR-only repaint must still render.
-    const unchanged = old && old.row === y && old.isWrapped === next.isWrapped
+    const unchanged = old && old.row === absolute && old.isWrapped === next.isWrapped
       && old.isError === next.isError && old.spans.length === next.spans.length
       && old.spans.every((span, i) => span.text === next.spans[i].text && sameAttr(span, next.spans[i]));
     out.push(unchanged ? old : next);

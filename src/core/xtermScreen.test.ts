@@ -427,3 +427,58 @@ describe('synchronized output', () => {
     } finally { screen.dispose(); }
   });
 });
+
+describe('trim counting', () => {
+  it('counts lines trimmed off the top, monotonically', async () => {
+    // Five lines of scrollback so trimming starts almost immediately; the
+    // production value is 5000 and would need that many writes to reach.
+    const screen = new XtermScreen(10, 3, 5);
+    try {
+      expect(screen.trimmedCount()).toBe(0);
+      for (let i = 0; i < 40; i++) await parsed(screen, `line${i}\r\n`);
+      const first = screen.trimmedCount();
+      expect(first).toBeGreaterThan(0);
+      for (let i = 0; i < 10; i++) await parsed(screen, `more${i}\r\n`);
+      expect(screen.trimmedCount()).toBeGreaterThanOrEqual(first);
+    } finally { screen.dispose(); }
+  });
+
+  it('numbers lines absolutely, so an id survives trimming', async () => {
+    const screen = new XtermScreen(10, 3, 5);
+    try {
+      for (let i = 0; i < 30; i++) await parsed(screen, `L${i}\r\n`);
+      const lines = screen.getLines();
+      const trimmed = screen.trimmedCount();
+      expect(trimmed).toBeGreaterThan(0);
+      // The window's first row is the absolute number, not buffer index 0.
+      expect(lines[0].row).toBe(trimmed);
+      expect(lines[0].id).toBe(`L${trimmed}`);
+      // Consecutive, and consecutive with the id.
+      expect(lines[1].row).toBe(trimmed + 1);
+      expect(lines[1].id).toBe(`L${trimmed + 1}`);
+    } finally { screen.dispose(); }
+  });
+
+  it('puts the caret in the same space as the rows it is compared against', async () => {
+    const screen = new XtermScreen(10, 3, 5);
+    try {
+      for (let i = 0; i < 30; i++) await parsed(screen, `L${i}\r\n`);
+      const lines = screen.getLines();
+      const cursor = screen.getCursor();
+      // RawTerminalView compares cursor.row against line.row directly; if they
+      // were in different spaces the caret would land on the wrong line.
+      const onALine = lines.some((l) => l.row === cursor.row);
+      expect(onALine).toBe(true);
+    } finally { screen.dispose(); }
+  });
+
+  it('forgets its trim count when the buffer is reconstructed', async () => {
+    const screen = new XtermScreen(10, 3, 5);
+    try {
+      for (let i = 0; i < 30; i++) await parsed(screen, `L${i}\r\n`);
+      expect(screen.trimmedCount()).toBeGreaterThan(0);
+      screen.reset();
+      expect(screen.trimmedCount()).toBe(0);
+    } finally { screen.dispose(); }
+  });
+});

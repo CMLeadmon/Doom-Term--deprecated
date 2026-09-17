@@ -57,15 +57,20 @@ export class XtermScreen implements TerminalScreen {
     timer: ReturnType<typeof setTimeout>;
   }>();
 
-  constructor(cols: number, rows: number) {
+  /**
+   * `scrollback` is overridable for tests only. Trimming is the behaviour that
+   * matters here and it is 5000 lines away at the production value.
+   */
+  constructor(cols: number, rows: number, private readonly scrollback: number = SCROLLBACK) {
     this.term = this.createTerminal(cols, rows);
+    this.armAnchor();
   }
 
   private createTerminal(cols: number, rows: number): Terminal {
     const terminal = new Terminal({
       cols,
       rows,
-      scrollback: SCROLLBACK,
+      scrollback: this.scrollback,
       // Treat LF as CRLF, as the emulator this replaces did. A PTY with ONLCR
       // delivers CRLF anyway, so this only matters for a stream that emits bare
       // LF — and without it that stream staircases across the screen.
@@ -108,6 +113,9 @@ export class XtermScreen implements TerminalScreen {
       if (this.disposed || this.parserFailure || generation !== this.parserGeneration) return;
       this.pendingWrites--;
       this.applied = ticket;
+      // Trimming happens inside a write. Reading the counter only when the view
+      // renders would miss whole bursts on a session nobody is looking at.
+      this.syncTrimmed();
       for (const boundary of this.boundaries) {
         if (boundary.target > this.applied) continue;
         clearTimeout(boundary.timer);
@@ -263,8 +271,72 @@ export class XtermScreen implements TerminalScreen {
     return id;
   }
 
+  /**
+   * Lines trimmed off the top since this screen was created. Monotonic.
+   *
+   * Neither `buffer.length` nor `buffer.baseY` can supply this: both saturate
+   * once scrollback is full, which is precisely when trimming begins. A marker
+   * can. Its `.line` is the marked line's CURRENT buffer index and falls as
+   * rows are deleted above it, so the difference between where the line was and
+   * where it is counts the deletions exactly.
+   *
+   * The anchor rides the cursor rather than the oldest row, because a marker on
+   * the oldest row is the very first thing trimming destroys. It is renewed
+   * while it is still well clear of the floor, so the count is never
+   * interrupted by a disposal we did not see coming.
+   */
+  private trimmed = 0;
+  private anchorMarker: IMarker | null = null;
+  /** The absolute line number `anchorMarker` was registered on. */
+  private anchorAbsolute = 0;
+
+  /**
+   * Put a marker on the current line and remember its absolute number.
+   *
+   * The anchor rides the CURSOR, never the oldest row: a marker on the oldest
+   * row is the first thing trimming destroys, so it would be renewed constantly
+   * and measure nothing.
+   */
+  private armAnchor(): void {
+    const marker = this.term.registerMarker(0) ?? null;
+    this.anchorMarker = marker;
+    if (!marker) return;
+    const absolute = this.trimmed + marker.line;
+    this.anchorAbsolute = absolute;
+    marker.onDispose(() => {
+      if (this.anchorMarker !== marker) return;
+      // The marked line has left the buffer, so every line up to and including
+      // it has. The count is exact at this instant and unrecoverable after it,
+      // which is the whole reason it is taken here.
+      if (absolute + 1 > this.trimmed) this.trimmed = absolute + 1;
+      this.anchorMarker = null;
+    });
+  }
+
+  private syncTrimmed(): void {
+    const marker = this.anchorMarker;
+    if (marker && !marker.isDisposed && marker.line >= 0) {
+      const measured = this.anchorAbsolute - marker.line;
+      // Monotonic. A resize reflows rows and can move a marker, and the number
+      // of lines that have left the buffer cannot go down.
+      if (measured > this.trimmed) this.trimmed = measured;
+      return;
+    }
+    this.armAnchor();
+  }
+
+  trimmedCount(): number {
+    this.syncTrimmed();
+    return this.trimmed;
+  }
+
   getLines(): AnsiLine[] {
-    this.renderedLines = linesFrom(this.term.buffer.active, 0, this.renderedLines);
+    this.renderedLines = linesFrom(
+      this.term.buffer.active,
+      0,
+      this.renderedLines,
+      this.trimmedCount(),
+    );
     return this.renderedLines;
   }
 
@@ -277,7 +349,12 @@ export class XtermScreen implements TerminalScreen {
    */
   getCursor(): ScreenCursor {
     const buffer = this.term.buffer.active;
-    const row = buffer.baseY + buffer.cursorY;
+    // The buffer's own index, for reading a cell...
+    const bufferRow = buffer.baseY + buffer.cursorY;
+    // ...and the absolute line number, which is what `AnsiLine.row` holds and
+    // what the view compares against. Mixing the two reads a cell off the
+    // wrong line.
+    const row = this.trimmedCount() + bufferRow;
     // Pending autowrap keeps cursorX == cols until the next glyph arrives.
     const col = Math.min(buffer.cursorX, this.term.cols - 1);
     // The cell under the caret, read here because this is the only place with
@@ -286,7 +363,7 @@ export class XtermScreen implements TerminalScreen {
     // stays readable. Blending the block with whatever colour the program
     // chose produces an arbitrary third colour instead — measured at
     // difference(#e0a92c, #e8dcbc) = #083390, navy on amber.
-    const cell = buffer.getLine(row)?.getCell(col);
+    const cell = buffer.getLine(bufferRow)?.getCell(col);
     const glyph = cell?.getChars() ?? '';
     const width = cell?.getWidth() ?? 1;
     return {
@@ -303,7 +380,7 @@ export class XtermScreen implements TerminalScreen {
     // An unknown mark is a restored session's, or one whose line has scrolled
     // out. Everything beats nothing.
     if (!marker) return this.getLines();
-    return linesFrom(this.term.buffer.active, marker.line);
+    return linesFrom(this.term.buffer.active, marker.line, [], this.trimmedCount());
   }
 
   resize(cols: number, rows: number): void {
@@ -330,6 +407,10 @@ export class XtermScreen implements TerminalScreen {
     this.term = this.createTerminal(cols, rows);
     this.marks.clear();
     this.renderedLines = [];
+    this.trimmed = 0;
+    this.anchorMarker = null;
+    this.anchorAbsolute = 0;
+    this.armAnchor();
   }
 
   dispose(): void {
