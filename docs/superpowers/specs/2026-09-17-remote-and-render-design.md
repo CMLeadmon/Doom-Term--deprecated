@@ -135,6 +135,29 @@ forever, once scrollback is full at 5000 lines (`xtermScreen.ts:9`).
 virtualization. A keystroke at the bottom of a full buffer reconciles 5000
 elements before its echo can paint.
 
+#### The trim compensation never runs
+
+Worse than the comment admits, and only visible once the producers are traced.
+`XtermScreen.getLines()` (`xtermScreen.ts:266`) is the sole production source of
+the `lines` prop — `usePtyEvents.ts:236` calls it, the value lands on
+`node.tuiLines`, and `App.tsx:520` and `:530` pass it in. It always calls
+`linesFrom(buffer, 0, ...)`, so **`lines[0].row` is always 0**. The sibling
+method that would yield a non-zero first row, `linesSince(mark)`
+(`xtermScreen.ts:301`), has no production caller anywhere in `src/`.
+
+So in the follow effect, `firstRow` is 0, `previousFirstRow` is 0, `trimmed` is
+`0 - 0`, and `if (trimmed > 0 ...)` is never true. The roughly sixty lines of
+trim compensation at `RawTerminalView.tsx:385-396` are **unreachable in the
+running application.** They pass their unit test only because
+`RawTerminalView.test.tsx:214-245` hand-feeds `row(2), row(3), row(4)` — a shape
+`getLines()` cannot produce.
+
+This is the most direct explanation of the reported jumbled history. A detached
+reader receives no compensation at all, so once the 5000-line buffer is full
+(`xtermScreen.ts:9`) and an agent keeps writing, the text under them crawls
+away — precisely the failure that code was written to prevent, by a correction
+that has never once executed.
+
 ### Finding 5. Refused input is silently swallowed
 
 `core/sessionAttachment.ts:277-282`:
