@@ -274,6 +274,30 @@ introducers are declined, because in UTF-8 they are continuation bytes."
 
 ## Stage 2 — The demuxer stops inventing a cursor position
 
+> **BLOCKED — do not execute as written. Found during execution, 2026-09-17.**
+>
+> Step 3 removes the `"6n"` arm from `csi_reply`. With it gone, `is_query` is
+> false and the CSI is forwarded to the renderer — but `@xterm/headless`'s
+> `onData` is not wired back to the PTY (`core/commandDelivery.ts`), so the
+> asker receives **nothing** and blocks on its own timeout.
+>
+> That is not a neutral "declining". It reintroduces a measured regression the
+> query-answering code was written to fix: silence on `CSI 6n` and OSC 10/11
+> stalls probing programs about five seconds each, roughly fifteen seconds per
+> new terminal. Trading a wrong answer for a fifteen-second stall is not an
+> improvement, and this plan would have shipped it.
+>
+> **The fix needs both halves in one change**, and the second half is
+> TypeScript this plan does not own:
+> 1. demuxer stops answering and forwards the query (this stage), **and**
+> 2. `XtermScreen` — the only component with an exact cursor — answers it, with
+>    its reply written back through `ptyClient`, costing one local round trip
+>    rather than five seconds.
+>
+> Until (2) exists, the fabricated `\x1b[1;1R` stays. It is wrong, and it is
+> less wrong than a stall. Re-plan this as a single cross-cutting stage.
+
+
 **Files:**
 - Modify: `crates/doom-term-pty/src/demuxer.rs:123-126`
 - Test: inline `mod tests`
