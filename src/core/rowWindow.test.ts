@@ -73,4 +73,20 @@ describe('rowWindow', () => {
     expect(w.start).toBe(0);
     expect(w.end).toBe(total);
   });
+
+  it('covers the viewport even when firstVisible is stale', () => {
+    // firstVisible is React state and can lag the rows it describes — a pane
+    // hidden when it was last set, a buffer that changed size under it, a
+    // screen swap. The shortfall renders as blank spacer over live output, and
+    // no amount of scrolling recovers rows that were never in the document.
+    const w = rowWindow({ firstVisible: 1032, viewportRows: 44, overscan: 20, total: 1033, rowHeight: 17 });
+    expect(w.end - w.start).toBeGreaterThanOrEqual(44);
+    expect(w.end).toBe(1033);
+    expect(w.padTopPx + (w.end - w.start) * 17 + w.padBottomPx).toBe(1033 * 17);
+  });
+
+  it('still renders everything when the buffer is smaller than the viewport', () => {
+    const w = rowWindow({ firstVisible: 40, viewportRows: 44, overscan: 20, total: 12, rowHeight: 17 });
+    expect(w).toMatchObject({ start: 0, end: 12, padTopPx: 0, padBottomPx: 0 });
+  });
 });

@@ -34,8 +34,23 @@ export function rowWindow(
   // stack the buffer at offset zero and call it a window.
   if (rowHeight <= 0) return { start: 0, end: total, padTopPx: 0, padBottomPx: 0 };
 
-  const start = Math.max(0, Math.min(total, firstVisible - overscan));
-  const end = Math.max(start, Math.min(total, firstVisible + viewportRows + overscan));
+  let start = Math.max(0, Math.min(total, firstVisible - overscan));
+  let end = Math.max(start, Math.min(total, firstVisible + viewportRows + overscan));
+
+  // The window must COVER THE VIEWPORT, whatever firstVisible says.
+  //
+  // firstVisible is React state and can lag the rows it is meant to describe —
+  // a pane that was hidden when it was last set, a buffer that changed size
+  // under it, a screen swap. When it does, a window anchored on it can be
+  // narrower than the viewport, and the shortfall renders as blank spacer:
+  // the reader sees empty space where output is, and no scroll recovers it
+  // because the rows were never in the document.
+  const need = Math.min(total, viewportRows + overscan * 2);
+  if (end - start < need) {
+    if (end >= total) start = Math.max(0, total - need);
+    else end = Math.min(total, start + need);
+  }
+
   return {
     start,
     end,
