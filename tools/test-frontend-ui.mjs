@@ -143,220 +143,36 @@ async function renderedRowsBetween(terminal, begin, end) {
  * Both the control and the warm run emit the same marker names, so the plain
  * search would always find the control's copy.
  */
-/** Every row currently in the document, keyed by its index in the full buffer. */
-async function renderedRowBatch(terminal) {
-  return terminal.evaluate((element) =>
-    [...element.querySelectorAll('[data-terminal-line]')].map((row) => ({
-      index: Number(row.dataset.terminalLine),
-      text: row.children[1]?.textContent ?? '',
-      spans: [...(row.children[1]?.children ?? [])].map((span) => ({
+async function renderedRowsBetweenAfter(terminal, anchor, begin, end) {
+  return terminal.evaluate((element, markers) => {
+    const rows = [...element.querySelectorAll('[data-terminal-line]')];
+    const content = row => row.children[1];
+    const exact = (row, marker) => content(row)?.textContent?.trimEnd() === marker;
+    const anchorAt = rows.findIndex(row => exact(row, markers.anchor));
+    if (anchorAt < 0) throw new Error(`Missing anchor ${markers.anchor}`);
+    const start = rows.findIndex((row, index) => index > anchorAt && exact(row, markers.begin));
+    const finish = rows.findIndex((row, index) => index > start && exact(row, markers.end));
+    if (start < 0 || finish < 0) throw new Error(`Missing rendered markers ${markers.begin}/${markers.end}`);
+    return rows.slice(start, finish).map(row => ({
+      text: content(row)?.textContent ?? '',
+      spans: [...content(row).children].map(span => ({
         text: span.textContent ?? '',
         style: span.getAttribute('style') ?? '',
       })),
-    })));
+    }));
+  }, { anchor, begin, end });
 }
 
-/** Move the rendered window one screen forward. False once at the bottom. */
-async function scrollWindowForward(terminal) {
-  return terminal.evaluate((element) => {
-    const scroll = element.firstElementChild;
-    if (!scroll) return false;
-    const limit = scroll.scrollHeight - scroll.clientHeight;
-    if (scroll.scrollTop >= limit) return false;
-    scroll.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: 100 }));
-    scroll.scrollTop = Math.min(limit, scroll.scrollTop + scroll.clientHeight);
-    scroll.dispatchEvent(new Event('scroll', { bubbles: true }));
-    return true;
-  });
-}
-
-/**
- * Rows between two markers, searching only after an anchor.
- *
- * Both the control and the warm run emit the same marker names, so the plain
- * search would always find the control's copy.
- *
- * Stitched across window positions rather than read from one query. Only the
- * visible rows plus overscan are in the document, and this range is hundreds of
- * lines long — no single query can hold it. `data-terminal-line` indexes the
- * full buffer, so rows gathered at different scroll positions reassemble into
- * one contiguous region without ambiguity.
- */
-async function renderedRowsBetweenAfter(terminal, anchor, begin, end) {
-  try {
-    let anchorAt = await renderedIndexOf(terminal, anchor);
-    for (let step = 0; anchorAt < 0 && step < 400; step++) {
-      if (!(await scrollWindowBack(terminal))) break;
-      anchorAt = await renderedIndexOf(terminal, anchor);
-    }
-    if (anchorAt < 0) throw new Error(`Missing anchor ${anchor}`);
-
-    const seen = new Map();
-    let start = -1;
-    let finish = -1;
-    for (let step = 0; step < 400; step++) {
-      for (const row of await renderedRowBatch(terminal)) {
-        seen.set(row.index, row);
-        const text = row.text.trimEnd();
-        if (row.index > anchorAt && start < 0 && text === begin) start = row.index;
-        if (start >= 0 && row.index > start && finish < 0 && text === end) finish = row.index;
-      }
-      if (finish >= 0) break;
-      if (!(await scrollWindowForward(terminal))) break;
-    }
-    if (start < 0 || finish < 0) {
-      throw new Error(`Missing rendered markers ${begin}/${end}`);
-    }
-    const out = [];
-    for (let index = start; index < finish; index++) {
-      const row = seen.get(index);
-      if (row) out.push({ text: row.text, spans: row.spans });
-    }
-    return out;
-  } finally {
-    await returnToTail(terminal);
-  }
-}
-
-/**
- * The buffer index of a rendered line, or -1 when it is not in the window.
- *
- * `data-terminal-line` indexes the FULL line array, not the rendered slice, so
- * two lines observed at different moments remain comparable. That is what keeps
- * ordering checkable now that only the visible rows plus overscan are in the
- * DOM.
- */
-async function renderedIndexOf(terminal, wanted) {
-  return terminal.evaluate((element, text) => {
-    const row = [...element.querySelectorAll('[data-terminal-line]')]
-      .find(candidate => candidate.children[1]?.textContent?.trimEnd() === text);
-    return row ? Number(row.dataset.terminalLine) : -1;
-  }, wanted);
-}
-
-/** Move the rendered window one screen further back. False once at the top. */
-async function scrollWindowBack(terminal) {
-  return terminal.evaluate((element) => {
-    const scroll = element.firstElementChild;
-    if (!scroll || scroll.scrollTop <= 0) return false;
-    // A wheel first. The view treats a scroll event with no gesture behind it
-    // as incidental — a resize clamping scrollTop — and returns to the tail,
-    // so setting scrollTop alone would search the same screen forever.
-    scroll.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -100 }));
-    scroll.scrollTop = Math.max(0, scroll.scrollTop - scroll.clientHeight);
-    scroll.dispatchEvent(new Event('scroll', { bubbles: true }));
-    return true;
-  });
-}
-
-/**
- * Is this line anywhere in the buffer, leaving the reader where it was?
- *
- * Distinct from `hasRenderedLineAfter`, which hands the tail back. The warm
- * recovery case asserts that a DETACHED anchor survived a reconnect, so a
- * search that moved the reader would destroy the very evidence under test.
- */
-async function lineExistsAnywhere(terminal, wanted) {
-  const at = await terminal.evaluate((element) => element.firstElementChild?.scrollTop ?? 0);
-  try {
-    if ((await renderedIndexOf(terminal, wanted)) >= 0) return true;
-    for (let step = 0; step < 400; step++) {
-      if (!(await scrollWindowForward(terminal))) break;
-      if ((await renderedIndexOf(terminal, wanted)) >= 0) return true;
-    }
-    return false;
-  } finally {
-    await terminal.evaluate((element, top) => {
-      const scroll = element.firstElementChild;
-      if (!scroll) return;
-      scroll.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -1 }));
-      scroll.scrollTop = top;
-      scroll.dispatchEvent(new Event('scroll', { bubbles: true }));
-    }, at);
-  }
-}
-
-/**
- * Is this line anywhere in the buffer at all, from the top?
- *
- * `lineExistsAnywhere` walks forward from wherever the reader is; this sweeps
- * the whole buffer, which is what a "the shell's scrollback came back" check
- * needs when the marker was printed a thousand lines ago and only a window of
- * rows is in the document.
- */
-async function bufferContainsLine(terminal, wanted) {
-  const at = await terminal.evaluate((element) => element.firstElementChild?.scrollTop ?? 0);
-  try {
-    for (let step = 0; step < 600; step++) {
-      if (!(await scrollWindowBack(terminal))) break;
-    }
-    if ((await renderedIndexOf(terminal, wanted)) >= 0) return true;
-    for (let step = 0; step < 600; step++) {
-      if (!(await scrollWindowForward(terminal))) break;
-      if ((await renderedIndexOf(terminal, wanted)) >= 0) return true;
-    }
-    return false;
-  } finally {
-    await terminal.evaluate((element, top) => {
-      const scroll = element.firstElementChild;
-      if (!scroll) return;
-      scroll.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -1 }));
-      scroll.scrollTop = top;
-      scroll.dispatchEvent(new Event('scroll', { bubbles: true }));
-    }, at);
-  }
-}
-
-/** Put the reader back on the newest output, whatever the search did. */
-async function returnToTail(terminal) {
-  await terminal.evaluate((element) => {
-    const scroll = element.firstElementChild;
-    if (!scroll) return;
-    scroll.scrollTop = scroll.scrollHeight;
-    scroll.dispatchEvent(new Event('scroll', { bubbles: true }));
-  });
-}
-
-/**
- * Did `wanted` arrive after `begin`?
- *
- * This used to read both markers out of one DOM query, which worked while the
- * whole buffer was rendered. It is not: a line five hundred rows back is not in
- * the document until the window is moved over it. Scroll back to find `begin`,
- * compare buffer indices, and always hand the tail back — `expect.poll` calls
- * this repeatedly, and a search that left the reader detached would hide the
- * very output the next assertion waits for.
- */
 async function hasRenderedLineAfter(terminal, begin, wanted) {
-  try {
-    const wantedAt = await renderedIndexOf(terminal, wanted);
-    if (wantedAt < 0) return false;
-    let beginAt = await renderedIndexOf(terminal, begin);
-    for (let step = 0; beginAt < 0 && step < 400; step++) {
-      if (!(await scrollWindowBack(terminal))) break;
-      beginAt = await renderedIndexOf(terminal, begin);
-    }
-    return beginAt >= 0 && beginAt < wantedAt;
-  } finally {
-    await returnToTail(terminal);
-  }
+  return terminal.evaluate((element, markers) => {
+    const rows = [...element.querySelectorAll('[data-terminal-line]')];
+    const text = row => row.children[1]?.textContent?.trimEnd();
+    const start = rows.findIndex(row => text(row) === markers.begin);
+    return start >= 0 && rows.slice(start + 1).some(row => text(row) === markers.wanted);
+  }, { begin, wanted });
 }
 
-/**
- * Scroll until `marker` is at the top of the viewport.
- *
- * Only the visible rows plus overscan are in the document, so a marker further
- * back than that is not there to scroll to yet — the window has to be walked
- * over it first. This used to be a single query and threw `Missing scroll
- * anchor` the moment the buffer outgrew one screen.
- */
 async function anchorScrollAt(terminal, marker) {
-  let at = await renderedIndexOf(terminal, marker);
-  for (let step = 0; at < 0 && step < 400; step++) {
-    if (!(await scrollWindowBack(terminal))) break;
-    at = await renderedIndexOf(terminal, marker);
-  }
-  if (at < 0) throw new Error(`Missing scroll anchor ${marker}`);
   await terminal.evaluate((element, wanted) => {
     const row = [...element.querySelectorAll('[data-terminal-line]')]
       .find(candidate => candidate.children[1]?.textContent?.trimEnd() === wanted);
@@ -439,15 +255,7 @@ async function main() {
   await command(page, "printf 'SHELL_OK\\n'", 'SHELL_OK');
   await command(page, "printf '\\344\\270\\255\\346\\226\\207 \\360\\237\\232\\200\\n'", '中文 🚀');
   console.log('[UI Test] PASS: startup, real shell I/O, Unicode');
-  // The pane the user is actually looking at.
-  //
-  // Unscoped, this matches every mounted pane — panes stay mounted through
-  // splits and session switches — and `.evaluate()` then acts on whichever
-  // happens to be first in the document, which may be a hidden background one.
-  // Harmless while assertions only read text that any pane might contain;
-  // wrong once the helpers below scroll a window and report what is rendered.
-  // Same scoping the `command` and `palette` helpers already use.
-  const terminal = page.getByTestId('raw-terminal').filter({ visible: true }).last();
+  const terminal = page.getByTestId('raw-terminal');
 
   // Warm transport loss retains the same parser and root while output crosses
   // the boundary. Compare the exact rendered row spans with an uninterrupted
@@ -524,19 +332,16 @@ process.stdout.write(end + '\\n');
   writeFileSync(warmRelease, '');
   await expect.poll(() => existsSync(warmSplit)).toBe(true);
   await page.evaluate(() => window.__doomTestDisconnect());
-  // Search without moving the reader: the anchor assertion below is the point
-  // of this case, and only the tail is rendered now, so a search that scrolled
-  // to find WARM_DONE would manufacture the evidence it is about to check.
-  await expect.poll(() => lineExistsAnywhere(terminal, 'WARM_DONE'),
+  await expect.poll(async () => (await terminal.innerText()).split('\n').some(line => line.trim() === 'WARM_DONE'),
     { timeout: 45000 }).toBe(true);
+  assert.equal((await terminal.innerText()).split('\n').filter(line => line.trim() === 'WARM_DONE').length, 1,
+    'warm output must not duplicate across reconnect');
+  assert.equal(paneProperty(warmPane, 'pane_pid'), warmPid, 'socket recovery must preserve the exact root process');
+  assert.deepEqual(
+    await renderedRowsBetweenAfter(terminal, 'WARM_BEGIN', 'BOUNDARY_READY', 'WARM_DONE'), controlRows,
+    'warm recovery cells and SGR spans must exactly match the uninterrupted control');
   assert.equal(await scrollAnchorIsVisible(terminal, 'WARM_BEGIN'), true,
     'warm recovery must preserve the reader\'s detached scroll anchor');
-  assert.equal(paneProperty(warmPane, 'pane_pid'), warmPid, 'socket recovery must preserve the exact root process');
-  const warmRows = await renderedRowsBetweenAfter(terminal, 'WARM_BEGIN', 'BOUNDARY_READY', 'WARM_DONE');
-  assert.equal(warmRows.filter(row => row.text.trim() === 'WARM_DONE').length, 0,
-    'WARM_DONE terminates the region and must not appear inside it');
-  assert.deepEqual(warmRows, controlRows,
-    'warm recovery cells and SGR spans must exactly match the uninterrupted control');
 
   await terminal.click();
   await page.keyboard.press('End');
@@ -660,11 +465,7 @@ process.stdout.write(end + '\\n');
     `the editor's first row must be visible, not merely present in the DOM: ${JSON.stringify(editorGeometry)}`);
   await page.keyboard.type(':wq');
   await page.keyboard.press('Enter');
-  // The shell's scrollback must come back when the alternate screen goes away.
-  // SHELL_OK was printed a thousand lines ago, so it is not in the rendered
-  // window — searched across the buffer rather than read out of innerText.
-  await expect.poll(() => bufferContainsLine(terminal, 'SHELL_OK'),
-    { timeout: 45000 }).toBe(true);
+  await expect(terminal).toContainText('SHELL_OK');
   await command(page, 'cat editor-probe.txt', 'TUI_EDITOR_OK');
   assert.equal(readFileSync(join(artifacts, 'editor-probe.txt'), 'utf8'), 'TUI_EDITOR_OK\n');
   console.log('[UI Test] PASS: real alternate-screen editor input, file save, and shell screen restoration');
@@ -830,21 +631,6 @@ try {
   console.error(`[UI Test] FAIL: ${error.stack || error.message}`);
   if (page && !page.isClosed()) {
     console.error(`[UI Test] terminal evidence: ${(await page.getByTestId('raw-terminal').allInnerTexts()).join('\n').slice(-6000)}`);
-    // The rendered window, not just the text: with only a slice of rows in the
-    // document, "the text is missing" and "the reader is looking elsewhere" are
-    // different failures and read identically from innerText alone.
-    console.error('[UI Test] window state: ' + JSON.stringify(await page.getByTestId('raw-terminal').evaluate((element) => {
-      const scroll = element.firstElementChild;
-      const idx = [...element.querySelectorAll('[data-terminal-line]')]
-        .map((r) => Number(r.dataset.terminalLine));
-      return {
-        scrollTop: scroll?.scrollTop,
-        scrollHeight: scroll?.scrollHeight,
-        clientHeight: scroll?.clientHeight,
-        atTail: scroll ? scroll.scrollHeight - (scroll.scrollTop + scroll.clientHeight) < 24 : null,
-        renderedFirst: idx[0], renderedLast: idx[idx.length - 1], renderedCount: idx.length,
-      };
-    })));
     await page.screenshot({ path: join(artifacts, 'failure.png') });
   }
   process.exitCode = 1;

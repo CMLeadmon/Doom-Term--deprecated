@@ -8,7 +8,6 @@ import { noteTotal, detach, reattach, runSearch, stepHit, stateOf } from '../cor
 import {
   TAIL, anchorAt, indexOfAnchor, easeScroll, type ViewportAnchor,
 } from '../core/viewportAnchor';
-import { rowWindow } from '../core/rowWindow';
 import {
   BINDINGS,
   VIEW_BINDINGS,
@@ -94,14 +93,6 @@ export function forgetSessionAnchor(sessionId: string): void {
  * decision to stop following would strand the reader mid-buffer.
  */
 const SCROLL_INTENT_MS = 400;
-
-/**
- * Rows kept in the DOM beyond the viewport, each side.
- *
- * Enough that a fast scroll does not outrun the render, small enough that a
- * full buffer is not in the document. The whole 5000-line buffer used to be.
- */
-const OVERSCAN_ROWS = 20;
 
 interface TerminalLineRowProps {
   line: AnsiLine;
@@ -322,9 +313,6 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
   const [keymapSeen, setKeymapSeen] = useState(
     () => typeof localStorage !== 'undefined' && !!localStorage.getItem(KEYMAP_SEEN_KEY),
   );
-  /** Index of the row at the top of the viewport, and the measured line box. */
-  const [firstVisible, setFirstVisible] = useState(0);
-  const [rowHeight, setRowHeight] = useState(0);
   const [searching, setSearching] = useState(false);
   /**
    * Bumped whenever the search moves.
@@ -381,18 +369,6 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
     }
   }, [isActive, quickSelecting]);
 
-  // Only what the reader can see, plus overscan. See `rowWindow`.
-  const viewportRows = rowHeight > 0
-    ? Math.ceil((scrollRef.current?.clientHeight ?? 0) / rowHeight)
-    : 0;
-  const win = rowWindow({
-    firstVisible,
-    viewportRows,
-    overscan: OVERSCAN_ROWS,
-    total: lines.length,
-    rowHeight,
-  });
-
   /**
    * A pane can swap which session it shows WITHOUT remounting.
    *
@@ -417,19 +393,7 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
     // undid the window a search hit had scrolled to.
     if (!swapped.current) return;
     swapped.current = false;
-    setFirstVisible(0);
-    setRowHeight(0);
   }, [sessionId]);
-
-  /**
-   * The index of the first row IN THE VIEWPORT when following the tail.
-   *
-   * Not `lines.length - 1` — that is the LAST row, and using it left the window
-   * covering only the overscan beneath it while the top of the viewport
-   * rendered as blank spacer. On a full-screen TUI, where the grid is the whole
-   * buffer, that meant the first lines of the file were simply absent.
-   */
-  const tailFirstVisible = () => Math.max(0, lines.length - Math.max(1, viewportRows));
 
   /** Is a scroll gesture still in flight? See SCROLL_INTENT_MS. */
   const gesturing = () => performance.now() - scrollIntentAtRef.current < SCROLL_INTENT_MS;
@@ -489,7 +453,6 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
     const line = top ? lines[top.index] : undefined;
     if (!line) return;
     setAnchor(anchorAt(line.id, top!.offsetPx));
-    setFirstVisible(top!.index);
     detach(sessionId, top!.index);
   };
 
@@ -515,18 +478,8 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
     if (!el) return;
     if (sessionId) noteTotal(sessionId, lines.length);
 
-    // One real measurement is enough; the line box is fixed at 17px by the
-    // grid's own class and only a font load can change it.
-    if (!rowHeight) {
-      const measured = el.querySelector<HTMLElement>('[data-terminal-line]')?.offsetHeight ?? 0;
-      if (measured > 0) setRowHeight(measured);
-    }
-
     const anchor = anchorRef.current;
     if (anchor.mode === 'tail') {
-      // The window has to follow the tail too, or the rows the reader is
-      // about to see are not in the DOM to scroll to.
-      if (lines.length && win.end < lines.length) setFirstVisible(tailFirstVisible());
       el.scrollTop = el.scrollHeight;
       return;
     }
@@ -542,7 +495,7 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
     }
     const row = el.querySelector<HTMLElement>(`[data-terminal-line="${index}"]`);
     if (row) el.scrollTop = Math.max(0, row.offsetTop - anchor.offsetPx);
-  }, [lines, sessionId, rowHeight, win.end]);
+  }, [lines, sessionId]);
 
   /**
    * Adopt whatever line is at the top of the viewport as the anchor.
@@ -556,7 +509,6 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
     if (atBottom) {
       cancelEasedScroll();
       setAnchor(TAIL);
-      setFirstVisible(tailFirstVisible());
       reattach(sessionId);
       return;
     }
@@ -569,26 +521,11 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
       return;
     }
     scrollIntentAtRef.current = Number.NEGATIVE_INFINITY;
-    // Where the window belongs is ARITHMETIC, not whatever is in the document.
-    //
-    // Scanning the rendered rows only works while the reader is already near
-    // them. A jump — a scrollbar drag, a click on the track, a programmatic
-    // restore — lands outside the window, and the scan then returns the first
-    // row of wherever the window happens to be and pins it there: the reader
-    // sees a blank pane, or silently loses an anchor they still hold.
-    const estimated = rowHeight > 0
-      ? Math.max(0, Math.min(lines.length - 1, Math.floor(el.scrollTop / rowHeight)))
-      : 0;
     const top = topRow(el);
-    // Trust the scan only when it agrees with the arithmetic; it carries the
-    // sub-row offset, which the estimate cannot.
-    const usable = top && Math.abs(top.index - estimated) <= 2 ? top : null;
-    const index = usable ? usable.index : estimated;
-    const line = lines[index];
-    if (!line) return;
-    setFirstVisible(index);
-    setAnchor(anchorAt(line.id, usable ? usable.offsetPx : 0));
-    detach(sessionId, index);
+    const line = top ? lines[top.index] : undefined;
+    if (!top || !line) return;
+    setAnchor(anchorAt(line.id, top.offsetPx));
+    detach(sessionId, top.index);
   };
 
   /** One frame of eased scrolling toward whatever the wheel asked for. */
@@ -788,7 +725,6 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
       // only on how far it was.
       const quarter = (scrollRef.current?.clientHeight ?? 0) / 4;
       if (line) setAnchor(anchorAt(line.id, -quarter));
-      setFirstVisible(target);
       detach(sessionId, target);
       const row = scrollRef.current.querySelector<HTMLElement>(`[data-terminal-line="${target}"]`);
       if (row) {
@@ -814,20 +750,13 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
     const el = scrollRef.current;
     const hit = lines[st.line];
     if (!hit) return;
-    // The window must follow the hit whether or not the hit happens to be in
-    // the DOM right now. Before the line box is measured `rowWindow` renders
-    // everything, so a hit IS found — and if only the not-found path synced
-    // `firstVisible`, the window would shrink back around index 0 the moment a
-    // real measurement arrived, taking the hit off screen again.
-    setAnchor(anchorAt(hit.id, -(el.clientHeight / 2)));
-    setFirstVisible(st.line);
     const row = el.querySelector<HTMLElement>(`[data-terminal-line="${st.line}"]`);
     if (row) {
       setAnchor(anchorAt(hit.id, 0));
       el.scrollTop = Math.max(0, row.offsetTop - el.clientHeight / 2);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [searching, searchEpoch, sessionId, lines, win.start, win.end]);
+  }, [searching, searchEpoch, sessionId, lines]);
 
   // Size from the grid container rather than the outer box. They are nearly the
   // same now the header is gone, but the grid is the surface the shell actually
@@ -935,7 +864,6 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
       e.preventDefault();
       cancelEasedScroll();
       setAnchor(TAIL);
-      setFirstVisible(tailFirstVisible());
       reattach(sessionId);
       if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
       return;
@@ -972,13 +900,6 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
     if (!row || !Number.isInteger(index)) return;
 
     const region = commandRegion(lines, index, marks);
-    // A region is computed on the lines ARRAY and may span rows the window does
-    // not currently hold. Bring them in and let the next click land, rather
-    // than silently selecting nothing.
-    if (region.start < win.start || region.end >= win.end) {
-      setFirstVisible(Math.max(0, region.start));
-      return;
-    }
     const start = scrollRef.current?.querySelector<HTMLElement>(`[data-terminal-line="${region.start}"]`);
     const end = scrollRef.current?.querySelector<HTMLElement>(`[data-terminal-line="${region.end}"]`);
     const selection = window.getSelection();
@@ -1047,9 +968,7 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
       >
         {recoveredHistory && <RecoveredHistory cache={recoveryCacheLines}
           cacheTruncated={recoveryCacheTruncated} history={recoveredHistory} />}
-        <div aria-hidden="true" style={{ height: `${win.padTopPx}px` }} />
-        {lines.slice(win.start, win.end).map((line, offset) => {
-          const i = win.start + offset;
+        {lines.map((line, i) => {
           const isCursorHere = isActive && cursor && cursor.visible !== false
             ? (line.row !== undefined ? cursor.row === line.row : cursor.row === i)
             : false;
@@ -1067,7 +986,6 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
             />
           );
         })}
-        <div aria-hidden="true" style={{ height: `${win.padBottomPx}px` }} />
       </div>
 
       {/*

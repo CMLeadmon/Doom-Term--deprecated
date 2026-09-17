@@ -49,9 +49,6 @@ Observed on a Windows build connected to a Linux development machine.
   any kind. It is a non-passive native listener, because React registers
   `onWheel` passively and `preventDefault` there is silently ignored — the
   browser's own scroll would otherwise run alongside the eased one.
-- **Row virtualization.** Only the visible rows plus overscan are in the DOM.
-  The whole 5000-line buffer used to be, reconciled on every frame of a
-  streaming agent and on every keystroke, before an echo could paint.
 
 ### Fixed
 
@@ -81,10 +78,6 @@ Observed on a Windows build connected to a Linux development machine.
   silently.** It is reported instead. No queue and no replay: bytes held now
   would land in whatever the child is doing by the time it is ready.
 - **Scrollback search moved the viewport nowhere** once rows were windowed.
-- **The top of every viewport rendered blank.** The window followed the LAST
-  row rather than the first row *in* the viewport, so it covered only the
-  overscan beneath it. On a full-screen editor, where the grid is the whole
-  buffer, the first lines of the file were simply absent.
 - **A deliberate jump was dragged back by an in-flight wheel animation.** The
   eased scroll chased an absolute pixel captured when the wheel turned, so
   anything that repositioned the reader afterwards — a search hit, a turn mark,
@@ -94,6 +87,13 @@ Observed on a Windows build connected to a Linux development machine.
 
 ### Known limitations
 
+- **Row virtualization is not enabled.** The arithmetic module ships and is
+  tested, but the view renders every row as before. Windowing the DOM broke
+  five things that assumed the whole buffer is present — scrollback search, the
+  top of every viewport, a full-screen editor's first lines, the browser
+  harness, and a reconnect case that reproduced only on CI — and its purpose
+  was input latency, which this release no longer claims. It will land with the
+  harness adapted deliberately rather than under a release.
 - **Predictive local echo is not enabled.** The policy module ships and is
   tested, but it is not wired to the view. Review found that a prompt which
   deliberately does not echo — `sudo`, `ssh`, `passwd`, a git credential
