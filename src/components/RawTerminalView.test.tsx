@@ -189,6 +189,35 @@ describe('RawTerminalView', () => {
     resetSessionAnchors();
   });
 
+  it('reports a refused keystroke instead of swallowing it', () => {
+    // mutate() returns false whenever the attachment is not 'ready'
+    // (sessionAttachment.ts), so a key typed before a session settles reaches
+    // nothing — while preventDefault ran regardless, so it left no trace at
+    // all. One of the two hypotheses for the sticky first character, and a
+    // defect either way.
+    const onWrite = vi.fn(() => false);
+    render(<RawTerminalView {...base} onWrite={onWrite} sessionId="refuse" isActive />);
+    fireEvent.keyDown(screen.getByTestId('raw-terminal'), { key: 'a' });
+    expect(onWrite).toHaveBeenCalledWith('a');
+    expect(screen.getByRole('status').textContent).toMatch(/not accepting input/i);
+  });
+
+  it('says nothing when the keystroke was accepted', () => {
+    const onWrite = vi.fn(() => true);
+    render(<RawTerminalView {...base} onWrite={onWrite} sessionId="ok" isActive />);
+    fireEvent.keyDown(screen.getByTestId('raw-terminal'), { key: 'a' });
+    expect(screen.queryByRole('status')).toBeNull();
+  });
+
+  it('stays silent for a handler that reports nothing either way', () => {
+    // Only an explicit false is a refusal. A void-returning handler is the
+    // old contract and must not start announcing failures it never claimed.
+    const onWrite = vi.fn();
+    render(<RawTerminalView {...base} onWrite={onWrite} sessionId="void" isActive />);
+    fireEvent.keyDown(screen.getByTestId('raw-terminal'), { key: 'a' });
+    expect(screen.queryByRole('status')).toBeNull();
+  });
+
   it('restores a detached reader to the same LINE on remount', () => {
     // The pixel map this replaces could not survive the buffer trimming
     // underneath it; a line number can.

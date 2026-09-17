@@ -28,7 +28,15 @@ import { RecoveredHistory } from './RecoveredHistory';
 
 interface RawTerminalViewProps {
   lines: AnsiLine[];
-  onWrite: (data: string) => void;
+  /**
+   * Send bytes to the child. Returns whether they were accepted.
+   *
+   * `false` is load-bearing: `mutate()` refuses every write while the
+   * attachment is not ready, and the view used to discard that and call
+   * preventDefault anyway — so the keystroke reached nothing and left no trace.
+   * `void` remains valid for a caller that cannot tell.
+   */
+  onWrite: (data: string) => boolean | void;
   onPasteText: (text: string, expected?: Readonly<MutationIdentity> | null) => Promise<void>;
   captureInputIdentity?: () => Readonly<MutationIdentity> | null;
   onSendSignal: (sig: 'ctrl+c' | 'ctrl+d' | 'ctrl+z') => void;
@@ -836,7 +844,12 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
     const bytes = keyToBytes(e);
     if (bytes !== null) {
       e.preventDefault();
-      onWrite(bytes);
+      // No queue and no replay. Bytes held now would land in whatever the
+      // child is doing by the time it is ready — the same discipline the paste
+      // contract sets out. An unknown delivery is reported as unknown.
+      if (onWrite(bytes) === false) {
+        setClipboardNotice('Terminal is not accepting input yet; that keystroke was not sent.');
+      }
     }
   };
 
