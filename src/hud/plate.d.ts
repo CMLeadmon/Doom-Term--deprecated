@@ -78,3 +78,15 @@ export interface MarkTones {
 export function markTones(agentKey: string, pulse?: number): MarkTones;
 
 export function mix(from: string | number[], to: string | number[], t: number): number[];
+
+/**
+ * Draw one agent's mark, centred on (cx, cy). The single place that answers
+ * what an agent looks like; see `agentMark.d.ts` for the DOM-facing wrapper.
+ */
+export function drawAgentMark(
+  s: PlateRenderResult,
+  agentKey: string,
+  cx: number,
+  cy: number,
+  pulse?: number,
+): PlateRenderResult;
