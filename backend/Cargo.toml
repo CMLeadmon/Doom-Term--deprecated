@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 doom-term-pty = { path = "../crates/doom-term-pty" }
-portable-pty = "0.8"
+portable-pty = "0.9"
 vte = "0.14"
 tokio = { version = "1.40", features = ["full"] }
 tokio-tungstenite = "0.26"
