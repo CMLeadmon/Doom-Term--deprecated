@@ -165,6 +165,26 @@ const WHITE = [255, 255, 255];
  * phase 0..1 of one cycle; `undefined` means the agent is not working and the
  * mark sits at its steady base colour with no ring.
  */
+/**
+ * Draw one agent's mark, centred on (cx, cy).
+ *
+ * The single place that answers "what does this agent look like". The title bar
+ * draws through it too, so the two surfaces cannot disagree the way the plate
+ * and the old floating indicator did — two colour tables with different values,
+ * one set of bitmaps and one set of hand-drawn SVG paths.
+ *
+ * Arity varies across MARKS: gemini, codex and opencode take no `dim`. Both are
+ * passed regardless, exactly as the plate has always done — JS drops the extra
+ * argument, and "fixing" the signatures would change three marks' rendering for
+ * nothing.
+ */
+function drawAgentMark(s, agentKey, cx, cy, pulse) {
+  const tones = markTones(agentKey, pulse);
+  // An unrecognised key is not an excuse to draw someone else's logo.
+  (MARKS[agentKey] || MARKS.shell)(s, cx, cy, tones.core, tones.dim);
+  return s;
+}
+
 function markTones(agentKey, pulse) {
   const base = AGENT_COLORS[agentKey] || C.tan;
   if (pulse === undefined) {
@@ -813,8 +833,7 @@ function drawPlate(s, spec, state) {
       x: spec.markX + 1, y: 5, w: spec.markW - 2, h: 22, floor,
     });
   }
-  // An unrecognised key is not an excuse to draw someone else's logo.
-  (MARKS[st.agent] || MARKS.shell)(s, spec.markX + 12, 16, tones.core, tones.dim);
+  drawAgentMark(s, st.agent, spec.markX + 12, 16, st.pulse);
   groove(s, spec.grooveX, 4, 24);
   const SHELL_KEYS = ['shell', 'terminal', 'bash', 'zsh', 'fish', 'none'];
   const agentLabel = SHELL_KEYS.includes(st.agent) ? 'SHELL' : 'AGENT';
@@ -902,6 +921,7 @@ function renderPlate(state, scale, spec) {
 export {
   renderPlate, drawPlate, upscale, Surface, px, striate, well, groove,
   bigText, smText, truncateLeft, FONT_BIG, FONT_SM, MARKS, markTones, mix,
+  drawAgentMark,
   plateSpec, PLATE_480, DEFAULT_STATE, DEMO_STATE, C as COLORS, AGENT_COLORS,
   ADV_BIG, ADV_SM, TABLE_PITCH, WAITING_ROWS, WAITING_ROWS_PER_COL,
   WAITING_ROWS_MIN_W, WAITING_MIN_W, WAITING_COL_MIN_W,
