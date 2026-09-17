@@ -107,6 +107,22 @@ mod tests {
     }
 
     #[test]
+    fn parses_a_frame_captured_from_the_real_snippet() {
+        // Not hand-written: these are the exact bytes `remote_enrichment_snippet`
+        // produced when sourced into a real bash on 2026-09-17. The snippet and
+        // this parser are two halves of one wire format and drift silently
+        // otherwise — the cwd here even carries a space, which is why it is a
+        // better fixture than anything I would have invented.
+        let captured = "eyJ2IjoxLCJob3N0IjoiU0VSNi1NQVgiLCJ1c2VyIjoiY2xlYWRtb24iLCJzaGVsbCI6ImJhc2giLCJjd2QiOiIvdmFyL2hvbWUvY2xlYWRtb24vUHJvamVjdHMvRG9vbSBUZXJtIiwiYnJhbmNoIjoiZmVhdC9yZW1vdGUtZW5oYW5jZW1lbnQifQ==";
+        let got = parse_frame(captured).expect("the shipped snippet must produce a parseable frame");
+        assert!(got.host.is_some(), "the snippet reported no host");
+        assert!(got.user.is_some(), "the snippet reported no user");
+        assert_eq!(got.shell.as_deref(), Some("bash"));
+        assert!(got.cwd.unwrap().contains('/'));
+        assert_eq!(got.branch.as_deref(), Some("feat/remote-enhancement"));
+    }
+
+    #[test]
     fn parses_a_well_formed_frame() {
         let frame = encode(
             r#"{"v":1,"host":"devbox","user":"cml","shell":"bash","branch":"main","agent":"claude","busy":true}"#,

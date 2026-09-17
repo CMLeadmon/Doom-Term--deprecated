@@ -289,6 +289,75 @@ pub fn shell_launch(shell: &str) -> ShellLaunch {
 
 /// Add shell integration to a directly-spawned command. The tmux path uses
 /// `shell_launch` instead, so both routes read from one definition.
+/// What a remote shell runs once per prompt to report itself.
+///
+/// Deliberately cheap. A prompt hook that shells out to anything slow is a
+/// prompt hook the user deletes, so `git` is the single subprocess and it runs
+/// with `--no-optional-locks` so a busy repository cannot stall a prompt.
+///
+/// One line, because this rides an `ssh` argv.
+///
+/// The frame is iTerm2's documented `SetUserVar`, not a private OSC number: the
+/// same snippet is then inert in iTerm2, kitty and WezTerm — they set a
+/// variable they ignore — rather than printing in every terminal but ours.
+pub fn remote_enrichment_snippet() -> String {
+    concat!(
+        "if [ -z \"$DOOM_TERM_BOOTSTRAPPED\" ]; then export DOOM_TERM_BOOTSTRAPPED=1; ",
+        "__doom_remote() { ",
+        "__db=$(git --no-optional-locks rev-parse --abbrev-ref HEAD 2>/dev/null); ",
+        "__dj=$(printf '{\"v\":1,\"host\":\"%s\",\"user\":\"%s\",\"shell\":\"%s\",\"cwd\":\"%s\",\"branch\":\"%s\"}' ",
+        "\"$(hostname -s 2>/dev/null)\" \"$USER\" \"$(basename \"${SHELL:-sh}\")\" \"$PWD\" \"$__db\" ",
+        "| base64 | tr -d '\\n'); ",
+        "printf '\\033]1337;SetUserVar=doomterm=%s\\007' \"$__dj\"; }; ",
+        "PROMPT_COMMAND=\"__doom_remote${PROMPT_COMMAND:+; $PROMPT_COMMAND}\"; fi"
+    )
+    .to_string()
+}
+
+/// An `ssh` invocation that instruments the far end at login.
+///
+/// kitty's model: the bootstrap rides the connection it is bootstrapping, so
+/// the remote shell is instrumented by construction.
+///
+/// Injecting into an already-running session is deliberately NOT implemented.
+/// Writing a snippet to a child's stdin types it into whatever that child is
+/// doing — a pager, an editor, an agent's composer — and the obvious guard,
+/// "only inject at an OSC 133 prompt mark", is circular: OSC 133 only arrives
+/// once the remote is already instrumented. A host you are already sitting on
+/// is served by the rc-file route instead.
+pub fn ssh_launch(user_args: &[String]) -> ShellLaunch {
+    ssh_launch_with(
+        user_args,
+        std::env::var("DOOM_TERM_NO_SHELL_INTEGRATION").is_ok(),
+    )
+}
+
+/// The decision, separated from reading the environment.
+///
+/// Tests take this form because `std::env::set_var` mutates one environment
+/// shared by every test thread: setting the kill switch to check it made
+/// `powershell_is_launched_with_a_script_and_stays_interactive` fail whenever
+/// the two happened to overlap.
+fn ssh_launch_with(user_args: &[String], disabled: bool) -> ShellLaunch {
+    let mut launch = ShellLaunch {
+        args: Vec::new(),
+        env: Vec::new(),
+    };
+    if disabled {
+        launch.args.extend_from_slice(user_args);
+        return launch;
+    }
+    // -t: the remote command replaces the login shell, so without a forced TTY
+    // there is no terminal for it to report to.
+    launch.args.push("-t".to_string());
+    launch.args.extend_from_slice(user_args);
+    launch.args.push(format!(
+        "{} ; exec \"${{SHELL:-sh}}\" -l",
+        remote_enrichment_snippet()
+    ));
+    launch
+}
+
 pub fn apply_shell_integration(cmd: &mut CommandBuilder, shell: &str) {
     let launch = shell_launch(shell);
     for (key, value) in &launch.env {
@@ -301,6 +370,42 @@ pub fn apply_shell_integration(cmd: &mut CommandBuilder, shell: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_remote_snippet_guards_against_double_bootstrapping() {
+        let script = super::remote_enrichment_snippet();
+        assert!(script.contains("DOOM_TERM_BOOTSTRAPPED"));
+        assert!(script.contains("SetUserVar=doomterm="));
+        assert!(script.contains("\"v\":1"), "schema version must match remote.rs");
+    }
+
+    #[test]
+    fn the_remote_snippet_is_one_line_so_it_can_ride_an_ssh_argv() {
+        assert!(!super::remote_enrichment_snippet().contains('\n'));
+    }
+
+    #[test]
+    fn a_remote_launch_carries_the_snippet_and_the_users_own_arguments() {
+        let launch = super::ssh_launch(&["devbox".to_string(), "-p".to_string(), "2222".to_string()]);
+        assert!(launch.args.iter().any(|a| a.contains("DOOM_TERM_BOOTSTRAPPED")));
+        assert!(launch.args.contains(&"devbox".to_string()));
+        assert!(launch.args.contains(&"2222".to_string()));
+        assert!(launch.args.contains(&"-t".to_string()));
+    }
+
+    #[test]
+    fn the_kill_switch_leaves_a_remote_launch_completely_alone() {
+        // Same escape hatch the local integration honours. A user who has
+        // turned this off must get a plain ssh, not a quieter instrumented one.
+        //
+        // Tested through the pure form rather than by setting the variable:
+        // std::env::set_var mutates one environment shared by every test
+        // thread, and doing that here broke the PowerShell launch test whenever
+        // the two overlapped.
+        let launch = super::ssh_launch_with(&["devbox".to_string()], true);
+        assert_eq!(launch.args, vec!["devbox".to_string()]);
+        assert!(launch.env.is_empty());
+    }
+
     use super::*;
 
     #[test]
