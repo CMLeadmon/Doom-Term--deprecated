@@ -93,6 +93,22 @@ jobs:
           npm run typecheck
           cargo check --locked --target ${{ matrix.target }}
 
+      # Fails closed. A tag whose version has no changelog section stops the
+      # release here rather than publishing one with an empty body: the assets
+      # are the part users cannot reconstruct, and the notes are the part that
+      # tells them what they are installing.
+      - name: Read the release notes from the changelog
+        id: notes
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          node tools/changelog-section.mjs "${GITHUB_REF_NAME#v}" > release-notes.md
+          {
+            echo 'body<<DOOM_TERM_NOTES_EOF'
+            cat release-notes.md
+            echo 'DOOM_TERM_NOTES_EOF'
+          } >> "$GITHUB_OUTPUT"
+
       - name: Build and bundle the desktop app
         uses: tauri-apps/tauri-action@v0
         env:
@@ -106,7 +122,7 @@ jobs:
           # which is what makes it usable as a pre-tag smoke test.
           tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
           releaseName: 'Doom Term ${{ github.ref_name }}'
-          releaseBody: ''
+          releaseBody: ${{ steps.notes.outputs.body }}
           releaseDraft: false
           prerelease: true
           includeUpdaterJson: false
@@ -120,3 +136,48 @@ jobs:
             target/${{ matrix.target }}/release/bundle/**/*
           if-no-files-found: ignore
           retention-days: 14
+
+  # Everything a user can actually check about a download they did not build.
+  #
+  # Runs after every bundle job, over the assets as PUBLISHED rather than over
+  # local build output — so the checksums describe the exact bytes people
+  # receive, not something that was equal to them at some earlier point.
+  provenance:
+    name: Checksums and provenance
+    needs: bundle
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # Provenance is signed through Sigstore with a short-lived certificate
+      # issued to this workflow run; both of these are what let it claim an
+      # identity at all.
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Download the published assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p assets
+          gh release download "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" --dir assets --pattern '*'
+          ls -l assets
+
+      # Before SHA256SUMS exists, so the attestation covers the installers
+      # themselves rather than a manifest describing them.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: 'assets/*'
+
+      - name: Publish SHA256SUMS
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd assets
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+          gh release upload "$GITHUB_REF_NAME" SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --clobber

@@ -37,6 +37,21 @@ Doom Term follows a strict set of design and engineering principles:
    npm run hud:check         # Pixel-exact HUD canvas regression check
    cargo check --workspace   # Rust workspace compilation check
    cargo test --workspace    # Rust workspace unit and integration tests
+   npm run check:tauri       # The desktop shell. Exit 2 is an ENVIRONMENT
+                             # BLOCK — a missing system package — and is
+                             # neither a pass nor a failure.
    ```
+3. Formatting and lints are a separate CI job, and `agent:verify` does not
+   cover them:
+   ```bash
+   cargo fmt --all --check
+   cargo clippy --all-targets -- -D warnings
+   ```
+   Clippy is a ratchet. The lints that predate its adoption are allowed by name
+   in the workspace `Cargo.toml`, so everything else is denied — adding to that
+   list is a deliberate act, not a side effect.
+4. Building and packaging are documented separately in
+   [`docs/BUILDING.md`](docs/BUILDING.md), and cutting a release in
+   [`docs/RELEASING.md`](docs/RELEASING.md).
 3. Consult [`AGENTS.md`](AGENTS.md) and [`docs/README.md`](docs/README.md) for architectural invariants and system specifications.
 

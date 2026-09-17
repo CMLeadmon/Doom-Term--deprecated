@@ -1,0 +1,37 @@
+# Actions, npm and Cargo, weekly.
+#
+# The Actions ecosystem matters most here: the release workflow references
+# actions by floating major tag, so this is what keeps them current until they
+# are pinned to commit SHAs. See docs/RELEASING.md.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci
+
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: build
+    groups:
+      # A frontend built from React 19, Vite 6 and Tailwind 3 breaks as a set or
+      # not at all; reviewing them one at a time costs more than it catches.
+      frontend:
+        patterns: ['react*', '@types/react*', 'vite', '@vitejs/*', 'tailwindcss', 'postcss', 'autoprefixer']
+      testing:
+        patterns: ['vitest', '@testing-library/*', 'jsdom', '@playwright/*']
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: build
+    groups:
+      tauri:
+        patterns: ['tauri', 'tauri-*']

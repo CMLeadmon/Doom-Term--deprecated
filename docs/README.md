@@ -14,6 +14,9 @@ Doom Term Documentation
 │   ├── AGENTS.md (Repo Root)                -> Operational directives & invariants for AI agents
 │   ├── README.md (Repo Root)                -> User-facing product overview, quickstart & 10 Reformation UX capabilities
 │   ├── CONTRIBUTING.md (Repo Root)          -> Contribution guidelines, material rules, verification checklist
+│   ├── CHANGELOG.md (Repo Root)             -> Per-release changes, and the limitations each release ships with
+│   ├── docs/BUILDING.md                     -> Prerequisites, dev loop, cross-compiling for Windows
+│   ├── docs/RELEASING.md                    -> Cutting a release; verifying checksums and provenance
 │   └── docs/REFORMATION_AGENT_REVIEW.md     -> Component entry points, test proofs, and review contracts
 │
 ├── 🎨 Design System & Visual Testing

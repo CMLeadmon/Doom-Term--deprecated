@@ -94,38 +94,47 @@ report.
 | | Linux | macOS | Windows |
 | :--- | :--- | :--- | :--- |
 | Terminal, splits, scrollback, status plate | ✅ | ✅ | ✅ |
-| Agent identification (mugshot, agent well) | ✅ `/proc/<pid>/stat` `tpgid` | ✅ via tmux `pane_current_command` | 🚧 in progress |
-| Durable sessions across a daemon restart | ✅ tmux | ✅ tmux | ❌ no native tmux |
-| Child-checked paste | ✅ | ✅ | 🚧 in progress |
-| Claude context reading | ✅ hook `transcript_path` | ✅ | 🚧 hook needs `bash`, `curl`, GNU `timeout` |
-| Codex context / rate reading | ✅ `/proc/<pid>/fd` | ❌ `--` | ❌ `--` |
-| Git branch indicator | ✅ | ✅ | 🚧 in progress |
-| Closing a pane closes what it started | ✅ `killpg` | ✅ `killpg` | ❌ orphans descendants |
-| Built and bundled in CI | ✅ | ✅ | ✅ |
+| Keyboard pass-through | ✅ | ✅ | ✅ |
+| Closing a pane closes what it started | ✅ `killpg` | ✅ `killpg` | ✅ job object |
+| Git branch indicator | ✅ | ✅ | ✅ |
+| Agent identification (mugshot, agent well) | ✅ `/proc/<pid>/stat` `tpgid` | ✅ tmux `pane_current_command` | 🚧 process tree |
+| Claude CONTEXT % and USAGE % | ✅ hook `transcript_path` | ✅ | 🚧 via the PowerShell hook |
+| Child-checked paste | ✅ tmux `bracket_paste_flag` | ✅ | 🚧 observed child mode 2004 |
+| Sessions survive closing the app | ✅ tmux | ✅ tmux | 🚧 the daemon outlives the window |
+| Durable across a **daemon** restart | ✅ tmux | ✅ tmux | ❌ no native tmux |
+| Codex CONTEXT % / rate without a hook | ✅ `/proc/<pid>/fd` | ❌ `--` | ❌ `--` |
+| Exercised by CI | ✅ full gate | ⚠️ compile-checked | ✅ portable gate + 113 PTY tests |
 
-Keyboard pass-through is **not** in this table, because it is not platform-dependent.
-Axiom 1 is unconditional: plain `Ctrl` keys are encoded and written to the child on
-every platform, with no reference to which process is in the foreground.
+✅ works, and CI exercises it &nbsp;·&nbsp; 🚧 implemented and unit-tested, not yet
+confirmed on real hardware &nbsp;·&nbsp; ❌ unavailable, and renders `--`
 
-**Linux is the reference platform.** It is the only one the full `npm run agent:verify`
-gate runs on.
+**Linux is the reference platform.** It is the only one the full
+`npm run agent:verify` gate runs on.
 
-**macOS is supported** through the portable fallback: with tmux installed (Homebrew
-prefixes are searched directly, since a Finder-launched app cannot see them through
-`PATH` alone), tmux's own `pane_current_command` and `pane_current_path` stand in for
-`/proc`. Codex context stays `--`, because attributing a rollout file to a pane
-requires reading that process's open descriptors.
+**macOS is supported** through the portable fallback: with tmux installed
+(Homebrew prefixes are searched directly, since a Finder-launched app cannot see
+them through `PATH` alone), tmux's own `pane_current_command` and
+`pane_current_path` stand in for `/proc`. Codex context stays `--`, because
+attributing a rollout file to a pane requires reading that process's open
+descriptors.
 
-**Windows builds, bundles and runs a terminal, and is being brought up to parity.**
-It has no process *group*, which is what `tpgid` reports — but it has a process
-*tree*, and the most recently spawned descendant of the shell is a real foreground
-witness. That work is specified in
-[`docs/superpowers/specs/2026-09-16-windows-support-design.md`](docs/superpowers/specs/2026-09-16-windows-support-design.md)
-and tracked in
-[`docs/superpowers/plans/2026-09-16-windows-support.md`](docs/superpowers/plans/2026-09-16-windows-support.md).
-Until each row above is confirmed on Windows hardware it stays 🚧, not ✅ — per
-Axiom 3, an unproven reading renders `--` rather than a number, and an unproven
-claim renders as unproven rather than as a checkmark.
+**Windows has no foreground process *group*** — which is what `tpgid` reports —
+**but it has a process *tree***, and the shell's most recently spawned
+descendant is the witness every Windows terminal emulator uses. Job objects
+stand in for `killpg`, and PowerShell shell integration supplies the OSC 133
+block model and the working directory that transcript attribution is keyed on.
+
+Three things stay `--` there and say so rather than guessing: sessions do not
+survive a **daemon** restart (tmux's trick is that the shell is nobody's child
+of ours, and reproducing it needs a per-session holder process); Codex telemetry
+without a hook needs that process's open handles; and an agent installed as an
+npm shim runs as `node.exe`, which is genuinely not an agent — naming it would
+mean reading another process's command line.
+
+Installers are **unsigned**, so Windows SmartScreen shows a prompt on first run.
+Every release ships `SHA256SUMS` and a Sigstore-backed build provenance
+attestation instead — see [`docs/RELEASING.md`](docs/RELEASING.md#verifying-a-release)
+for how to check both, which is stronger evidence than an unverified signature.
 
 ---
 
@@ -267,6 +276,19 @@ Doom Term's visual design is strictly governed by the following core constraints
   * Waiting: `--st-wait: #5b8ae8`
   * Idle: `--st-idle: #847c6e`
 * **Integer Plate Scaling**: Status plate is always scaled by `Math.floor(available / 480)`, preserving pixel-exact striations and text contrast.
+
+---
+
+## 📚 Documentation
+
+| | |
+| :--- | :--- |
+| [`CHANGELOG.md`](CHANGELOG.md) | What changed in each release, and what it still cannot do |
+| [`docs/BUILDING.md`](docs/BUILDING.md) | Prerequisites, the dev loop, and cross-compiling for Windows |
+| [`docs/RELEASING.md`](docs/RELEASING.md) | Cutting a release, and verifying one you downloaded |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | The design invariants, and the gate to run before a PR |
+| [`docs/README.md`](docs/README.md) | The full documentation map |
+| [`AGENTS.md`](AGENTS.md) | Architecture and operating rules, for AI coding agents |
 
 ---
 

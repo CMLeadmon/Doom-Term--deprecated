@@ -1,0 +1,36 @@
+name: Missing capability
+description: A reading or feature that is unavailable, and could be made available
+labels: [capability]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this for something Doom Term currently reports as unavailable and
+        you would like it to measure — not for a bug, where it claims something
+        untrue.
+  - type: textarea
+    id: capability
+    attributes:
+      label: What should Doom Term be able to report or do?
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: What evidence could it read?
+      description: |
+        This is the part that decides whether it can be built. Doom Term
+        attributes by evidence, never by directory — a file descriptor, a hook
+        payload, a kernel field. "Two candidates is ambiguity, and ambiguity is
+        `--`." If you know of an API or file that answers the question for one
+        specific pane, name it here.
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Platform
+      multiple: true
+      options: [Linux, macOS, Windows]
+    validations:
+      required: true

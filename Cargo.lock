@@ -924,7 +924,7 @@ dependencies = [
 
 [[package]]
 name = "doom-term"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "doom-term-pty",
  "env_logger",
@@ -940,7 +940,7 @@ dependencies = [
 
 [[package]]
 name = "doom-term-pty"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "getrandom 0.3.4",
@@ -957,7 +957,7 @@ dependencies = [
 
 [[package]]
 name = "doom-term-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bytes",

@@ -1,0 +1,63 @@
+name: Bug report
+description: Something behaves differently from what it says it does
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Before filing: a reading of `--` is often correct, not a bug.**
+
+        Doom Term renders `--` when the operating system cannot supply a
+        measurement, rather than showing a zero it would have had to invent.
+        Several readings are unavailable by design on some platforms — see the
+        platform table in the README. If a number is missing, check there
+        first; if the table says it should work on your platform, that is a bug
+        and this is the right place.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected instead
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open a session in ...
+        2. Run ...
+        3. The status plate shows ...
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Platform
+      options: [Linux, macOS, Windows]
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Doom Term version
+      description: From the release you installed, or `git rev-parse --short HEAD` if you built it.
+    validations:
+      required: true
+  - type: input
+    id: shell
+    attributes:
+      label: Shell
+      description: bash, zsh, PowerShell, pwsh — and its version if you know it.
+  - type: input
+    id: agent
+    attributes:
+      label: Agent in the pane, if any
+      description: claude, codex, gemini, agy — and how it was installed (native binary, npm shim, other).
+  - type: textarea
+    id: daemon
+    attributes:
+      label: Daemon output
+      description: |
+        Run `npm run server` in a terminal, reproduce, and paste what it prints.
+        This is usually the fastest route to a cause.
+      render: text
