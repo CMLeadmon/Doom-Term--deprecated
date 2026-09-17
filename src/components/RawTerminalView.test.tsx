@@ -189,6 +189,45 @@ describe('RawTerminalView', () => {
     resetSessionAnchors();
   });
 
+  it('abandons an eased scroll when anything else moves the viewport', () => {
+    // scrollTarget is an ABSOLUTE pixel captured when the wheel turned. Anything
+    // that repositions the reader afterwards — a search hit, a turn mark,
+    // scrollIntoView, the layout effect holding an anchor — leaves the loop
+    // easing toward a stale destination and dragging them off the new one.
+    // Observed in the browser as a detached reader drifting forward while
+    // output arrived, which is the exact failure the anchor exists to prevent.
+    const frames: FrameRequestCallback[] = [];
+    const realRaf = globalThis.requestAnimationFrame;
+    globalThis.requestAnimationFrame = ((cb: FrameRequestCallback) => {
+      frames.push(cb);
+      return frames.length;
+    }) as typeof globalThis.requestAnimationFrame;
+    resetScrollback('steal');
+    resetSessionAnchors();
+    try {
+      withRowGeometry(() => {
+        const props = { ...base, sessionId: 'steal', isActive: true, lines: win(0, 100) };
+        render(<RawTerminalView {...props} />);
+        const scroller = screen.getByTestId('raw-terminal').firstElementChild as HTMLDivElement;
+        Object.defineProperties(scroller, {
+          scrollHeight: { configurable: true, value: 1700 },
+          clientHeight: { configurable: true, value: 100 },
+        });
+        scroller.scrollTop = 1600;
+        fireEvent.wheel(scroller, { deltaY: -400 });   // target ≈ 1200
+
+        // Something else puts the reader somewhere deliberate.
+        scroller.scrollTop = 200;
+        act(() => { frames.splice(0).forEach((cb) => cb(0)); });
+        expect(scroller.scrollTop).toBe(200);
+      });
+    } finally {
+      globalThis.requestAnimationFrame = realRaf;
+      resetScrollback('steal');
+      resetSessionAnchors();
+    }
+  });
+
   it('End beats an eased scroll that is still running', () => {
     // The loop eases toward a target captured when the wheel turned. Without
     // cancelling it, a deliberate jump to the tail is dragged straight back off

@@ -276,6 +276,37 @@ async function lineExistsAnywhere(terminal, wanted) {
   }
 }
 
+/**
+ * Is this line anywhere in the buffer at all, from the top?
+ *
+ * `lineExistsAnywhere` walks forward from wherever the reader is; this sweeps
+ * the whole buffer, which is what a "the shell's scrollback came back" check
+ * needs when the marker was printed a thousand lines ago and only a window of
+ * rows is in the document.
+ */
+async function bufferContainsLine(terminal, wanted) {
+  const at = await terminal.evaluate((element) => element.firstElementChild?.scrollTop ?? 0);
+  try {
+    for (let step = 0; step < 600; step++) {
+      if (!(await scrollWindowBack(terminal))) break;
+    }
+    if ((await renderedIndexOf(terminal, wanted)) >= 0) return true;
+    for (let step = 0; step < 600; step++) {
+      if (!(await scrollWindowForward(terminal))) break;
+      if ((await renderedIndexOf(terminal, wanted)) >= 0) return true;
+    }
+    return false;
+  } finally {
+    await terminal.evaluate((element, top) => {
+      const scroll = element.firstElementChild;
+      if (!scroll) return;
+      scroll.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -1 }));
+      scroll.scrollTop = top;
+      scroll.dispatchEvent(new Event('scroll', { bubbles: true }));
+    }, at);
+  }
+}
+
 /** Put the reader back on the newest output, whatever the search did. */
 async function returnToTail(terminal) {
   await terminal.evaluate((element) => {
@@ -621,7 +652,11 @@ process.stdout.write(end + '\\n');
     `the editor's first row must be visible, not merely present in the DOM: ${JSON.stringify(editorGeometry)}`);
   await page.keyboard.type(':wq');
   await page.keyboard.press('Enter');
-  await expect(terminal).toContainText('SHELL_OK');
+  // The shell's scrollback must come back when the alternate screen goes away.
+  // SHELL_OK was printed a thousand lines ago, so it is not in the rendered
+  // window — searched across the buffer rather than read out of innerText.
+  await expect.poll(() => bufferContainsLine(terminal, 'SHELL_OK'),
+    { timeout: 45000 }).toBe(true);
   await command(page, 'cat editor-probe.txt', 'TUI_EDITOR_OK');
   assert.equal(readFileSync(join(artifacts, 'editor-probe.txt'), 'utf8'), 'TUI_EDITOR_OK\n');
   console.log('[UI Test] PASS: real alternate-screen editor input, file save, and shell screen restoration');

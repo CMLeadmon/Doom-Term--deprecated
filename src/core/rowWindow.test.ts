@@ -50,4 +50,27 @@ describe('rowWindow', () => {
     const w = rowWindow({ firstVisible: 900, viewportRows: 30, overscan: 10, total: 100, rowHeight: 17 });
     expect(w.end).toBeGreaterThanOrEqual(w.start);
   });
+
+  it('covers the whole viewport when the reader is at the tail', () => {
+    // firstVisible is the index of the first row IN the viewport. Handing it
+    // the LAST row leaves the window covering only the overscan below it, and
+    // the top of the viewport renders as blank spacer — which in a full-screen
+    // TUI means the first lines of the file simply are not there.
+    const total = 500;
+    const viewportRows = 44;
+    const firstVisible = total - viewportRows;
+    const w = rowWindow({ firstVisible, viewportRows, overscan: 20, total, rowHeight: 17 });
+    expect(w.start).toBeLessThanOrEqual(total - viewportRows);
+    expect(w.end).toBe(total);
+    expect(w.end - w.start).toBeGreaterThanOrEqual(viewportRows);
+  });
+
+  it('renders a whole alternate screen, which has no scrollback to window', () => {
+    // vim, htop, less. The grid IS the buffer, and every row of it is on
+    // screen at once.
+    const total = 45;
+    const w = rowWindow({ firstVisible: 1, viewportRows: 44, overscan: 20, total, rowHeight: 17 });
+    expect(w.start).toBe(0);
+    expect(w.end).toBe(total);
+  });
 });

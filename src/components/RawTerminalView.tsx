@@ -421,6 +421,16 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
     setRowHeight(0);
   }, [sessionId]);
 
+  /**
+   * The index of the first row IN THE VIEWPORT when following the tail.
+   *
+   * Not `lines.length - 1` — that is the LAST row, and using it left the window
+   * covering only the overscan beneath it while the top of the viewport
+   * rendered as blank spacer. On a full-screen TUI, where the grid is the whole
+   * buffer, that meant the first lines of the file were simply absent.
+   */
+  const tailFirstVisible = () => Math.max(0, lines.length - Math.max(1, viewportRows));
+
   /** Is a scroll gesture still in flight? See SCROLL_INTENT_MS. */
   const gesturing = () => performance.now() - scrollIntentAtRef.current < SCROLL_INTENT_MS;
   const noteGesture = () => { scrollIntentAtRef.current = performance.now(); };
@@ -436,6 +446,7 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
    */
   const cancelEasedScroll = () => {
     scrollTarget.current = null;
+    lastWrote.current = null;
     if (scrollFrame.current) cancelAnimationFrame(scrollFrame.current);
     scrollFrame.current = 0;
     lastFrameAt.current = 0;
@@ -515,7 +526,7 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
     if (anchor.mode === 'tail') {
       // The window has to follow the tail too, or the rows the reader is
       // about to see are not in the DOM to scroll to.
-      if (lines.length && win.end < lines.length) setFirstVisible(lines.length - 1);
+      if (lines.length && win.end < lines.length) setFirstVisible(tailFirstVisible());
       el.scrollTop = el.scrollHeight;
       return;
     }
@@ -545,7 +556,7 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
     if (atBottom) {
       cancelEasedScroll();
       setAnchor(TAIL);
-      setFirstVisible(Math.max(0, lines.length - 1));
+      setFirstVisible(tailFirstVisible());
       reattach(sessionId);
       return;
     }
@@ -582,6 +593,8 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
 
   /** One frame of eased scrolling toward whatever the wheel asked for. */
   const lastFrameAt = useRef(0);
+  /** The scrollTop the eased loop last set, so it can tell its own writes apart. */
+  const lastWrote = useRef<number | null>(null);
   /**
    * Stable identity, latest body. rAF holds the callback across frames while the
    * body must see the current `lines`; a useCallback with real dependencies
@@ -592,6 +605,18 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
     const el = scrollRef.current;
     const target = scrollTarget.current;
     if (!el || target === null) { scrollFrame.current = 0; return; }
+    // Did anything else move the viewport since our last frame?
+    //
+    // `target` is an ABSOLUTE pixel captured when the wheel turned. A search
+    // hit, a turn mark, scrollIntoView, or the layout effect holding an anchor
+    // all reposition the reader deliberately — and easing on toward a
+    // destination chosen before that drags them straight back off it. Observed
+    // in the browser as a detached reader drifting forward while output
+    // arrived: the exact failure the anchor exists to prevent.
+    if (lastWrote.current !== null && Math.abs(el.scrollTop - lastWrote.current) > 1) {
+      cancelEasedScroll();
+      return;
+    }
     const reduced = typeof window !== 'undefined'
       && !!window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
     // Measured, not assumed: easeScroll is frame-rate independent by design,
@@ -602,6 +627,7 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
     lastFrameAt.current = now;
     const next = easeScroll(el.scrollTop, target, dt, reduced);
     el.scrollTop = next;
+    lastWrote.current = el.scrollTop;
     // Move the anchor WITH the animation.
     //
     // Otherwise the anchor stays where the gesture began until the browser
@@ -616,6 +642,37 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
     scrollFrame.current = requestAnimationFrame(stepScroll);
   };
   const stepScroll = React.useCallback(() => stepImpl.current(), []);
+
+  /**
+   * The wheel, as a NON-PASSIVE native listener.
+   *
+   * React registers onWheel passively — for scroll performance — so
+   * preventDefault() inside it does nothing and logs "Unable to preventDefault
+   * inside passive event listener invocation." The browser's own scroll then
+   * ran alongside the eased one, and the two compounded. A native listener is
+   * the only way to claim the gesture.
+   */
+  const wheelImpl = useRef<(event: WheelEvent) => void>(() => {});
+  wheelImpl.current = (event: WheelEvent) => {
+    const el = scrollRef.current;
+    if (!el) return;
+    noteGesture();
+    if (event.deltaY < 0) leaveTail();
+    event.preventDefault();
+    lastWrote.current = el.scrollTop;
+    const from = scrollTarget.current ?? el.scrollTop;
+    const limit = Math.max(0, el.scrollHeight - el.clientHeight);
+    scrollTarget.current = Math.max(0, Math.min(limit, from + event.deltaY));
+    if (!scrollFrame.current) scrollFrame.current = requestAnimationFrame(stepScroll);
+  };
+
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const onWheel = (event: WheelEvent) => wheelImpl.current(event);
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => el.removeEventListener('wheel', onWheel);
+  }, []);
 
   useEffect(() => () => {
     if (scrollFrame.current) cancelAnimationFrame(scrollFrame.current);
@@ -878,7 +935,7 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
       e.preventDefault();
       cancelEasedScroll();
       setAnchor(TAIL);
-      setFirstVisible(Math.max(0, lines.length - 1));
+      setFirstVisible(tailFirstVisible());
       reattach(sessionId);
       if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
       return;
@@ -966,19 +1023,6 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
            existed only to beat the follow effect to the viewport, and a tail
            anchor no longer moves a reader who has left it.
         */
-        onWheel={(event) => {
-          const el = scrollRef.current;
-          if (!el) return;
-          noteGesture();
-          if (event.deltaY < 0) leaveTail();
-          event.preventDefault();
-          const from = scrollTarget.current ?? el.scrollTop;
-          const limit = Math.max(0, el.scrollHeight - el.clientHeight);
-          scrollTarget.current = Math.max(0, Math.min(limit, from + event.deltaY));
-          if (!scrollFrame.current) scrollFrame.current = requestAnimationFrame(stepScroll);
-        }}
-        // The PTY uses whole-pixel rows. A fractional 17.875px line box
-        // accumulated 37px of overflow and scrolled an editor's first row away.
         onTouchStart={noteGesture}
         onPointerDown={(event) => {
           if (event.target === event.currentTarget) noteGesture();

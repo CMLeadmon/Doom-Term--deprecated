@@ -46,7 +46,9 @@ Observed on a Windows build connected to a Linux development machine.
   and never had an exception.
 - **Smooth scrolling.** The wheel drives an eased, frame-rate-independent
   scroll that honours `prefers-reduced-motion`. There was previously none of
-  any kind.
+  any kind. It is a non-passive native listener, because React registers
+  `onWheel` passively and `preventDefault` there is silently ignored — the
+  browser's own scroll would otherwise run alongside the eased one.
 - **Row virtualization.** Only the visible rows plus overscan are in the DOM.
   The whole 5000-line buffer used to be, reconciled on every frame of a
   streaming agent and on every keystroke, before an echo could paint.
@@ -79,6 +81,14 @@ Observed on a Windows build connected to a Linux development machine.
   silently.** It is reported instead. No queue and no replay: bytes held now
   would land in whatever the child is doing by the time it is ready.
 - **Scrollback search moved the viewport nowhere** once rows were windowed.
+- **The top of every viewport rendered blank.** The window followed the LAST
+  row rather than the first row *in* the viewport, so it covered only the
+  overscan beneath it. On a full-screen editor, where the grid is the whole
+  buffer, the first lines of the file were simply absent.
+- **A deliberate jump was dragged back by an in-flight wheel animation.** The
+  eased scroll chased an absolute pixel captured when the wheel turned, so
+  anything that repositioned the reader afterwards — a search hit, a turn mark,
+  recovery restoring a detached anchor — was undone a frame later.
 - **An `agy` session drew Antigravity's mark in the shell's tan**, because the
   colour table had no entry for the binary name even though the mark table did.
 
