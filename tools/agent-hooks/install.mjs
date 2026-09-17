@@ -43,6 +43,9 @@ const WINDOWS = process.platform === 'win32';
 const HOOK_NAME = WINDOWS ? 'doom-term-hook.ps1' : 'doom-term-hook.sh';
 const HOOK_SRC = join(dirname(fileURLToPath(import.meta.url)), HOOK_NAME);
 const ARTIFACT_SRC = join(dirname(fileURLToPath(import.meta.url)), 'doom-term-artifact.sh');
+const REMOTE_SRC = join(dirname(fileURLToPath(import.meta.url)), 'doom-term-remote.sh');
+/** Shells whose rc file we know how to patch additively. */
+const REMOTE_RC = ['.bashrc', '.zshrc'];
 const hookDestination = root => join(root, '.doom-term', 'agent-hooks', HOOK_NAME);
 const artifactHookDestination = root => join(root, '.doom-term', 'agent-hooks', 'doom-term-artifact.sh');
 const localBinArtifact = root => join(root, '.local', 'bin', 'doom-term-artifact');
@@ -202,6 +205,38 @@ function status(root) {
   return out;
 }
 
+/**
+ * Add (or remove) the remote enrichment snippet in a shell's own rc file.
+ *
+ * Additive and reversible, tagged with the same MARKER the agent hooks use, so
+ * one uninstall convention covers both. Runs ON THE REMOTE MACHINE — this is
+ * the route for a host you are already sitting on, where injecting a bootstrap
+ * would mean typing into whatever the shell is currently doing.
+ */
+export function installRemoteSnippet({ root = homedir(), remove = false } = {}) {
+  const begin = `# >>> doom-term remote >>>  # ${MARKER}`;
+  const end = `# <<< doom-term remote <<<  # ${MARKER}`;
+  const block = `${begin}\n${readFileSync(REMOTE_SRC, 'utf8').trimEnd()}\n${end}\n`;
+  const results = [];
+  for (const name of REMOTE_RC) {
+    const path = join(root, name);
+    if (!existsSync(path)) { results.push({ path, changed: false, note: 'absent' }); continue; }
+    const before = readFileSync(path, 'utf8');
+    // Strip any block we previously wrote, so install is idempotent and
+    // uninstall is exact. The user's own lines are never touched.
+    const stripped = before.replace(
+      new RegExp(`${begin.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[\\s\\S]*?${end.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\n?`, 'g'),
+      '',
+    );
+    const after = remove ? stripped : `${stripped.trimEnd()}\n\n${block}`;
+    if (after === before) { results.push({ path, changed: false }); continue; }
+    backupOnce(path);
+    atomicWrite(path, after, 0o644);
+    results.push({ path, changed: true });
+  }
+  return results;
+}
+
 export function runInstaller({ root = homedir(), remove = false, purgeNodeterm = false } = {}) {
   const destination = hookDestination(root);
   // Preflight every vendor before copying the script, making backups, or
@@ -241,6 +276,12 @@ export function runInstaller({ root = homedir(), remove = false, purgeNodeterm =
 function main() {
   const remove = process.argv.includes('--remove');
   const root = homedir();
+  if (process.argv.includes('--remote')) {
+    for (const r of installRemoteSnippet({ root, remove })) {
+      console.log(`${r.path}: ${r.note ?? (r.changed ? (remove ? 'removed' : 'installed') : 'unchanged')}`);
+    }
+    return;
+  }
   if (process.argv.includes('--status')) {
     console.log(status(root).join('\n'));
     return;
