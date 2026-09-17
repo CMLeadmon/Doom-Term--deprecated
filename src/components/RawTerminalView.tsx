@@ -10,9 +10,6 @@ import {
 } from '../core/viewportAnchor';
 import { rowWindow } from '../core/rowWindow';
 import {
-  shouldEngage, predict, reconcile, noteSample, rttOf,
-} from '../core/localEcho';
-import {
   BINDINGS,
   VIEW_BINDINGS,
   isAppChord,
@@ -117,8 +114,6 @@ interface TerminalLineRowProps {
   /** Cells the caret covers: 2 over a double-width character, otherwise 1. */
   cursorCells?: number;
   hasFocus?: boolean;
-  /** Keystrokes sent but not yet confirmed, drawn after the caret. */
-  prediction?: string;
 }
 
 const TerminalLineRow = React.memo(function TerminalLineRow({
@@ -130,7 +125,6 @@ const TerminalLineRow = React.memo(function TerminalLineRow({
   cursorGlyph = '',
   cursorCells = 1,
   hasFocus = false,
-  prediction = '',
 }: TerminalLineRowProps) {
   return (
     <div
@@ -194,34 +188,6 @@ const TerminalLineRow = React.memo(function TerminalLineRow({
           >
             {hasFocus ? cursorGlyph : ''}
           </i>
-        )}
-        {isCursorHere && prediction && (
-          /*
-              Typed, sent, not yet confirmed.
-
-              Drawn in --st-idle, which is one of the five canonical state
-              colours and already means "not settled" — so an unconfirmed cell
-              is visibly not a confirmed one, in the vocabulary the plate
-              already uses. That is the whole basis on which this is allowed to
-              exist beside Axiom 3: the uncertainty is stated, not hidden.
-
-              Absolutely positioned for the same reason the caret is, and
-              carrying the same tracking: it renders terminal cells, and
-              without it the text advances by the font's fractional metric and
-              walks off the grid the caret is on.
-          */
-          <span
-            aria-hidden="true"
-            data-testid="echo-prediction"
-            className="absolute top-0 whitespace-pre pointer-events-none"
-            style={{
-              left: `calc(var(--terminal-cell-width, 1ch) * ${cursorCol + cursorCells})`,
-              color: 'var(--st-idle)',
-              letterSpacing: 'var(--terminal-tracking, 0px)',
-            }}
-          >
-            {prediction}
-          </span>
         )}
       </span>
     </div>
@@ -334,15 +300,6 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
     (sessionId && sessionAnchors.get(sessionId)) || TAIL,
   );
   const scrollIntentAtRef = useRef(Number.NEGATIVE_INFINITY);
-  /**
-   * Keystrokes sent but not yet confirmed, and what it takes to decide whether
-   * to draw them. See `core/localEcho`.
-   */
-  const [pending, setPending] = useState<string[]>([]);
-  const rttSamples = useRef<number[]>([]);
-  const sentAt = useRef<number | null>(null);
-  const lastCursor = useRef<{ row: number; col: number } | null>(null);
-
   /** Target of an in-flight eased scroll, and its frame handle. */
   const scrollTarget = useRef<number | null>(null);
   const scrollFrame = useRef(0);
@@ -453,9 +410,6 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
     swapped.current = true;
     anchorRef.current = (sessionId && sessionAnchors.get(sessionId)) || TAIL;
     scrollTarget.current = null;
-    rttSamples.current = [];
-    sentAt.current = null;
-    lastCursor.current = null;
   }
   useEffect(() => {
     // Only on an actual swap. Firing on MOUNT clobbers whatever the layout
@@ -465,12 +419,27 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
     swapped.current = false;
     setFirstVisible(0);
     setRowHeight(0);
-    setPending([]);
   }, [sessionId]);
 
   /** Is a scroll gesture still in flight? See SCROLL_INTENT_MS. */
   const gesturing = () => performance.now() - scrollIntentAtRef.current < SCROLL_INTENT_MS;
   const noteGesture = () => { scrollIntentAtRef.current = performance.now(); };
+
+  /**
+   * Abandon an in-flight eased scroll.
+   *
+   * Anything that jumps the reader somewhere deliberately — End, catching up
+   * to the tail, a session swap — has to cancel it first. The loop eases
+   * toward a target captured when the wheel turned, so without this it drags
+   * the viewport straight back off the destination: End pressed during an
+   * animation simply did not stick.
+   */
+  const cancelEasedScroll = () => {
+    scrollTarget.current = null;
+    if (scrollFrame.current) cancelAnimationFrame(scrollFrame.current);
+    scrollFrame.current = 0;
+    lastFrameAt.current = 0;
+  };
 
   /** Remember where this session was left, so a remount finds it again. */
   const setAnchor = (next: ViewportAnchor) => {
@@ -542,29 +511,6 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
       if (measured > 0) setRowHeight(measured);
     }
 
-    // ── LOCAL ECHO ────────────────────────────────────────────────────────
-    //
-    // A frame arriving is the child answering. Time it, then work out how much
-    // of what we predicted it just confirmed.
-    if (sentAt.current !== null) {
-      rttSamples.current = noteSample(rttSamples.current, performance.now() - sentAt.current);
-      sentAt.current = null;
-    }
-    if (pending.length > 0 && cursor) {
-      const previous = lastCursor.current;
-      if (!previous || previous.row !== cursor.row || cursor.col < previous.col) {
-        // The caret left the row, or went backwards. Whatever we predicted is
-        // attached to columns that no longer mean what they meant.
-        setPending([]);
-      } else if (cursor.col > previous.col) {
-        const row = lines.find((l) => l.row === cursor.row);
-        const text = row ? row.spans.map((sp) => sp.text).join('') : '';
-        const kept = reconcile(pending, text.slice(previous.col, cursor.col));
-        setPending(kept ?? []);
-      }
-    }
-    if (cursor) lastCursor.current = { row: cursor.row, col: cursor.col };
-
     const anchor = anchorRef.current;
     if (anchor.mode === 'tail') {
       // The window has to follow the tail too, or the rows the reader is
@@ -585,7 +531,7 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
     }
     const row = el.querySelector<HTMLElement>(`[data-terminal-line="${index}"]`);
     if (row) el.scrollTop = Math.max(0, row.offsetTop - anchor.offsetPx);
-  }, [lines, sessionId, rowHeight, win.end, cursor, pending]);
+  }, [lines, sessionId, rowHeight, win.end]);
 
   /**
    * Adopt whatever line is at the top of the viewport as the anchor.
@@ -597,6 +543,7 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
     if (!el || !sessionId) return;
     const atBottom = el.scrollHeight - (el.scrollTop + el.clientHeight) < 24;
     if (atBottom) {
+      cancelEasedScroll();
       setAnchor(TAIL);
       setFirstVisible(Math.max(0, lines.length - 1));
       reattach(sessionId);
@@ -611,21 +558,26 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
       return;
     }
     scrollIntentAtRef.current = Number.NEGATIVE_INFINITY;
+    // Where the window belongs is ARITHMETIC, not whatever is in the document.
+    //
+    // Scanning the rendered rows only works while the reader is already near
+    // them. A jump — a scrollbar drag, a click on the track, a programmatic
+    // restore — lands outside the window, and the scan then returns the first
+    // row of wherever the window happens to be and pins it there: the reader
+    // sees a blank pane, or silently loses an anchor they still hold.
+    const estimated = rowHeight > 0
+      ? Math.max(0, Math.min(lines.length - 1, Math.floor(el.scrollTop / rowHeight)))
+      : 0;
     const top = topRow(el);
-    if (!top) {
-      // The reader jumped outside the rendered window — a scrollbar drag or a
-      // click on the track. There is no row here to anchor to, and returning
-      // would leave them looking at a spacer div: a blank pane that nothing
-      // recovers until more output arrives. Estimate the row and let the next
-      // frame anchor properly.
-      if (rowHeight > 0) setFirstVisible(Math.min(lines.length - 1, Math.floor(el.scrollTop / rowHeight)));
-      return;
-    }
-    const line = lines[top.index];
+    // Trust the scan only when it agrees with the arithmetic; it carries the
+    // sub-row offset, which the estimate cannot.
+    const usable = top && Math.abs(top.index - estimated) <= 2 ? top : null;
+    const index = usable ? usable.index : estimated;
+    const line = lines[index];
     if (!line) return;
-    setFirstVisible(top.index);
-    setAnchor(anchorAt(line.id, top.offsetPx));
-    detach(sessionId, top.index);
+    setFirstVisible(index);
+    setAnchor(anchorAt(line.id, usable ? usable.offsetPx : 0));
+    detach(sessionId, index);
   };
 
   /** One frame of eased scrolling toward whatever the wheel asked for. */
@@ -924,6 +876,7 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
     // button floating in the middle of the pane; it is a key and a readout now.
     if (e.key === 'End' && anchorRef.current.mode === 'row' && sessionId) {
       e.preventDefault();
+      cancelEasedScroll();
       setAnchor(TAIL);
       setFirstVisible(Math.max(0, lines.length - 1));
       reattach(sessionId);
@@ -941,20 +894,6 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
         setClipboardNotice('Terminal is not accepting input yet; that keystroke was not sent.');
         return;
       }
-      if (sentAt.current === null) sentAt.current = performance.now();
-      const emu = sessionId ? getEmulator(sessionId) : null;
-      const engaged = shouldEngage({
-        rttMs: rttOf(rttSamples.current),
-        altScreen: emu?.isAltScreen() ?? false,
-        foreground: agentKey,
-      });
-      if (!engaged) {
-        if (pending.length) setPending([]);
-        return;
-      }
-      const next = predict(pending, bytes);
-      // null means "send it and wait", which is what every key did before this.
-      if (next) setPending(next);
     }
   };
 
@@ -1081,7 +1020,6 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
               cursorGlyph={isCursorHere ? cursor?.glyph : undefined}
               cursorCells={isCursorHere ? cursor?.cells : undefined}
               hasFocus={isCursorHere ? hasFocus : false}
-              prediction={isCursorHere && hasFocus ? pending.join('') : undefined}
             />
           );
         })}

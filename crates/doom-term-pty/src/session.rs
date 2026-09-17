@@ -562,6 +562,9 @@ impl PtySession {
         let remote: Arc<parking_lot::Mutex<Option<crate::remote::RemoteEnrichment>>> =
             Arc::new(parking_lot::Mutex::new(None));
         let reader_remote = remote.clone();
+        // Did a frame arrive during the prompt cycle that just ended?
+        let remote_fresh = Arc::new(AtomicBool::new(false));
+        let reader_remote_fresh = remote_fresh.clone();
 
         let running = Arc::new(AtomicBool::new(true));
         let running_clone = running.clone();
@@ -636,11 +639,37 @@ impl PtySession {
                         // Last one wins: the frame is emitted once per prompt,
                         // so the newest is the only one that still describes
                         // where the shell is.
+                        // Last one wins: the frame is emitted once per prompt,
+                        // so the newest is the only one that still describes
+                        // where the shell is.
+                        let mut reported = false;
                         if let Some(data) = events.iter().rev().find_map(|event| match event {
                             DemuxEvent::RemoteEnrichment { data } => Some(data.clone()),
                             _ => None,
                         }) {
                             *reader_remote.lock() = Some(data);
+                            reported = true;
+                        }
+                        // ...and it EXPIRES. A prompt that came round without a
+                        // frame is a shell that is not reporting: you typed
+                        // `exit` and you are back on this machine. Without this
+                        // the pane described the remote for the rest of its
+                        // life — a stale host, a stale branch, and context
+                        // forced to '--' for a session that is entirely local.
+                        if events
+                            .iter()
+                            .any(|event| matches!(event, DemuxEvent::PromptStart))
+                        {
+                            let mut held = reader_remote.lock();
+                            if held.is_some()
+                                && !reported
+                                && !reader_remote_fresh.swap(false, Ordering::Relaxed)
+                            {
+                                *held = None;
+                            }
+                        }
+                        if reported {
+                            reader_remote_fresh.store(true, Ordering::Relaxed);
                         }
 
                         for event in events {

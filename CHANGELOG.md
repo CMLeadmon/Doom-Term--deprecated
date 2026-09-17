@@ -38,13 +38,6 @@ Observed on a Windows build connected to a Linux development machine.
   `node tools/agent-hooks/install.mjs --remote` installs it on a host you are
   already connected to, additively and reversibly, with the same
   `doom-term-hook` tagging the agent hooks use.
-- **Predictive local echo.** Over a slow link a keystroke is drawn immediately
-  in `--st-idle` and retired when the child confirms it. It engages only above
-  a measured 30 ms round trip, never on the alternate screen, and never for
-  `vim`, `vi`, `nano` or `tmux` — VS Code's rules, which have the field
-  evidence. An unconfirmed cell is visibly not a confirmed one, which is the
-  whole basis on which it sits beside Axiom 3: the uncertainty is stated. What
-  is *sent* to the child is unchanged, byte for byte.
 - **A window titlebar in the four materials**, replacing the OS chrome, with
   the agent marks folded into it and `−` `□` `×` drawn as Unicode glyphs. This
   amends Axiom 2 in the open: the Status Plate remains the only persistent
@@ -91,6 +84,15 @@ Observed on a Windows build connected to a Linux development machine.
 
 ### Known limitations
 
+- **Predictive local echo is not enabled.** The policy module ships and is
+  tested, but it is not wired to the view. Review found that a prompt which
+  deliberately does not echo — `sudo`, `ssh`, `passwd`, a git credential
+  prompt — produces no output at all, so nothing ever reconciles the
+  prediction away and the typed password would be painted on screen. The
+  honest signal for "this prompt does not echo" is the PTY's termios `ECHO`
+  bit, which the daemon does not yet report. Input latency is still
+  substantially improved by row virtualization.
+
 - **The sticky first character is not closed.** One of its two causes — input
   discarded before attachment — is fixed. The other is that the demuxer answers
   every `CSI 6n` cursor-position probe with the origin, whatever the cursor is
@@ -108,6 +110,15 @@ Observed on a Windows build connected to a Linux development machine.
   desktop.
 - **Context and rate limits stay `--` across a transport.** Both are read from
   an agent's transcript, and the transcript is on the other machine.
+- **Remote isolation is reported from the local machine.** `CTNR`/`TREE`/`HOST`
+  describe the daemon's own container and worktree state; the enrichment frame
+  carries no isolation field. For a remote session the ENV cell shows the host
+  instead, so the wrong value is not displayed — but a frame that reports other
+  fields without a host would fall back to the local answer.
+- **An enrichment frame is accepted from any PTY output**, not only from a
+  session known to be an SSH one — as OSC 7 and OSC 133 already are, in every
+  terminal. Displaying a file containing the sequence will therefore relabel a
+  local pane, until the next prompt expires it.
 - Trim counting reads a private `@xterm/headless` interface. It is guarded: if
   that interface changes, line numbers degrade to buffer indices rather than
   going silently wrong.

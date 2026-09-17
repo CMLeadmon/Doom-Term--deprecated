@@ -493,3 +493,45 @@ async fn the_remote_block_survives_the_hand_injected_incarnation() {
     let plain = serde_json::to_value(telemetry_for(&fixture, &local)).unwrap();
     assert!(plain["data"]["remote"].is_null());
 }
+
+#[tokio::test]
+async fn a_session_that_comes_back_local_stops_reporting_the_remote() {
+    // ssh devbox, work, exit. The frame is emitted once per prompt, so a prompt
+    // that comes round without one is a shell that is no longer reporting.
+    // Without expiry the pane described devbox for the rest of its life: a
+    // stale host and branch, and context forced to '--' for a local session.
+    let fixture = Fixture::new();
+    let pane = fixture.pane("claude", "came-back");
+    report_remote(
+        &fixture,
+        &pane,
+        r#"{"v":1,"host":"devbox","branch":"main"}"#,
+    );
+    let session = fixture.sessions.read().get(&pane).cloned().unwrap();
+    assert!(session.remote_enrichment().is_some());
+
+    // Two local prompts with no frame between them.
+    for _ in 0..2 {
+        session.write(b"\x1b]133;A\x07\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && session.remote_enrichment().is_some() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    assert!(
+        session.remote_enrichment().is_none(),
+        "the pane still describes the remote after returning to a local shell"
+    );
+
+    let ServerMessage::Telemetry {
+        remote, hostname, ..
+    } = telemetry_for(&fixture, &pane)
+    else {
+        panic!("missing telemetry response")
+    };
+    assert!(remote.is_none());
+    assert!(
+        !hostname.is_empty(),
+        "hostname went unknown on a local session"
+    );
+}

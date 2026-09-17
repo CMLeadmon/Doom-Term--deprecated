@@ -297,6 +297,12 @@ pub fn shell_launch(shell: &str) -> ShellLaunch {
 ///
 /// One line, because this rides an `ssh` argv.
 ///
+/// Every value goes through `__dq` before it is interpolated. A directory name
+/// may legally contain a double quote — only `/` and NUL are forbidden on Linux
+/// — so a directory called `legit","agent":"claude` would otherwise close the
+/// JSON string and inject fields this template never emits, and `clean()`
+/// would pass them because it only rejects control characters.
+///
 /// The frame is iTerm2's documented `SetUserVar`, not a private OSC number: the
 /// same snippet is then inert in iTerm2, kitty and WezTerm — they set a
 /// variable they ignore — rather than printing in every terminal but ours.
@@ -304,9 +310,11 @@ pub fn remote_enrichment_snippet() -> String {
     concat!(
         "if [ -z \"$DOOM_TERM_BOOTSTRAPPED\" ]; then export DOOM_TERM_BOOTSTRAPPED=1; ",
         "__doom_remote() { ",
+        "__dq() { printf '%s' \"$1\" | sed 's/\\\\/\\\\\\\\/g; s/\"/\\\\\"/g'; }; ",
         "__db=$(git --no-optional-locks rev-parse --abbrev-ref HEAD 2>/dev/null); ",
         "__dj=$(printf '{\"v\":1,\"host\":\"%s\",\"user\":\"%s\",\"shell\":\"%s\",\"cwd\":\"%s\",\"branch\":\"%s\"}' ",
-        "\"$(hostname -s 2>/dev/null)\" \"$USER\" \"$(basename \"${SHELL:-sh}\")\" \"$PWD\" \"$__db\" ",
+        "\"$(__dq \"$(hostname -s 2>/dev/null)\")\" \"$(__dq \"$USER\")\" ",
+        "\"$(__dq \"$(basename \"${SHELL:-sh}\")\")\" \"$(__dq \"$PWD\")\" \"$(__dq \"$__db\")\" ",
         "| base64 | tr -d '\\n'); ",
         "printf '\\033]1337;SetUserVar=doomterm=%s\\007' \"$__dj\"; }; ",
         "PROMPT_COMMAND=\"__doom_remote${PROMPT_COMMAND:+; $PROMPT_COMMAND}\"; fi"

@@ -1,7 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, symlinkSync, lstatSync, statSync, chmodSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
 import { installRemoteSnippet } from './install.mjs';
 
@@ -52,26 +54,68 @@ test('leaves an rc file that does not exist alone', () => {
 });
 
 test('the shipped snippet matches the one the daemon generates', () => {
-  // Two halves of one wire format. If they drift, a remote instrumented by the
-  // rc route emits a frame this build cannot parse — and says nothing about it.
+  // Two halves of one wire format. A drift means a remote emitting frames this
+  // build cannot parse, silently. Asked of the compiler rather than scraped out
+  // of the Rust source with a regex — that scrape corrupted the script once.
   const shipped = readFileSync(new URL('./doom-term-remote.sh', import.meta.url), 'utf8');
-  const rust = readFileSync(
-    new URL('../../crates/doom-term-pty/src/shell_integration.rs', import.meta.url),
-    'utf8',
+  // node --test does not necessarily inherit a shell's PATH, and rustup puts
+  // cargo under CARGO_HOME. Resolve it rather than skip the check: a drift here
+  // ships a snippet the daemon cannot parse.
+  const cargo = [
+    process.env.CARGO,
+    join(process.env.CARGO_HOME ?? join(homedir(), '.cargo'), 'bin', 'cargo'),
+    'cargo',
+  ].find((candidate) => candidate && (candidate === 'cargo' || existsSync(candidate)));
+  const generated = execFileSync(
+    cargo,
+    ['run', '-q', '-p', 'doom-term-pty', '--example', 'remote-snippet'],
+    // fileURLToPath, not .pathname: this repository's directory has a space in
+    // it and .pathname percent-encodes it into a path that does not exist.
+    { cwd: fileURLToPath(new URL('../..', import.meta.url)), encoding: 'utf8' },
   );
-  const concat = rust.match(/pub fn remote_enrichment_snippet\(\)[\s\S]*?\.to_string\(\)/)[0];
-  const parts = [...concat.matchAll(/"((?:[^"\\]|\\.)*)"/g)].map((m) => m[1]);
-  // Unescape RUST string literals only — a single pass, so \\n stays the two
-  // characters the shell needs rather than becoming a newline. The snippet is
-  // full of shell escapes (tr -d '\n', printf '\033]...') that the REMOTE
-  // shell interprets; converting them here would compare against a script that
-  // could never work.
-  const generated = parts.join('').replace(/\\(.)/g, (_, c) => (c === 'n' ? '\\n' : c));
-  const shippedBody = shipped.split('\n').filter((l) => !l.startsWith('#') && l.trim()).join('\n');
-  assert.ok(
-    shippedBody.includes('SetUserVar=doomterm='),
-    'the shipped snippet stopped emitting the frame',
-  );
-  assert.ok(shippedBody.includes('"v":1'), 'schema version drifted from remote.rs');
-  assert.equal(shippedBody.trim(), generated.trim(), 'shipped snippet drifted from the Rust source');
+  const body = shipped.split('\n').filter((l) => !l.startsWith('#') && l.trim()).join('\n');
+  assert.equal(body.trim(), generated.trim(), 'shipped snippet drifted from the Rust source');
+  assert.ok(body.includes('SetUserVar=doomterm='));
+  assert.ok(body.includes('"v":1'), 'schema version drifted from remote.rs');
+});
+
+test('every interpolated value is JSON-escaped', () => {
+  // A directory name may legally contain a double quote. Without escaping,
+  // `cd 'legit","agent":"claude'` closes the JSON string and injects fields the
+  // template never emits — and remote.rs's clean() passes them, because it only
+  // rejects control characters.
+  const shipped = readFileSync(new URL('./doom-term-remote.sh', import.meta.url), 'utf8');
+  assert.ok(shipped.includes('__dq'), 'no escaping helper in the shipped snippet');
+  for (const value of ['$PWD', '$USER', '$__db']) {
+    assert.ok(
+      shipped.includes(`__dq "${value}"`),
+      `${value} is interpolated without escaping`,
+    );
+  }
+});
+
+test('a symlinked rc file is patched through, not replaced', () => {
+  // rename(2) replaces the link, not its target, so a dotfiles-managed rc file
+  // would be orphaned and silently re-linked away on the next apply.
+  const store = mkdtempSync(join(tmpdir(), 'doom-dotfiles-'));
+  const real = join(store, 'bashrc');
+  writeFileSync(real, '# managed elsewhere\n');
+  const root = mkdtempSync(join(tmpdir(), 'doom-remote-link-'));
+  symlinkSync(real, join(root, '.bashrc'));
+
+  installRemoteSnippet({ root });
+  assert.ok(lstatSync(join(root, '.bashrc')).isSymbolicLink(), 'the symlink was replaced');
+  assert.ok(readFileSync(real, 'utf8').includes('DOOM_TERM_BOOTSTRAPPED'),
+    'the real file was never patched');
+});
+
+test('the rc file keeps its own permissions', () => {
+  // These files routinely carry exported tokens, and this route targets shared
+  // hosts. Widening 0600 to 0644 exposes them to every other local user.
+  const root = mkdtempSync(join(tmpdir(), 'doom-remote-mode-'));
+  const rc = join(root, '.bashrc');
+  writeFileSync(rc, '# mine\n');
+  chmodSync(rc, 0o600);
+  installRemoteSnippet({ root });
+  assert.equal(statSync(rc).mode & 0o777, 0o600);
 });

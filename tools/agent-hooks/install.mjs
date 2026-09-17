@@ -219,8 +219,13 @@ export function installRemoteSnippet({ root = homedir(), remove = false } = {}) 
   const block = `${begin}\n${readFileSync(REMOTE_SRC, 'utf8').trimEnd()}\n${end}\n`;
   const results = [];
   for (const name of REMOTE_RC) {
-    const path = join(root, name);
+    let path = join(root, name);
     if (!existsSync(path)) { results.push({ path, changed: false, note: 'absent' }); continue; }
+    // Follow a symlink to its target, as the vendor-config path already does.
+    // atomicWrite renames over the destination, and rename(2) replaces the
+    // LINK — so a dotfiles-managed ~/.bashrc became a plain file and the repo's
+    // copy was orphaned, to be silently re-linked away on the next apply.
+    try { path = realpathSync(path); } catch { /* keep the literal path */ }
     const before = readFileSync(path, 'utf8');
     // Strip any block we previously wrote, so install is idempotent and
     // uninstall is exact. The user's own lines are never touched.
@@ -231,7 +236,10 @@ export function installRemoteSnippet({ root = homedir(), remove = false } = {}) 
     const after = remove ? stripped : `${stripped.trimEnd()}\n\n${block}`;
     if (after === before) { results.push({ path, changed: false }); continue; }
     backupOnce(path);
-    atomicWrite(path, after, 0o644);
+    // Preserve the mode. A hardcoded 0o644 widened a `chmod 600` rc file to
+    // world-readable — on a shared host, which is exactly where this route is
+    // used, and rc files routinely carry exported tokens.
+    atomicWrite(path, after, statSync(path).mode & 0o777);
     results.push({ path, changed: true });
   }
   return results;

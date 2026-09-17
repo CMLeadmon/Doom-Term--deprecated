@@ -45,16 +45,20 @@ pub fn telemetry(
     // directory that belongs to a mount which is unmounted when the app exits.
     // HOME is the same last resort `resolve_cwd` uses when it spawns a shell,
     // so the two agree about where "nowhere in particular" is.
-    let current_dir = remote
-        .as_ref()
-        .and_then(|r| r.cwd.clone())
-        .or(observed)
-        .or_else(|| {
-            cwd.map(|c| pty::session::expand_path(&c).to_string_lossy().to_string())
-                .filter(|c| !c.trim().is_empty())
-        })
-        .or_else(|| pty::home_dir().map(|home| home.to_string_lossy().into_owned()))
-        .unwrap_or_else(|| "/".to_string());
+    // For a remote session the local foreground process is `ssh` itself, so
+    // `observed` is the directory ssh was launched from ON THIS MACHINE. It is
+    // the same substitution every sibling field stopped making; this was the
+    // one place it survived.
+    let current_dir = match remote.as_ref() {
+        Some(r) => r.cwd.clone(),
+        None => observed,
+    }
+    .or_else(|| {
+        cwd.map(|c| pty::session::expand_path(&c).to_string_lossy().to_string())
+            .filter(|c| !c.trim().is_empty())
+    })
+    .or_else(|| pty::home_dir().map(|home| home.to_string_lossy().into_owned()))
+    .unwrap_or_else(|| "/".to_string());
     // No game vocabulary in anything the UI can render: an unknown user
     // is unknown, not a "marine" on "phobos-base".
     let username = match remote.as_ref() {
