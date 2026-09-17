@@ -185,7 +185,22 @@ fn listen_addr(host: Option<String>, port: Option<String>) -> String {
 }
 
 const CLI_ARTIFACT_SCRIPT: &str = include_str!("../../tools/agent-hooks/doom-term-artifact.sh");
+/// The hook this platform can actually run.
+///
+/// The POSIX hook needs `sh`, GNU `timeout` and `curl` on PATH. A stock Windows
+/// has none of the first two, and Claude Code's native Windows build no longer
+/// requires Git for Windows — so provisioning the .sh there writes a file that
+/// can never fire, and the agent well stays dark for a reason nothing reports.
+/// The .ps1 sibling keeps the same bounded-critical-path contract.
+#[cfg(not(windows))]
 const HOOK_SCRIPT: &str = include_str!("../../tools/agent-hooks/doom-term-hook.sh");
+#[cfg(windows)]
+const HOOK_SCRIPT: &str = include_str!("../../tools/agent-hooks/doom-term-hook.ps1");
+
+#[cfg(not(windows))]
+const HOOK_SCRIPT_NAME: &str = "doom-term-hook.sh";
+#[cfg(windows)]
+const HOOK_SCRIPT_NAME: &str = "doom-term-hook.ps1";
 
 /// When a daemon that nobody is connected to should stop.
 ///
@@ -386,7 +401,7 @@ fn provision_cli_tools() {
     let hook_targets = [home
         .join(".doom-term")
         .join("agent-hooks")
-        .join("doom-term-hook.sh")];
+        .join(HOOK_SCRIPT_NAME)];
     for target in &hook_targets {
         if let Some(parent) = target.parent() {
             let _ = std::fs::create_dir_all(parent);

@@ -30,9 +30,20 @@ import { fileURLToPath } from 'node:url';
 /** Our fingerprint. Never change it without a migration — removal keys on it. */
 const MARKER = 'doom-term-hook';
 
-const HOOK_SRC = join(dirname(fileURLToPath(import.meta.url)), 'doom-term-hook.sh');
+/**
+ * Which hook this platform can actually run.
+ *
+ * The .sh hook needs `sh`, GNU `timeout` and `curl` on PATH. Windows has none
+ * of the first two by default, and Claude Code's native Windows build no
+ * longer requires Git for Windows — so installing the POSIX hook there writes
+ * a config entry that can never fire, and the agent well stays dark for a
+ * reason nothing reports. The .ps1 sibling keeps the same contract.
+ */
+const WINDOWS = process.platform === 'win32';
+const HOOK_NAME = WINDOWS ? 'doom-term-hook.ps1' : 'doom-term-hook.sh';
+const HOOK_SRC = join(dirname(fileURLToPath(import.meta.url)), HOOK_NAME);
 const ARTIFACT_SRC = join(dirname(fileURLToPath(import.meta.url)), 'doom-term-artifact.sh');
-const hookDestination = root => join(root, '.doom-term', 'agent-hooks', 'doom-term-hook.sh');
+const hookDestination = root => join(root, '.doom-term', 'agent-hooks', HOOK_NAME);
 const artifactHookDestination = root => join(root, '.doom-term', 'agent-hooks', 'doom-term-artifact.sh');
 const localBinArtifact = root => join(root, '.local', 'bin', 'doom-term-artifact');
 
@@ -63,7 +74,23 @@ const isNodeterm = (h) =>
   typeof h?.command === 'string' && h.command.includes('.nodeterm/agent-hooks');
 
 const shellQuote = value => `'${value.replaceAll("'", "'\\''")}'`;
-const command = (agent, destination) => `sh ${shellQuote(destination)} ${agent}  # ${MARKER}`;
+/**
+ * PowerShell single-quoted strings escape a quote by doubling it, and know no
+ * other escape — so a path is safe to interpolate once its own quotes are
+ * doubled. `-File` must come last: everything after it is the script's own
+ * arguments.
+ *
+ * -NoProfile because a hook is not an interactive shell and loading the user's
+ * profile would put arbitrary startup time inside the agent's critical path.
+ * -ExecutionPolicy Bypass because the script is installed unsigned into the
+ * user's own directory, and the flag is scoped to this one invocation rather
+ * than changing any machine or user policy.
+ */
+const psQuote = value => `'${value.replaceAll("'", "''")}'`;
+const command = (agent, destination) =>
+  WINDOWS
+    ? `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ${psQuote(destination)} ${agent}  # ${MARKER}`
+    : `sh ${shellQuote(destination)} ${agent}  # ${MARKER}`;
 const isOurs = (h) => typeof h?.command === 'string' && h.command.includes(MARKER);
 
 function backupOnce(path) {

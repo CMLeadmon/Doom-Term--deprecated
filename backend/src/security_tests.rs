@@ -326,11 +326,14 @@ fn provision_cli_tools_creates_executable_helpers() {
         .join("doom-term-artifact");
     assert!(doom_bin.exists());
 
+    // Named by the same constant the daemon provisions from: this file is
+    // doom-term-hook.ps1 on Windows, and a literal here would assert the wrong
+    // name on the one platform where the name is the interesting part.
     let hook_file = tmp
         .path()
         .join(".doom-term")
         .join("agent-hooks")
-        .join("doom-term-hook.sh");
+        .join(HOOK_SCRIPT_NAME);
     assert!(hook_file.exists());
     let hook_content = std::fs::read_to_string(&hook_file).unwrap();
     assert!(hook_content.contains("Doom Term agent hook"));
