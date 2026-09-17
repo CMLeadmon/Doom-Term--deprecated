@@ -11,6 +11,7 @@ pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_decorum::init())
         .setup(|app| {
             // The daemon is bundled, not something the user starts. A failure
             // here is not fatal: the UI reconnects on a timer, so the window

@@ -25,7 +25,7 @@ import { PaneSelectOverlay } from './components/PaneSelectOverlay';
 import { closeDisposition } from './core/sessionClose';
 import { CloseSessionPrompt } from './components/CloseSessionPrompt';
 import { SessionSnapshotNotice } from './components/SessionSnapshotNotice';
-import { AgentQueueIndicator } from './components/AgentQueueIndicator';
+import { TitleBar } from './components/TitleBar';
 import { PermissionModeModal, type PermissionMode } from './components/PermissionModeModal';
 import { RenameSessionModal } from './components/RenameSessionModal';
 import { DaemonAuthModal } from './components/DaemonAuthModal';
@@ -565,23 +565,55 @@ export const App: React.FC = () => {
     errors: workspaceNodes.filter(isSessionFailed).length,
   };
 
+  /**
+   * Drive the real window from our own controls.
+   *
+   * Dynamic import and a Tauri guard, matching how `ptyClient` and
+   * `useSessionNotifications` already reach the desktop shell: in a browser
+   * there is no window to minimise and the module is not there to load.
+   */
+  const windowAction = React.useCallback(
+    async (action: 'minimize' | 'toggleMaximize' | 'close') => {
+      if (!ptyClient.getIsTauri()) return;
+      try {
+        const { getCurrentWindow } = await import('@tauri-apps/api/window');
+        const win = getCurrentWindow();
+        if (action === 'minimize') await win.minimize();
+        else if (action === 'toggleMaximize') await win.toggleMaximize();
+        else await win.close();
+      } catch (error) {
+        console.warn('[window] control unavailable', error);
+      }
+    },
+    [],
+  );
+
   const autoBlockedNode = permissionMode === 'auto'
     ? workspaceNodes.find((n) => n.blockedOnUser && !dismissedAsks.has(`${n.id}:${n.attentionSerial ?? 0}`))
     : null;
 
   return (
     <div className="flex flex-col h-screen w-screen overflow-hidden select-none font-mono" style={{ background: 'var(--ground)' }}>
+      {/* Window chrome. The plate is still the only persistent APPLICATION
+          chrome; this is window management, and it replaces an OS titlebar
+          that was already persistent and already outside the design system. */}
+      <div className="shrink-0">
+        <TitleBar
+          nodes={workspaceNodes}
+          activeSessionId={activeGroup.activeNodeId}
+          onSelectNode={handleSelectNode}
+          title="Doom Term"
+          onMinimize={() => void windowAction('minimize')}
+          onToggleMaximize={() => void windowAction('toggleMaximize')}
+          onClose={() => void windowAction('close')}
+        />
+      </div>
       <SessionModeNotice sessionId={activeNode?.id ?? null} />
 
       {/* The terminal reaches all four window edges. The plate is the only
           chrome, and Ctrl+1-9 plus the plate's waiting rows are how you move
           between sessions now that the strip and the sidebar are gone. */}
       <div className="flex-1 flex relative min-h-0 min-w-0">
-        <AgentQueueIndicator
-          nodes={workspaceNodes}
-          activeSessionId={activeGroup.activeNodeId}
-          onSelectNode={handleSelectNode}
-        />
         <SplitPaneGrid
           layout={activeGroup.layout}
           nodes={groupNodes}
