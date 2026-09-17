@@ -100,3 +100,22 @@ test('plate state pulses only while the agent is busy', () => {
   assert.equal(toPlateState({ agent: 'claude', agentBusy: false }, 0.5).pulse, undefined);
   assert.equal(toPlateState({ agent: 'claude' }, 0.5).pulse, undefined, 'unknown is not busy');
 });
+
+/** Marks that stand in for a plain shell, which correctly has no vendor colour. */
+const SHELL_ALIASES = new Set(['shell', 'terminal', 'bash', 'zsh', 'fish', 'none']);
+
+test('every vendor mark has a vendor colour, so none falls back to the shell tan', () => {
+  for (const key of Object.keys(MARKS)) {
+    if (SHELL_ALIASES.has(key)) continue;
+    assert.ok(
+      AGENT_COLORS[key],
+      `${key} draws a vendor mark but has no vendor colour, so markTones falls back to C.tan`,
+    );
+  }
+});
+
+test('agy and antigravity are one product, and one colour', () => {
+  // MARKS.agy = MARKS.antigravity has been true since agy was added; the colour
+  // table never followed, so an agy session drew the prism in the shell's tan.
+  assert.equal(AGENT_COLORS.agy, AGENT_COLORS.antigravity);
+});

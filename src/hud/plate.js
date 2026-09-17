@@ -124,6 +124,12 @@ const AGENT_COLORS = {
   codex: '#e6e6e6',
   gemini: '#8ab6ff',
   antigravity: '#d8ecff',
+  // agy is the binary, antigravity the product, and MARKS.agy has aliased the
+  // prism since it was added. The colour table never followed, so markTones
+  // fell through to C.tan and an agy session drew Antigravity's prism in the
+  // shell's own tan — while AgentQueueIndicator's private table had it right.
+  // That disagreement is why one table is going away.
+  agy: '#d8ecff',
   aider: '#d8b45f',
   opencode: '#8fd4a0',
   grok: '#e6e6e6',
