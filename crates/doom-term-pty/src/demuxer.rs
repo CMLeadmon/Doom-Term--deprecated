@@ -12,6 +12,8 @@ pub enum DemuxEvent {
     BracketedPasteMode { enabled: bool },
     AgentState { state: String },
     Cwd { path: String },
+    /// What the shell on the far end of a transport reported about itself.
+    RemoteEnrichment { data: crate::remote::RemoteEnrichment },
     StreamFault { reason: crate::stream::StreamFault },
 }
 
@@ -523,6 +525,13 @@ impl StreamDemuxer {
                 let state = body["AgentState=".len()..].trim().to_lowercase();
                 return Some(DemuxEvent::AgentState { state });
             }
+            // iTerm2's documented SetUserVar, carrying what a remote shell says
+            // about itself. A frame we cannot parse is dropped: being an OSC
+            // record has already kept it off the screen.
+            if let Some(payload) = body.strip_prefix("SetUserVar=doomterm=") {
+                return crate::remote::parse_frame(payload.trim())
+                    .map(|data| DemuxEvent::RemoteEnrichment { data });
+            }
         }
 
         None
@@ -649,6 +658,55 @@ mod tests {
             let text = screen_text(&demuxer.process_bytes(&input));
             assert_eq!(text, "AB", "U+{:04X} leaked out of a control string", ch as u32);
         }
+    }
+
+    #[test]
+    fn a_remote_enrichment_frame_becomes_an_event_and_never_text() {
+        use base64::Engine;
+        let payload = base64::engine::general_purpose::STANDARD
+            .encode(r#"{"v":1,"host":"devbox","branch":"main"}"#);
+        let mut demuxer = StreamDemuxer::new();
+        let events =
+            demuxer.process_bytes(format!("a\x1b]1337;SetUserVar=doomterm={payload}\x07b").as_bytes());
+        assert_eq!(screen_text(&events), "ab");
+        let found = events.iter().find_map(|e| match e {
+            DemuxEvent::RemoteEnrichment { data } => Some(data.clone()),
+            _ => None,
+        });
+        let data = found.expect("the frame produced no enrichment event");
+        assert_eq!(data.host.as_deref(), Some("devbox"));
+        assert_eq!(data.branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn a_foreign_user_var_is_swallowed_without_being_read() {
+        // iTerm2's SetUserVar space is shared. Another vendor's variable is not
+        // ours to interpret, and must not print either.
+        let mut demuxer = StreamDemuxer::new();
+        let events = demuxer.process_bytes(b"a\x1b]1337;SetUserVar=someoneelse=eHl6\x07b");
+        assert_eq!(screen_text(&events), "ab");
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, DemuxEvent::RemoteEnrichment { .. })));
+    }
+
+    #[test]
+    fn a_malformed_enrichment_frame_is_dropped_rather_than_rendered() {
+        let mut demuxer = StreamDemuxer::new();
+        let events = demuxer.process_bytes(b"a\x1b]1337;SetUserVar=doomterm=!!!notbase64\x07b");
+        assert_eq!(screen_text(&events), "ab");
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, DemuxEvent::RemoteEnrichment { .. })));
+    }
+
+    #[test]
+    fn the_agent_state_hook_still_works_beside_it() {
+        let mut demuxer = StreamDemuxer::new();
+        let events = demuxer.process_bytes(b"\x1b]1337;AgentState=waiting_input\x07");
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, DemuxEvent::AgentState { state } if state == "waiting_input")));
     }
 
     #[test]
