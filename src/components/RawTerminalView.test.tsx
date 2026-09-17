@@ -189,6 +189,73 @@ describe('RawTerminalView', () => {
     resetSessionAnchors();
   });
 
+  it('predicts nothing until a round trip has actually been measured', () => {
+    // No measurement is not a fast link and not a slow one. Predicting on no
+    // answer would be inventing the reason to predict.
+    const onWrite = vi.fn(() => true);
+    render(<RawTerminalView {...base} onWrite={onWrite} sessionId="echo-cold" isActive
+      lines={[{ id: 'L0', row: 0, spans: [{ text: '$ ' }], timestamp: 0 }]}
+      cursor={{ row: 0, col: 2 }} />);
+    fireEvent.keyDown(screen.getByTestId('raw-terminal'), { key: 'x' });
+    expect(screen.queryByTestId('echo-prediction')).toBeNull();
+  });
+
+  it('paints an unconfirmed keystroke in the unsettled colour once the link is slow', () => {
+    const realNow = performance.now;
+    let clock = 0;
+    performance.now = () => clock;
+    const onWrite = vi.fn(() => true);
+    try {
+      const props = { ...base, onWrite, sessionId: 'echo', isActive: true };
+      const view = render(<RawTerminalView {...props}
+        lines={[{ id: 'L0', row: 0, spans: [{ text: '$ ' }], timestamp: 0 }]}
+        cursor={{ row: 0, col: 2 }} />);
+      const term = screen.getByTestId('raw-terminal');
+
+      // One keystroke, answered 200ms later: that is the measurement.
+      fireEvent.keyDown(term, { key: 'a' });
+      clock = 200;
+      view.rerender(<RawTerminalView {...props}
+        lines={[{ id: 'L0', row: 0, spans: [{ text: '$ a' }], timestamp: 0 }]}
+        cursor={{ row: 0, col: 3 }} />);
+
+      // Now the link is known slow, so the next keystroke is drawn immediately.
+      fireEvent.keyDown(term, { key: 'b' });
+      const predicted = screen.getByTestId('echo-prediction');
+      expect(predicted.textContent).toBe('b');
+      expect(predicted.getAttribute('style')).toContain('var(--st-idle)');
+
+      // ...and the child confirming it retires the prediction rather than
+      // leaving the character drawn twice.
+      view.rerender(<RawTerminalView {...props}
+        lines={[{ id: 'L0', row: 0, spans: [{ text: '$ ab' }], timestamp: 0 }]}
+        cursor={{ row: 0, col: 4 }} />);
+      expect(screen.queryByTestId('echo-prediction')).toBeNull();
+    } finally { performance.now = realNow; }
+  });
+
+  it('never predicts a control byte, however slow the link', () => {
+    const realNow = performance.now;
+    let clock = 0;
+    performance.now = () => clock;
+    const onWrite = vi.fn(() => true);
+    try {
+      const props = { ...base, onWrite, sessionId: 'echo-ctl', isActive: true };
+      const view = render(<RawTerminalView {...props}
+        lines={[{ id: 'L0', row: 0, spans: [{ text: '$ ' }], timestamp: 0 }]}
+        cursor={{ row: 0, col: 2 }} />);
+      const term = screen.getByTestId('raw-terminal');
+      fireEvent.keyDown(term, { key: 'a' });
+      clock = 300;
+      view.rerender(<RawTerminalView {...props}
+        lines={[{ id: 'L0', row: 0, spans: [{ text: '$ a' }], timestamp: 0 }]}
+        cursor={{ row: 0, col: 3 }} />);
+      // An arrow key moves a cursor we cannot model; Enter runs something.
+      fireEvent.keyDown(term, { key: 'ArrowLeft' });
+      expect(screen.queryByTestId('echo-prediction')).toBeNull();
+    } finally { performance.now = realNow; }
+  });
+
   it('reports a refused keystroke instead of swallowing it', () => {
     // mutate() returns false whenever the attachment is not 'ready'
     // (sessionAttachment.ts), so a key typed before a session settles reaches

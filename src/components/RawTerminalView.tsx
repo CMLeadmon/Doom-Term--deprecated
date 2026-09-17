@@ -10,6 +10,9 @@ import {
 } from '../core/viewportAnchor';
 import { rowWindow } from '../core/rowWindow';
 import {
+  shouldEngage, predict, reconcile, noteSample, rttOf,
+} from '../core/localEcho';
+import {
   BINDINGS,
   VIEW_BINDINGS,
   isAppChord,
@@ -114,6 +117,8 @@ interface TerminalLineRowProps {
   /** Cells the caret covers: 2 over a double-width character, otherwise 1. */
   cursorCells?: number;
   hasFocus?: boolean;
+  /** Keystrokes sent but not yet confirmed, drawn after the caret. */
+  prediction?: string;
 }
 
 const TerminalLineRow = React.memo(function TerminalLineRow({
@@ -125,6 +130,7 @@ const TerminalLineRow = React.memo(function TerminalLineRow({
   cursorGlyph = '',
   cursorCells = 1,
   hasFocus = false,
+  prediction = '',
 }: TerminalLineRowProps) {
   return (
     <div
@@ -188,6 +194,34 @@ const TerminalLineRow = React.memo(function TerminalLineRow({
           >
             {hasFocus ? cursorGlyph : ''}
           </i>
+        )}
+        {isCursorHere && prediction && (
+          /*
+              Typed, sent, not yet confirmed.
+
+              Drawn in --st-idle, which is one of the five canonical state
+              colours and already means "not settled" — so an unconfirmed cell
+              is visibly not a confirmed one, in the vocabulary the plate
+              already uses. That is the whole basis on which this is allowed to
+              exist beside Axiom 3: the uncertainty is stated, not hidden.
+
+              Absolutely positioned for the same reason the caret is, and
+              carrying the same tracking: it renders terminal cells, and
+              without it the text advances by the font's fractional metric and
+              walks off the grid the caret is on.
+          */
+          <span
+            aria-hidden="true"
+            data-testid="echo-prediction"
+            className="absolute top-0 whitespace-pre pointer-events-none"
+            style={{
+              left: `calc(var(--terminal-cell-width, 1ch) * ${cursorCol + cursorCells})`,
+              color: 'var(--st-idle)',
+              letterSpacing: 'var(--terminal-tracking, 0px)',
+            }}
+          >
+            {prediction}
+          </span>
         )}
       </span>
     </div>
@@ -300,6 +334,15 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
     (sessionId && sessionAnchors.get(sessionId)) || TAIL,
   );
   const scrollIntentAtRef = useRef(Number.NEGATIVE_INFINITY);
+  /**
+   * Keystrokes sent but not yet confirmed, and what it takes to decide whether
+   * to draw them. See `core/localEcho`.
+   */
+  const [pending, setPending] = useState<string[]>([]);
+  const rttSamples = useRef<number[]>([]);
+  const sentAt = useRef<number | null>(null);
+  const lastCursor = useRef<{ row: number; col: number } | null>(null);
+
   /** Target of an in-flight eased scroll, and its frame handle. */
   const scrollTarget = useRef<number | null>(null);
   const scrollFrame = useRef(0);
@@ -326,6 +369,15 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
   const [firstVisible, setFirstVisible] = useState(0);
   const [rowHeight, setRowHeight] = useState(0);
   const [searching, setSearching] = useState(false);
+  /**
+   * Bumped whenever the search moves.
+   *
+   * `runSearch` and `stepHit` write module state through a ref, which React
+   * cannot see — so typing a query caused no render at all, and the effect that
+   * follows the hit never ran. Harmless while every row was in the DOM; once
+   * only a window is rendered it means the hit is never brought into it.
+   */
+  const [searchEpoch, setSearchEpoch] = useState(0);
   const [quickSelecting, setQuickSelecting] = useState(false);
   const [clipboardNotice, setClipboardNotice] = useState<string | null>(null);
   const clipboardEpoch = useRef(0);
@@ -395,14 +447,25 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
    * would land somewhere real-looking and wrong.
    */
   const shownSession = useRef(sessionId);
+  const swapped = useRef(false);
   if (shownSession.current !== sessionId) {
     shownSession.current = sessionId;
+    swapped.current = true;
     anchorRef.current = (sessionId && sessionAnchors.get(sessionId)) || TAIL;
     scrollTarget.current = null;
+    rttSamples.current = [];
+    sentAt.current = null;
+    lastCursor.current = null;
   }
   useEffect(() => {
+    // Only on an actual swap. Firing on MOUNT clobbers whatever the layout
+    // effects just decided — passive effects run after them — which silently
+    // undid the window a search hit had scrolled to.
+    if (!swapped.current) return;
+    swapped.current = false;
     setFirstVisible(0);
     setRowHeight(0);
+    setPending([]);
   }, [sessionId]);
 
   /** Is a scroll gesture still in flight? See SCROLL_INTENT_MS. */
@@ -479,6 +542,29 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
       if (measured > 0) setRowHeight(measured);
     }
 
+    // ── LOCAL ECHO ────────────────────────────────────────────────────────
+    //
+    // A frame arriving is the child answering. Time it, then work out how much
+    // of what we predicted it just confirmed.
+    if (sentAt.current !== null) {
+      rttSamples.current = noteSample(rttSamples.current, performance.now() - sentAt.current);
+      sentAt.current = null;
+    }
+    if (pending.length > 0 && cursor) {
+      const previous = lastCursor.current;
+      if (!previous || previous.row !== cursor.row || cursor.col < previous.col) {
+        // The caret left the row, or went backwards. Whatever we predicted is
+        // attached to columns that no longer mean what they meant.
+        setPending([]);
+      } else if (cursor.col > previous.col) {
+        const row = lines.find((l) => l.row === cursor.row);
+        const text = row ? row.spans.map((sp) => sp.text).join('') : '';
+        const kept = reconcile(pending, text.slice(previous.col, cursor.col));
+        setPending(kept ?? []);
+      }
+    }
+    if (cursor) lastCursor.current = { row: cursor.row, col: cursor.col };
+
     const anchor = anchorRef.current;
     if (anchor.mode === 'tail') {
       // The window has to follow the tail too, or the rows the reader is
@@ -499,7 +585,7 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
     }
     const row = el.querySelector<HTMLElement>(`[data-terminal-line="${index}"]`);
     if (row) el.scrollTop = Math.max(0, row.offsetTop - anchor.offsetPx);
-  }, [lines, sessionId, rowHeight, win.end]);
+  }, [lines, sessionId, rowHeight, win.end, cursor, pending]);
 
   /**
    * Adopt whatever line is at the top of the viewport as the anchor.
@@ -666,6 +752,7 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
       setSearching(true);
       queryRef.current = '';
       runSearch(sessionId, '', lines);
+      setSearchEpoch((n) => n + 1);
       return;
     }
 
@@ -718,21 +805,20 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
     const el = scrollRef.current;
     const hit = lines[st.line];
     if (!hit) return;
+    // The window must follow the hit whether or not the hit happens to be in
+    // the DOM right now. Before the line box is measured `rowWindow` renders
+    // everything, so a hit IS found — and if only the not-found path synced
+    // `firstVisible`, the window would shrink back around index 0 the moment a
+    // real measurement arrived, taking the hit off screen again.
+    setAnchor(anchorAt(hit.id, -(el.clientHeight / 2)));
+    setFirstVisible(st.line);
     const row = el.querySelector<HTMLElement>(`[data-terminal-line="${st.line}"]`);
-    if (!row) {
-      // Only the viewport plus overscan is rendered, so a hit further away has
-      // no element to scroll to. Without this the search silently did nothing:
-      // "a hit you cannot see was found for nobody" described the bug rather
-      // than preventing it.
-      setAnchor(anchorAt(hit.id, -(el.clientHeight / 2)));
-      setFirstVisible(st.line);
-      return;
-    }
     if (row) {
       setAnchor(anchorAt(hit.id, 0));
       el.scrollTop = Math.max(0, row.offsetTop - el.clientHeight / 2);
     }
-  });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searching, searchEpoch, sessionId, lines, win.start, win.end]);
 
   // Size from the grid container rather than the outer box. They are nearly the
   // same now the header is gone, but the grid is the surface the shell actually
@@ -791,20 +877,24 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
         setSearching(false);
         queryRef.current = '';
         runSearch(sessionId, '', lines);
+        setSearchEpoch((n) => n + 1);
         return;
       }
       if (e.key === 'Enter') {
         stepHit(sessionId, e.shiftKey ? -1 : 1);
+        setSearchEpoch((n) => n + 1);
         return;
       }
       if (e.key === 'Backspace') {
         queryRef.current = queryRef.current.slice(0, -1);
         runSearch(sessionId, queryRef.current, lines);
+        setSearchEpoch((n) => n + 1);
         return;
       }
       if (e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey) {
         queryRef.current += e.key;
         runSearch(sessionId, queryRef.current, lines);
+        setSearchEpoch((n) => n + 1);
         return;
       }
       return;   // swallow everything else so a stray key cannot reach the PTY
@@ -849,7 +939,22 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
       // contract sets out. An unknown delivery is reported as unknown.
       if (onWrite(bytes) === false) {
         setClipboardNotice('Terminal is not accepting input yet; that keystroke was not sent.');
+        return;
       }
+      if (sentAt.current === null) sentAt.current = performance.now();
+      const emu = sessionId ? getEmulator(sessionId) : null;
+      const engaged = shouldEngage({
+        rttMs: rttOf(rttSamples.current),
+        altScreen: emu?.isAltScreen() ?? false,
+        foreground: agentKey,
+      });
+      if (!engaged) {
+        if (pending.length) setPending([]);
+        return;
+      }
+      const next = predict(pending, bytes);
+      // null means "send it and wait", which is what every key did before this.
+      if (next) setPending(next);
     }
   };
 
@@ -976,6 +1081,7 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
               cursorGlyph={isCursorHere ? cursor?.glyph : undefined}
               cursorCells={isCursorHere ? cursor?.cells : undefined}
               hasFocus={isCursorHere ? hasFocus : false}
+              prediction={isCursorHere && hasFocus ? pending.join('') : undefined}
             />
           );
         })}
