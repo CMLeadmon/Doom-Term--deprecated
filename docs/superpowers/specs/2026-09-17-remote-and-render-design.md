@@ -369,8 +369,20 @@ Add a string-state to the demuxer alongside `in_osc` and `in_csi`:
 
 Terminated by ST (`ESC \` or `0x9c`) or, leniently, BEL. Bounded by
 `MAX_CONTROL_LEN` (= `stream::MAX_RECORD_BYTES`) with the same `control_fault`
-as OSC. 8-bit introducers and terminators are recognised in the byte loop,
-**before** `take_output` can replace them with U+FFFD.
+as OSC.
+
+**The 8-bit introducers are declined, and that correction came from the code.**
+This document first claimed they should be recognised in the byte loop ahead of
+the UTF-8 splice. They cannot be: `0x80..=0xbf` is the UTF-8 *continuation*
+range and the C1 introducers live inside it, so `0x9f` is both the APC
+introducer and the second byte of every four-byte emoji — U+1F389 is
+`f0 9f 8e 89`. Implementing the original claim ate emoji, and
+`a_four_byte_emoji_survives_a_split_at_every_interior_offset` caught it on the
+first run. xterm declines them in UTF-8 mode for exactly this reason.
+
+The 8-bit **terminator** is a different question and is honoured, but only
+inside an open string, where the body is opaque bytes rather than decoded text.
+That is the ST Warp's bootstrap actually emits.
 
 Nothing inside a string sequence reaches the renderer. Foreign vendor hooks —
 Warp's `SourcedRcFileForWarp` and `InitSubshell`, iTerm2's — are swallowed in

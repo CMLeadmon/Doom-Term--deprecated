@@ -33,6 +33,21 @@ pub struct StreamDemuxer {
     osc_buf: Vec<u8>,
     in_csi: bool,
     csi_buf: Vec<u8>,
+    /// An open DCS, SOS, PM or APC string.
+    ///
+    /// The demuxer modelled OSC and CSI and nothing else, so `ESC P` fell into
+    /// the ESC catch-all below: the introducer was emitted as text and the
+    /// state machine returned to ground, which printed every byte of the body.
+    /// A remote whose rc file carries Warp's bootstrap therefore rendered its
+    /// JSON hook on screen at every connect.
+    ///
+    /// None of these sequences carries screen content by definition. The
+    /// terminator is the only part that matters and swallowing the rest is the
+    /// whole job, so the body is counted rather than buffered.
+    in_string: bool,
+    /// An ESC seen inside a string, which may be the first half of `ESC \`.
+    string_esc: bool,
+    string_len: usize,
     tui_active: bool,
     /// Bytes owed back to the PTY. A terminal that stays silent when asked a
     /// question leaves the asker blocked on its own timeout.
@@ -77,6 +92,9 @@ impl StreamDemuxer {
             osc_buf: Vec::with_capacity(256),
             in_csi: false,
             csi_buf: Vec::with_capacity(64),
+            in_string: false,
+            string_esc: false,
+            string_len: 0,
             tui_active: false,
             pending_responses: Vec::new(),
             utf8_tail: Vec::new(),
@@ -145,6 +163,33 @@ impl StreamDemuxer {
         let mut i = 0;
         while i < bytes.len() {
             let b = bytes[i];
+
+            // A control string runs to its terminator and reaches nobody.
+            if self.in_string {
+                if self.string_len == MAX_CONTROL_LEN {
+                    events.push(self.control_fault());
+                    return events;
+                }
+                self.string_len += 1;
+                let escaped = self.string_esc;
+                self.string_esc = false;
+                if escaped {
+                    // ESC \ is the 7-bit ST. ESC anything-else is payload, and
+                    // a second ESC may itself begin the terminator.
+                    if b == b'\\' {
+                        self.in_string = false;
+                    } else if b == 0x1b {
+                        self.string_esc = true;
+                    }
+                } else if b == 0x9c || b == 0x07 {
+                    // 8-bit ST, and BEL accepted leniently as it is for OSC.
+                    self.in_string = false;
+                } else if b == 0x1b {
+                    self.string_esc = true;
+                }
+                i += 1;
+                continue;
+            }
 
             if self.in_osc {
                 if self.osc_buf.len() == MAX_CONTROL_LEN {
@@ -288,6 +333,14 @@ impl StreamDemuxer {
                     i += 1;
                     continue;
                 }
+                // DCS, SOS, PM, APC. Nothing inside one is screen content.
+                if matches!(b, b'P' | b'X' | b'^' | b'_') {
+                    self.in_string = true;
+                    self.string_esc = false;
+                    self.string_len = 0;
+                    i += 1;
+                    continue;
+                }
                 // Some other ESC sequence — hand it to the renderer intact.
                 if b == b'c' {
                     events.push(DemuxEvent::BracketedPasteMode { enabled: false });
@@ -304,6 +357,19 @@ impl StreamDemuxer {
                 continue;
             }
 
+            // The 8-bit C1 introducers (DCS 0x90, SOS 0x98, PM 0x9e, APC 0x9f)
+            // are deliberately NOT recognised here.
+            //
+            // In a UTF-8 stream they are indistinguishable from continuation
+            // bytes, because that is exactly what they are: 0x80..=0xbf is the
+            // continuation range. Treating 0x9f as an APC introducer ate the
+            // second byte of every four-byte emoji — U+1F389 is f0 9f 8e 89 —
+            // which the split-emoji test caught immediately. xterm declines
+            // them in UTF-8 mode for the same reason.
+            //
+            // The 8-bit ST is a different question and IS honoured, inside a
+            // string, where the body is opaque bytes rather than decoded text.
+            // That is the terminator Warp's bootstrap actually uses.
             output_chunk.push(b);
             i += 1;
         }
@@ -324,6 +390,9 @@ impl StreamDemuxer {
         self.faulted = true;
         self.osc_buf = Vec::new();
         self.csi_buf = Vec::new();
+        self.in_string = false;
+        self.string_esc = false;
+        self.string_len = 0;
         self.utf8_tail.clear();
         self.pending_responses.clear();
         DemuxEvent::StreamFault {
@@ -436,6 +505,112 @@ fn percent_decode(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Collect just the renderable text out of a demux result.
+    fn screen_text(events: &[DemuxEvent]) -> String {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                DemuxEvent::Output { data } => Some(data.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_warp_bootstrap_frame_never_reaches_the_renderer() {
+        // Observed on a remote whose ~/.bashrc carries Warp's auto-warpify
+        // snippet. ESC P fell through the ESC catch-all, so the payload printed
+        // from `$f` onward, character for character.
+        let mut demuxer = StreamDemuxer::new();
+        let input = b"before\x1bP$f{\"hook\": \"SourcedRcFileForWarp\", \"value\": { \"shell\": \"bash\" }}\x1b\\after";
+        let text = screen_text(&demuxer.process_bytes(input));
+        assert!(
+            !text.contains("SourcedRcFileForWarp"),
+            "DCS payload reached the screen: {text:?}"
+        );
+        assert!(!text.contains("$f"), "DCS payload reached the screen: {text:?}");
+        assert_eq!(text, "beforeafter");
+    }
+
+    #[test]
+    fn an_eight_bit_string_terminator_ends_a_control_string() {
+        // Warp terminates with the single byte 0x9c, which is invalid UTF-8.
+        // take_output's from_utf8_lossy would replace it with U+FFFD before any
+        // consumer could resynchronise on it, so it must be recognised in the
+        // byte loop, ahead of the splice.
+        let mut demuxer = StreamDemuxer::new();
+        let text = screen_text(&demuxer.process_bytes(b"a\x1bP$fpayload\x9cb"));
+        assert_eq!(text, "ab");
+    }
+
+    #[test]
+    fn apc_pm_and_sos_are_swallowed_like_dcs() {
+        for intro in [&b"\x1b_"[..], &b"\x1b^"[..], &b"\x1bX"[..]] {
+            let mut demuxer = StreamDemuxer::new();
+            let mut input = b"x".to_vec();
+            input.extend_from_slice(intro);
+            input.extend_from_slice(b"secret");
+            input.extend_from_slice(b"\x1b\\y");
+            let text = screen_text(&demuxer.process_bytes(&input));
+            assert_eq!(text, "xy", "introducer {intro:?} leaked");
+        }
+    }
+
+    #[test]
+    fn an_eight_bit_introducer_is_not_recognised_because_utf8_owns_those_bytes() {
+        // 0x80..=0xbf is the UTF-8 continuation range, and the C1 introducers
+        // live inside it. U+1F389 is f0 9f 8e 89 — its second byte IS the APC
+        // introducer. Claiming these in a UTF-8 stream eats text.
+        let mut demuxer = StreamDemuxer::new();
+        let text = screen_text(&demuxer.process_bytes("a\u{1F389}b".as_bytes()));
+        assert_eq!(text, "a\u{1F389}b");
+    }
+
+    #[test]
+    fn the_eight_bit_terminator_is_honoured_inside_a_string() {
+        // Safe where the introducer is not: inside a control string the body is
+        // opaque bytes, not decoded text, and 0x9c is the ST Warp actually
+        // emits. Covered from the other direction by
+        // an_eight_bit_string_terminator_ends_a_control_string.
+        let mut demuxer = StreamDemuxer::new();
+        let text = screen_text(&demuxer.process_bytes(b"a\x1b_apc body\x9cb"));
+        assert_eq!(text, "ab");
+    }
+
+    #[test]
+    fn a_control_string_split_across_two_reads_still_terminates() {
+        // A PTY read ends on an arbitrary byte boundary (8192 bytes,
+        // session.rs), so a frame routinely straddles two of them.
+        let mut demuxer = StreamDemuxer::new();
+        let first = demuxer.process_bytes(b"a\x1bP$fpay");
+        let second = demuxer.process_bytes(b"load\x1b\\b");
+        let mut all = first;
+        all.extend(second);
+        assert_eq!(screen_text(&all), "ab");
+    }
+
+    #[test]
+    fn an_escape_inside_a_control_string_does_not_end_it() {
+        // Only ESC \ terminates. ESC anything-else is payload.
+        let mut demuxer = StreamDemuxer::new();
+        let text = screen_text(&demuxer.process_bytes(b"a\x1bP\x1bXstill inside\x1b\\b"));
+        assert_eq!(text, "ab");
+    }
+
+    #[test]
+    fn an_unterminated_control_string_faults_rather_than_growing_forever() {
+        let mut demuxer = StreamDemuxer::new();
+        let mut input = b"\x1bP".to_vec();
+        input.extend(std::iter::repeat(b'x').take(crate::stream::MAX_RECORD_BYTES + 16));
+        let events = demuxer.process_bytes(&input);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            DemuxEvent::StreamFault {
+                reason: crate::stream::StreamFault::ControlTooLong
+            }
+        )));
+    }
 
     #[test]
     fn paste_mode_tracks_enable_disable_reset_and_split_sequences() {
