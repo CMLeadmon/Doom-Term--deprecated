@@ -189,7 +189,13 @@ describe('ordered stream application with real xterm', () => {
     expect(terminal.getCursor()).toEqual(control.getCursor());
     expect(plain(terminal)[0]).toBe('warm history');
     expect(terminal.linesSince(mark)[0].spans.map(span => span.text).join('').trimEnd()).toBe('row 0 三🚀');
-  });
+  // 30s, not the 5s default. This drives 600 wide-character rows through a
+  // real headless xterm TWICE — once live, once as catch-up — and compares
+  // every rendered cell. It takes ~1s on Linux and comfortably over 5s on a
+  // Windows runner, so the default timeout failed it there for being slow
+  // rather than wrong. Raised here alone: a global bump would hide a real
+  // hang in the other 665 tests.
+  }, 30_000);
 
   it('restores semantic state in order while withholding catch-up activity effects', async () => {
     const activity: string[] = [];
