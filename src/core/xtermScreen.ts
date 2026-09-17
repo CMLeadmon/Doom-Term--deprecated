@@ -63,7 +63,7 @@ export class XtermScreen implements TerminalScreen {
    */
   constructor(cols: number, rows: number, private readonly scrollback: number = SCROLLBACK) {
     this.term = this.createTerminal(cols, rows);
-    this.armAnchor();
+    this.watchTrims();
   }
 
   private createTerminal(cols: number, rows: number): Terminal {
@@ -113,9 +113,6 @@ export class XtermScreen implements TerminalScreen {
       if (this.disposed || this.parserFailure || generation !== this.parserGeneration) return;
       this.pendingWrites--;
       this.applied = ticket;
-      // Trimming happens inside a write. Reading the counter only when the view
-      // renders would miss whole bursts on a session nobody is looking at.
-      this.syncTrimmed();
       for (const boundary of this.boundaries) {
         if (boundary.target > this.applied) continue;
         clearTimeout(boundary.timer);
@@ -274,59 +271,58 @@ export class XtermScreen implements TerminalScreen {
   /**
    * Lines trimmed off the top since this screen was created. Monotonic.
    *
-   * Neither `buffer.length` nor `buffer.baseY` can supply this: both saturate
-   * once scrollback is full, which is precisely when trimming begins. A marker
-   * can. Its `.line` is the marked line's CURRENT buffer index and falls as
-   * rows are deleted above it, so the difference between where the line was and
-   * where it is counts the deletions exactly.
+   * ── WHY NOT A MARKER ───────────────────────────────────────────────────
    *
-   * The anchor rides the cursor rather than the oldest row, because a marker on
-   * the oldest row is the very first thing trimming destroys. It is renewed
-   * while it is still well clear of the floor, so the count is never
-   * interrupted by a disposal we did not see coming.
+   * This was a marker on the cursor line, measuring how far that line had
+   * slid toward index 0. It was wrong, and wrong in a way no per-line test
+   * could reach. xterm fires `onTrim` once per trim; a marker fires
+   * `onDispose` once, when its own line goes. Every trim after that IN THE
+   * SAME WRITE had no listener at all, and the counter was re-armed afterward
+   * from the stale value.
+   *
+   * That is not a corner case. A PTY record is capped at 64KiB
+   * (`stream.rs MAX_RECORD_BYTES`) and `StreamApplication` hands a whole
+   * record to `writeAndWait` in ONE call, so at roughly eight bytes a line a
+   * single `seq 1 20000` — or the first catch-up record after reconnecting —
+   * delivers thousands. Measured on a 10-line buffer: 500 lines written, the
+   * last numbered 12 instead of 499.
+   *
+   * `onTrim` is the event the trimming itself fires, so it cannot miss one.
+   * It is private API, which is why every access is guarded: if the shape ever
+   * changes, `trimmed` stays 0 and line numbers degrade to the buffer index
+   * they were before any of this — visibly imperfect, never silently wrong.
+   *
+   * Only the NORMAL buffer is watched. The alternate screen has no scrollback
+   * and trims nothing; verified against @xterm/headless 6.0.0.
    */
   private trimmed = 0;
-  private anchorMarker: IMarker | null = null;
-  /** The absolute line number `anchorMarker` was registered on. */
-  private anchorAbsolute = 0;
+  private trimWatch: { dispose(): void } | null = null;
 
-  /**
-   * Put a marker on the current line and remember its absolute number.
-   *
-   * The anchor rides the CURSOR, never the oldest row: a marker on the oldest
-   * row is the first thing trimming destroys, so it would be renewed constantly
-   * and measure nothing.
-   */
-  private armAnchor(): void {
-    const marker = this.term.registerMarker(0) ?? null;
-    this.anchorMarker = marker;
-    if (!marker) return;
-    const absolute = this.trimmed + marker.line;
-    this.anchorAbsolute = absolute;
-    marker.onDispose(() => {
-      if (this.anchorMarker !== marker) return;
-      // The marked line has left the buffer, so every line up to and including
-      // it has. The count is exact at this instant and unrecoverable after it,
-      // which is the whole reason it is taken here.
-      if (absolute + 1 > this.trimmed) this.trimmed = absolute + 1;
-      this.anchorMarker = null;
-    });
-  }
-
-  private syncTrimmed(): void {
-    const marker = this.anchorMarker;
-    if (marker && !marker.isDisposed && marker.line >= 0) {
-      const measured = this.anchorAbsolute - marker.line;
-      // Monotonic. A resize reflows rows and can move a marker, and the number
-      // of lines that have left the buffer cannot go down.
-      if (measured > this.trimmed) this.trimmed = measured;
-      return;
+  private watchTrims(): void {
+    this.trimWatch?.dispose();
+    this.trimWatch = null;
+    try {
+      const core = (this.term as unknown as {
+        _core?: {
+          _bufferService?: {
+            buffers?: { normal?: { lines?: { onTrim?: (cb: (n: number) => void) => { dispose(): void } } } };
+          };
+        };
+      })._core;
+      const lines = core?._bufferService?.buffers?.normal?.lines;
+      if (typeof lines?.onTrim === 'function') {
+        this.trimWatch = lines.onTrim((count: number) => {
+          this.trimmed += count;
+        });
+      } else {
+        console.warn('[terminal] no trim event; line numbers fall back to buffer indices');
+      }
+    } catch (err) {
+      console.warn('[terminal] could not observe scrollback trimming', err);
     }
-    this.armAnchor();
   }
 
   trimmedCount(): number {
-    this.syncTrimmed();
     return this.trimmed;
   }
 
@@ -408,12 +404,12 @@ export class XtermScreen implements TerminalScreen {
     this.marks.clear();
     this.renderedLines = [];
     this.trimmed = 0;
-    this.anchorMarker = null;
-    this.anchorAbsolute = 0;
-    this.armAnchor();
+    this.watchTrims();
   }
 
   dispose(): void {
+    this.trimWatch?.dispose();
+    this.trimWatch = null;
     this.inputRevision++;
     this.disposed = true;
     this.rejectBoundaries(new Error('Terminal screen is disposed'));

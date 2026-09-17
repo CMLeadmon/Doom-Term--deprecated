@@ -71,6 +71,11 @@ export function resetSessionAnchors(): void {
   sessionAnchors.clear();
 }
 
+/** Drop one session's remembered anchor when its session is gone for good. */
+export function forgetSessionAnchor(sessionId: string): void {
+  sessionAnchors.delete(sessionId);
+}
+
 /**
  * How long a scroll gesture counts as the reader's intent.
  *
@@ -371,6 +376,27 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
     rowHeight,
   });
 
+  /**
+   * A pane can swap which session it shows WITHOUT remounting.
+   *
+   * Split layouts replace the leaf that is losing focus rather than adding one
+   * (`paneTree.ts`), and `SplitPaneGrid` keys that leaf by `tree.id` — the pane
+   * slot — not by `node.id`. React therefore reuses this instance with a new
+   * `sessionId`, and a ref initialised at mount would go on describing the
+   * session that left: `L500` plausibly exists in both buffers, so the reader
+   * would land somewhere real-looking and wrong.
+   */
+  const shownSession = useRef(sessionId);
+  if (shownSession.current !== sessionId) {
+    shownSession.current = sessionId;
+    anchorRef.current = (sessionId && sessionAnchors.get(sessionId)) || TAIL;
+    scrollTarget.current = null;
+  }
+  useEffect(() => {
+    setFirstVisible(0);
+    setRowHeight(0);
+  }, [sessionId]);
+
   /** Is a scroll gesture still in flight? See SCROLL_INTENT_MS. */
   const gesturing = () => performance.now() - scrollIntentAtRef.current < SCROLL_INTENT_MS;
   const noteGesture = () => { scrollIntentAtRef.current = performance.now(); };
@@ -492,25 +518,58 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
     }
     scrollIntentAtRef.current = Number.NEGATIVE_INFINITY;
     const top = topRow(el);
-    const line = top ? lines[top.index] : undefined;
-    if (!top || !line) return;
+    if (!top) {
+      // The reader jumped outside the rendered window — a scrollbar drag or a
+      // click on the track. There is no row here to anchor to, and returning
+      // would leave them looking at a spacer div: a blank pane that nothing
+      // recovers until more output arrives. Estimate the row and let the next
+      // frame anchor properly.
+      if (rowHeight > 0) setFirstVisible(Math.min(lines.length - 1, Math.floor(el.scrollTop / rowHeight)));
+      return;
+    }
+    const line = lines[top.index];
+    if (!line) return;
     setFirstVisible(top.index);
     setAnchor(anchorAt(line.id, top.offsetPx));
     detach(sessionId, top.index);
   };
 
   /** One frame of eased scrolling toward whatever the wheel asked for. */
-  const stepScroll = React.useCallback(() => {
+  const lastFrameAt = useRef(0);
+  /**
+   * Stable identity, latest body. rAF holds the callback across frames while the
+   * body must see the current `lines`; a useCallback with real dependencies
+   * would hand a new function to a loop already scheduled with the old one.
+   */
+  const stepImpl = useRef<() => void>(() => {});
+  stepImpl.current = () => {
     const el = scrollRef.current;
     const target = scrollTarget.current;
     if (!el || target === null) { scrollFrame.current = 0; return; }
     const reduced = typeof window !== 'undefined'
       && !!window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
-    const next = easeScroll(el.scrollTop, target, 16, reduced);
+    // Measured, not assumed: easeScroll is frame-rate independent by design,
+    // and a hardcoded 16 makes a dropped frame a slower scroll rather than a
+    // longer step — the exact thing its contract promises not to do.
+    const now = performance.now();
+    const dt = lastFrameAt.current ? Math.min(64, now - lastFrameAt.current) : 16;
+    lastFrameAt.current = now;
+    const next = easeScroll(el.scrollTop, target, dt, reduced);
     el.scrollTop = next;
-    if (next === target) { scrollTarget.current = null; scrollFrame.current = 0; return; }
+    // Move the anchor WITH the animation.
+    //
+    // Otherwise the anchor stays where the gesture began until the browser
+    // delivers a scroll event, and any output arriving in that gap makes the
+    // layout effect re-pin to the old position while this loop eases away from
+    // it — a rubber-band exactly when the reader is scrolling back through a
+    // live stream. Kept level, the layout effect's write is a no-op.
+    const at = topRow(el);
+    const line = at ? lines[at.index] : undefined;
+    if (at && line) setAnchor(anchorAt(line.id, at.offsetPx));
+    if (next === target) { scrollTarget.current = null; scrollFrame.current = 0; lastFrameAt.current = 0; return; }
     scrollFrame.current = requestAnimationFrame(stepScroll);
-  }, []);
+  };
+  const stepScroll = React.useCallback(() => stepImpl.current(), []);
 
   useEffect(() => () => {
     if (scrollFrame.current) cancelAnimationFrame(scrollFrame.current);
@@ -618,7 +677,13 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
     const target = stepTurn(marks, current, viewAction === 'previousTurn' ? -1 : 1);
     if (target !== null && scrollRef.current) {
       const line = lines[target];
-      if (line) setAnchor(anchorAt(line.id, 0));
+      // A quarter down, expressed as the ANCHOR's offset rather than a scrollTop
+      // write. setFirstVisible is async, so for a mark outside the window the
+      // querySelector below finds nothing and the placement silently never
+      // applied — a jump landed flush at the top or a quarter down depending
+      // only on how far it was.
+      const quarter = (scrollRef.current?.clientHeight ?? 0) / 4;
+      if (line) setAnchor(anchorAt(line.id, -quarter));
       setFirstVisible(target);
       detach(sessionId, target);
       const row = scrollRef.current.querySelector<HTMLElement>(`[data-terminal-line="${target}"]`);
@@ -643,10 +708,20 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
     const st = stateOf(sessionId);
     if (!st.hits) return;
     const el = scrollRef.current;
+    const hit = lines[st.line];
+    if (!hit) return;
     const row = el.querySelector<HTMLElement>(`[data-terminal-line="${st.line}"]`);
+    if (!row) {
+      // Only the viewport plus overscan is rendered, so a hit further away has
+      // no element to scroll to. Without this the search silently did nothing:
+      // "a hit you cannot see was found for nobody" described the bug rather
+      // than preventing it.
+      setAnchor(anchorAt(hit.id, -(el.clientHeight / 2)));
+      setFirstVisible(st.line);
+      return;
+    }
     if (row) {
-      const hit = lines[st.line];
-      if (hit) setAnchor(anchorAt(hit.id, 0));
+      setAnchor(anchorAt(hit.id, 0));
       el.scrollTop = Math.max(0, row.offsetTop - el.clientHeight / 2);
     }
   });

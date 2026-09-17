@@ -133,6 +133,62 @@ describe('RawTerminalView', () => {
     expect(screen.queryByTestId('terminal-cursor')).toBeNull();
   });
 
+  it('forgets the previous session when a pane swaps to a different one', () => {
+    // Split layouts REPLACE the leaf that is losing focus (paneTree.ts:208),
+    // and SplitPaneGrid keys that leaf by tree.id, not node.id — so React
+    // reuses this component instance with a new sessionId rather than
+    // remounting it. A ref initialised at mount would then apply session A's
+    // anchor to session B's content, and L500 plausibly exists in both.
+    resetScrollback('swap-a');
+    resetScrollback('swap-b');
+    resetSessionAnchors();
+    withRowGeometry(() => {
+      const view = render(<RawTerminalView {...base} sessionId="swap-a" isActive lines={win(0, 20)} />);
+      const scroller = screen.getByTestId('raw-terminal').firstElementChild as HTMLDivElement;
+      Object.defineProperties(scroller, {
+        scrollHeight: { configurable: true, value: 340 },
+        clientHeight: { configurable: true, value: 100 },
+      });
+      fireEvent.wheel(scroller, { deltaY: -100 });
+      scroller.scrollTop = 85;
+      fireEvent.scroll(scroller);
+      expect(stateOf('swap-a').detached).toBe(true);
+
+      // The same mounted instance is handed a different session.
+      view.rerender(<RawTerminalView {...base} sessionId="swap-b" isActive lines={win(0, 20)} />);
+      expect(scroller.scrollTop).toBe(340);   // B's tail, not A's anchor
+    });
+    resetScrollback('swap-a');
+    resetScrollback('swap-b');
+    resetSessionAnchors();
+  });
+
+  it('brings a search hit into the window when it is outside the rendered rows', () => {
+    // Only the viewport plus overscan is in the DOM, so a hit further away than
+    // that has no element to scroll to. The effect's own comment — "a hit you
+    // cannot see was found for nobody" — predates windowing and described
+    // exactly the bug windowing introduced.
+    resetScrollback('find');
+    resetSessionAnchors();
+    withRowGeometry(() => {
+      const lines = win(0, 2000);
+      render(<RawTerminalView {...base} sessionId="find" isActive lines={lines}
+        viewActionRequest={{ id: 1, sessionId: 'find', action: 'searchScrollback' }} />);
+      const scroller = screen.getByTestId('raw-terminal').firstElementChild as HTMLDivElement;
+      Object.defineProperties(scroller, {
+        scrollHeight: { configurable: true, value: 2000 * 17 },
+        clientHeight: { configurable: true, value: 100 },
+      });
+      // Search for text that only exists far from the tail.
+      for (const ch of '150') fireEvent.keyDown(screen.getByTestId('raw-terminal'), { key: ch });
+      const rendered = scroller.querySelectorAll('[data-terminal-line]');
+      const indices = [...rendered].map((r) => Number((r as HTMLElement).dataset.terminalLine));
+      expect(indices).toContain(150);
+    });
+    resetScrollback('find');
+    resetSessionAnchors();
+  });
+
   it('restores a detached reader to the same LINE on remount', () => {
     // The pixel map this replaces could not survive the buffer trimming
     // underneath it; a line number can.

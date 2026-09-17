@@ -429,6 +429,31 @@ describe('synchronized output', () => {
 });
 
 describe('trim counting', () => {
+  it('counts correctly when one write trims past the anchor and keeps going', async () => {
+    // The failure the per-line tests structurally cannot reach. A PTY record is
+    // capped at 64KiB (stream.rs MAX_RECORD_BYTES) and StreamApplication hands
+    // a whole record to writeAndWait in ONE call, so at ~8 bytes a line a single
+    // write delivers thousands. xterm's onTrim fires per trim, our marker's
+    // onDispose fires once, and every trim after that in the same write had no
+    // listener at all.
+    const SCROLLBACK = 10;
+    const ROWS = 3;
+    const WRITTEN = 500;
+    const screen = new XtermScreen(10, ROWS, SCROLLBACK);
+    try {
+      await parsed(screen, Array.from({ length: WRITTEN }, (_, i) => `L${i}`).join('\r\n') + '\r\n');
+      const lines = screen.getLines();
+      // Whatever is on screen now, the LAST line written must be numbered
+      // WRITTEN-1: that is the definition of an absolute line number, and it is
+      // checkable without knowing xterm's exact trim arithmetic.
+      const last = lines[lines.length - 1];
+      const lastInked = [...lines].reverse().find((l) => l.spans.some((sp) => sp.text.trim() !== ''));
+      expect(lastInked?.spans.map((sp) => sp.text).join('').trim()).toBe(`L${WRITTEN - 1}`);
+      expect(lastInked?.row).toBe(WRITTEN - 1);
+      expect(last).toBeDefined();
+    } finally { screen.dispose(); }
+  });
+
   it('counts lines trimmed off the top, monotonically', async () => {
     // Five lines of scrollback so trimming starts almost immediately; the
     // production value is 5000 and would need that many writes to reach.
@@ -469,6 +494,21 @@ describe('trim counting', () => {
       // were in different spaces the caret would land on the wrong line.
       const onALine = lines.some((l) => l.row === cursor.row);
       expect(onALine).toBe(true);
+    } finally { screen.dispose(); }
+  });
+
+  it('resubscribes after a reconstruction, so counting resumes', async () => {
+    // reset() builds a NEW Terminal, so the subscription taken at construction
+    // belongs to a buffer that no longer exists. Without re-arming, every line
+    // after a reconnection would be numbered from a frozen zero.
+    const screen = new XtermScreen(10, 3, 5);
+    try {
+      for (let i = 0; i < 40; i++) await parsed(screen, `a${i}\r\n`);
+      expect(screen.trimmedCount()).toBeGreaterThan(0);
+      screen.reset();
+      expect(screen.trimmedCount()).toBe(0);
+      for (let i = 0; i < 40; i++) await parsed(screen, `b${i}\r\n`);
+      expect(screen.trimmedCount()).toBeGreaterThan(0);
     } finally { screen.dispose(); }
   });
 
