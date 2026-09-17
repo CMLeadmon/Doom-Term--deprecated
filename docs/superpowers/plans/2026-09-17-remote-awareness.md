@@ -51,7 +51,7 @@ rather than believing CI proved it everywhere.
 
 | File | Responsibility |
 | :--- | :--- |
-| `crates/doom-term-pty/src/demuxer.rs` | Gains a string-sequence state (DCS/APC/PM/SOS), 8-bit C1 recognition, and the enrichment frame event. Stops fabricating a cursor position. |
+| `crates/doom-term-pty/src/demuxer.rs` | Gains a string-sequence state (DCS/APC/PM/SOS) and the enrichment frame event. Stops fabricating a cursor position. |
 | `crates/doom-term-pty/src/remote.rs` **(new)** | Parses one enrichment frame. Pure: bytes in, a validated struct or nothing out. |
 | `crates/doom-term-pty/src/shell_integration.rs` | Gains the remote snippet and the `doom-ssh` launch form. |
 | `backend/src/metadata.rs` | Learns that a session may be remote, and that local values do not substitute. |
@@ -230,19 +230,18 @@ In the byte loop, ahead of the `in_osc` branch:
                 }
 ```
 
-And in ground state, before `output_chunk.push(b)` at `:307`, recognise the
-8-bit introducers — these must be caught here because `take_output`'s
-`from_utf8_lossy` would otherwise destroy them:
+**Do NOT recognise the 8-bit introducers in ground state.** This plan
+originally said to, and that was wrong: `0x80..=0xbf` is the UTF-8
+*continuation* range and the C1 introducers live inside it, so `0x9f` is both
+the APC introducer and the second byte of U+1F389 (`f0 9f 8e 89`). Claiming
+them ate every four-byte emoji, and the existing
+`a_four_byte_emoji_survives_a_split_at_every_interior_offset` failed on the
+first run. xterm declines them in UTF-8 mode for the same reason.
 
-```rust
-            if matches!(b, 0x90 | 0x98 | 0x9e | 0x9f) {
-                self.in_string = true;
-                self.string_esc = false;
-                self.string_len = 0;
-                i += 1;
-                continue;
-            }
-```
+Only the 7-bit `ESC P` / `ESC X` / `ESC ^` / `ESC _` forms introduce a string.
+The 8-bit ST **is** honoured, but only inside an already-open string, where the
+body is opaque bytes rather than decoded text — that is the terminator Warp
+emits, and the `in_string` branch above already handles it.
 
 `control_fault` (`:325`) must clear the new state alongside `osc_buf`/`csi_buf`:
 `self.in_string = false; self.string_esc = false; self.string_len = 0;`
@@ -267,8 +266,8 @@ Warp's bootstrap therefore rendered
 
   \$f{\"hook\": \"SourcedRcFileForWarp\", ...}
 
-on connect. Eight-bit introducers and the 0x9c terminator are recognised in
-the byte loop, ahead of the UTF-8 splice that would otherwise replace them."
+on connect. The 0x9c terminator is honoured inside an open string; the 8-bit
+introducers are declined, because in UTF-8 they are continuation bytes."
 ```
 
 ---
