@@ -361,9 +361,25 @@ impl StreamDemuxer {
         if let Some(rest) = trimmed.strip_prefix("7;") {
             if let Some(after_scheme) = rest.trim().strip_prefix("file://") {
                 if let Some(slash) = after_scheme.find('/') {
-                    return Some(DemuxEvent::Cwd {
-                        path: percent_decode(&after_scheme[slash..]),
-                    });
+                    let path = percent_decode(&after_scheme[slash..]);
+                    #[cfg(windows)]
+                    let path = {
+                        let bytes = path.as_bytes();
+                        if bytes.len() >= 4
+                            && bytes[1].is_ascii_alphabetic()
+                            && bytes[2] == b':'
+                            && bytes[3] == b'/'
+                        {
+                            path[1..].replace('/', "\\")
+                        } else if !after_scheme[..slash].is_empty()
+                            && !after_scheme[..slash].eq_ignore_ascii_case("localhost")
+                        {
+                            format!("\\\\{}{}", &after_scheme[..slash], path.replace('/', "\\"))
+                        } else {
+                            path
+                        }
+                    };
+                    return Some(DemuxEvent::Cwd { path });
                 }
             }
             return None;
@@ -577,10 +593,32 @@ mod tests {
     #[test]
     fn osc_7_reports_the_working_directory() {
         let mut demuxer = StreamDemuxer::new();
-        let events = demuxer.process_bytes(b"\x1b]7;file://host/home/me/src\x07");
+        let events = demuxer.process_bytes(b"\x1b]7;file://localhost/home/me/src\x07");
         assert!(events
             .iter()
             .any(|e| matches!(e, DemuxEvent::Cwd { path } if path == "/home/me/src")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn osc_7_decodes_native_windows_paths() {
+        for (uri, expected) in [
+            ("file:///C:/Users/me/Doom%20Term", r"C:\Users\me\Doom Term"),
+            (
+                "file://server/share/Doom%20Term",
+                r"\\server\share\Doom Term",
+            ),
+            ("file:///C:/literal%2520", r"C:\literal%20"),
+        ] {
+            let mut demuxer = StreamDemuxer::new();
+            let events = demuxer.process_bytes(format!("\x1b]7;{uri}\x07").as_bytes());
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, DemuxEvent::Cwd { path } if path == expected)),
+                "{events:?}"
+            );
+        }
     }
 
     #[test]

@@ -150,16 +150,7 @@ pub fn powershell_integration_script() -> String {
 
 if ($env:DOOM_TERM_NO_SHELL_INTEGRATION) { return }
 
-# The user's own profile first. Ours is additive, never a replacement.
-foreach ($candidate in @(
-    $PROFILE.AllUsersAllHosts,
-    $PROFILE.CurrentUserAllHosts,
-    $PROFILE.CurrentUserCurrentHost
-)) {
-    if ($candidate -and (Test-Path -LiteralPath $candidate)) {
-        try { . $candidate } catch { }
-    }
-}
+# PowerShell loads the user's profiles before -File. Do not source them twice.
 
 $global:__DoomTermEsc = [char]27
 $global:__DoomTermBel = [char]7
@@ -187,8 +178,8 @@ function global:prompt {
     try {
         $cwd = (Get-Location).ProviderPath
         if ($cwd) {
-            $machine = if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { "localhost" }
-            $out += "$esc]7;file://$machine/$($cwd -replace '\\', '/')$bel"
+            $uri = [System.Uri]::new($cwd).AbsoluteUri
+            $out += "$esc]7;$uri$bel"
         }
     } catch { }
 
@@ -509,15 +500,19 @@ mod tests {
         // is the only thing that tells the daemon where the pane is, and
         // hint::transcript_for is keyed on that directory.
         let script = powershell_integration_script();
-        assert!(script.contains("]7;file://"), "OSC 7");
+        assert!(script.contains("]7;$uri"), "OSC 7");
+        assert!(script.contains("[System.Uri]::new($cwd).AbsoluteUri"));
     }
 
     #[test]
     fn powershell_integration_keeps_the_users_own_profile_and_prompt() {
         let script = powershell_integration_script();
+        assert!(!shell_launch("powershell.exe")
+            .args
+            .contains(&"-NoProfile".to_string()));
         assert!(
-            script.contains("$PROFILE"),
-            "must source the user's profile"
+            !script.contains(". $candidate"),
+            "PowerShell already loads all four profiles"
         );
         assert!(
             script.contains("__DoomTermInnerPrompt"),
