@@ -439,7 +439,15 @@ async function main() {
   await command(page, "printf 'SHELL_OK\\n'", 'SHELL_OK');
   await command(page, "printf '\\344\\270\\255\\346\\226\\207 \\360\\237\\232\\200\\n'", '中文 🚀');
   console.log('[UI Test] PASS: startup, real shell I/O, Unicode');
-  const terminal = page.getByTestId('raw-terminal');
+  // The pane the user is actually looking at.
+  //
+  // Unscoped, this matches every mounted pane — panes stay mounted through
+  // splits and session switches — and `.evaluate()` then acts on whichever
+  // happens to be first in the document, which may be a hidden background one.
+  // Harmless while assertions only read text that any pane might contain;
+  // wrong once the helpers below scroll a window and report what is rendered.
+  // Same scoping the `command` and `palette` helpers already use.
+  const terminal = page.getByTestId('raw-terminal').filter({ visible: true }).last();
 
   // Warm transport loss retains the same parser and root while output crosses
   // the boundary. Compare the exact rendered row spans with an uninterrupted
