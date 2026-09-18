@@ -308,9 +308,10 @@ pane A is `failed`." Causes, not pixels.
 
 ### A2. Correlation ids end to end
 
-`request_id` already exists on every request. Carry it into the daemon's
-`tracing` spans and back out on every refusal, so a refusal visible in the UI
-maps to a daemon log line without guesswork.
+`request_id` already exists on every request. Carry it into the daemon's log
+output — the backend uses the `log` crate, not `tracing` spans — and back out on
+every refusal, so a refusal visible in the UI maps to a daemon log line without
+guesswork.
 
 ### A3. A transient diagnostics overlay
 
