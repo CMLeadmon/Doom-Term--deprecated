@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { audioEngine } from '../core/audioEngine';
+import { daemonPort } from '../core/daemonPort';
 import type { SessionNode } from '../types/sessionTree';
 
 export interface ArtifactPaneProps {
@@ -32,7 +33,12 @@ export const ArtifactPane: React.FC<ArtifactPaneProps> = ({
   };
 
   const handleOpenInBrowser = () => {
-    const port = window.location.port === '1420' ? '1421' : window.location.port || '1421';
+    // In the desktop shell there is no meaningful window.location.port, and on
+    // the dev server 1420 is the UI, not the daemon: both resolve to the port
+    // the shell injected.
+    const port = window.location.port && window.location.port !== '1420'
+      ? window.location.port
+      : String(daemonPort());
     const url = `http://${window.location.hostname || '127.0.0.1'}:${port}/artifact/${artifactId}`;
     window.open(url, '_blank');
     audioEngine.playSound('click', 3);

@@ -9,6 +9,7 @@ import type { AppliedContext } from './streamApplication';
 import type { StreamRecord } from './streamProtocol';
 import { parseGrid } from './terminalGeometry';
 import { diagnostics } from './diagnostics';
+import { daemonPort } from './daemonPort';
 
 export interface DirectoryEntry { name: string; path: string; is_dir: boolean; is_git_repo: boolean }
 export interface DirectoryListing { request_id: string; current_path: string; parent_path?: string; entries: DirectoryEntry[]; truncated?: boolean }
@@ -96,7 +97,7 @@ export class PtyClient {
       socket: options.socket ?? (() => {
         const host = this.isTauri ? '127.0.0.1' : window.location.hostname || '127.0.0.1';
         // Callbacks installed below consume only message.data or no event fields.
-        return new WebSocket('ws://' + host + ':1421') as unknown as DaemonSocket;
+        return new WebSocket('ws://' + host + ':' + daemonPort()) as unknown as DaemonSocket;
       }),
       onMessage: (event, data) => this.handleServerMessage(event, data),
       onState: state => {

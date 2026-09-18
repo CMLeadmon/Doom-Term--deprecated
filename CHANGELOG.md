@@ -13,6 +13,30 @@ where it is not.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A stranger on the daemon port no longer silently becomes the daemon.** The
+  desktop shell decided whether a daemon was already running by opening a TCP
+  connection to 1421 and seeing whether anything accepted. Any unrelated process
+  holding that port — a stale dev server, a leftover debug proxy — was adopted
+  as the daemon: the shell spawned nothing, the webview dialled the stranger,
+  and every terminal failed to open with no error in any log. The shell now asks
+  over `GET /health` and requires the daemon to name itself before attaching. A
+  port that answers with anything else is left alone and the daemon is started
+  on a free port instead, which the webview is told about in an initialization
+  script rather than assuming 1421.
+- **A second launch no longer kills the first window's terminals.** Two
+  instances were never two independent apps: the second attached to the first's
+  daemon, and closing the first took that daemon down with it, leaving a window
+  whose terminals were all dead and nothing to say why. A second launch now
+  focuses the existing window and exits.
+
+### Added
+
+- **`GET /health` on the daemon.** Answers `{service, version, port}`. It is the
+  identity handshake above, and is the supported way to ask whether a Doom Term
+  daemon is on a port.
+
 ## [0.4.0] — 2026-09-17
 
 Failure containment, forward-compatible stream validation, and excision of fragile legacy screen recovery.

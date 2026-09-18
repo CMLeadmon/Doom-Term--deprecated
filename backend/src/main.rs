@@ -181,6 +181,10 @@ pub enum ServerMessage {
 type SessionsMap = Arc<RwLock<HashMap<String, Arc<PtySession>>>>;
 type UsageHandle = Arc<usage::service::UsageService>;
 
+/// What `GET /health` answers with, and what the desktop shell requires before
+/// it will treat a listening port as this daemon.
+pub const DAEMON_SERVICE_ID: &str = "doom-term-daemon";
+
 /// Where the daemon listens.
 ///
 /// This protocol is local-only; it does not provide TLS for remote access.
@@ -731,6 +735,7 @@ async fn serve_hook(
 async fn serve_artifact_post(
     mut stream: TcpStream,
     artifacts: &Arc<crate::artifacts::ArtifactHub>,
+    port: u16,
 ) {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
@@ -786,7 +791,7 @@ async fn serve_artifact_post(
                         "title": record.title,
                         "type": record.artifact_type,
                         "version": record.version,
-                        "url": format!("http://127.0.0.1:1421/artifact/{}", record.id)
+                        "url": format!("http://127.0.0.1:{}/artifact/{}", port, record.id)
                     });
                     let resp_bytes = serde_json::to_vec(&resp_body).unwrap();
                     let header = format!(
@@ -1063,7 +1068,7 @@ async fn handle_connection_authenticated(
     let is_ws = header_value(&head, "upgrade").is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
 
     if peek_str.starts_with("post /artifact") {
-        serve_artifact_post(stream, &server.artifacts).await;
+        serve_artifact_post(stream, &server.artifacts, port).await;
         return;
     }
 
@@ -1101,6 +1106,35 @@ async fn handle_connection_authenticated(
         return;
     }
 
+    // Identity handshake. The desktop shell attaches to a daemon that is
+    // already listening rather than spawning a second one, and before this it
+    // decided that on nothing more than "something accepted a TCP connection".
+    // Any unrelated process holding the port — a stale dev server, a debug
+    // proxy — was silently adopted as the daemon, and every terminal failed
+    // with no error anywhere. A port is not an identity: this is.
+    if peek_str.starts_with("get /health") {
+        // The head was peeked, not consumed. Closing with the request still
+        // unread makes the kernel send RST and discard whatever we queued, so
+        // the caller gets headers and no body — which reads as "not a Doom
+        // Term daemon" and moves the daemon off its own port. Drain first.
+        let mut drain = [0u8; 4096];
+        let _ = stream.read(&mut drain).await;
+        let body = serde_json::json!({
+            "service": DAEMON_SERVICE_ID,
+            "version": env!("CARGO_PKG_VERSION"),
+            "port": port,
+        });
+        let bytes = serde_json::to_vec(&body).unwrap_or_else(|_| b"{}".to_vec());
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            bytes.len()
+        );
+        let _ = stream.write_all(header.as_bytes()).await;
+        let _ = stream.write_all(&bytes).await;
+        let _ = stream.flush().await;
+        return;
+    }
+
     if peek_str.starts_with("post /hook") {
         // "POST /hook/claude HTTP/1.1" -> Some("claude")
         let agent = peek_str
@@ -1133,13 +1167,14 @@ async fn handle_connection_authenticated(
 <body>
   <div class="card">
     <h1>⚡ DOOM TERM</h1>
-    <p>PTY WebSocket Server is running on port <strong>1421</strong>.</p>
+    <p>PTY WebSocket Server is running on port <strong>__DOOM_PORT__</strong>.</p>
     <p>The interactive Web Terminal UI is hosted on port <strong>1420</strong>.</p>
     <a class="btn" href="http://localhost:1420">👉 CLICK TO OPEN DOOM TERM UI (Port 1420)</a>
   </div>
 </body>
 </html>"#;
 
+        let html_body = html_body.replace("__DOOM_PORT__", &port.to_string());
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             html_body.len(),

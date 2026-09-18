@@ -8,15 +8,48 @@ use tauri::{Manager, RunEvent};
 pub fn run() {
     env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
 
+    // Where the daemon will be, decided before the app is built because the
+    // webview has to be told in a script that runs before its own. The daemon
+    // itself is started in setup(), which is where the app handle exists.
+    let plan = daemon::plan();
+    let port = plan.port();
+
     let app = tauri::Builder::default()
+        // Must be registered first: it decides whether this process is the app
+        // or a second launch that should hand off and exit.
+        //
+        // Two windows were never two independent apps. The second one attaches
+        // to the first's daemon, and then the first is closed — taking the
+        // daemon with it, because it owns the child — and the survivor is a
+        // window whose terminals are all dead with nothing to say why. Focus
+        // the window that already exists instead.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
+        // The frontend can no longer hardcode the daemon port: a stranger on
+        // the default moves the daemon elsewhere. An initialization script is
+        // the only channel guaranteed to land before the page's own scripts,
+        // and a plugin is how a config-declared window gets one — building the
+        // window in code to attach a script instead makes decorum position the
+        // macOS traffic lights against a window that has none yet, which is a
+        // null dereference and an abort, not a degraded titlebar.
+        .plugin(
+            tauri::plugin::Builder::<tauri::Wry, ()>::new("doom-term-daemon-port")
+                .js_init_script(format!("globalThis.__DOOM_TERM_DAEMON_PORT__ = {port};"))
+                .build(),
+        )
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_decorum::init())
-        .setup(|app| {
+        .setup(move |app| {
             // The daemon is bundled, not something the user starts. A failure
             // here is not fatal: the UI reconnects on a timer, so the window
             // still opens and reports the problem rather than refusing to run.
-            if let Err(e) = daemon::start(app.handle()) {
+            if let Err(e) = daemon::start(app.handle(), plan) {
                 log::error!("could not start the bundled PTY daemon: {}", e);
             }
 
