@@ -560,8 +560,52 @@ diagnosticsSnapshot() {
   };
 }
 
-// Transport Renamed (No recovery naming trap):
-DaemonConnection (src/core/daemonConnection.ts) & Gateway (backend/src/gateway.rs)
+// Transport Renamed: DaemonConnection & Gateway
+    </div>
+  </div>
+
+  <!-- SECTION 6: FRESH DEV SERVER VERIFICATION -->
+  <div class="section">
+    <div class="section-title">
+      <span>6. Live Fresh Dev Server Verification (Localhost 1420 & 1421)</span>
+      <span class="badge badge-pass">Clean Slate Verified</span>
+    </div>
+    <div class="issue-desc">
+      <strong>Zero-State Verification:</strong> All previous test runners, legacy tmux sockets, and background processes were completely killed and spun down. A clean backend daemon (<code>./target/release/doom-term-server</code> on port 1421) and fresh Vite development server (<code>http://127.0.0.1:1420</code>) were spun up from scratch.
+    </div>
+
+    <div class="side-by-side">
+      <div class="photo-container">
+        <div class="photo-label">
+          <span class="live">FRESH DEV SERVER LANDING</span>
+          <span>fresh-dev-landing.png</span>
+        </div>
+        <img class="img-preview" src="evidence/fresh-dev-landing.png" alt="Fresh Dev Server Landing">
+        <div class="resolution-expl">
+          <strong>Landing Page Initialization:</strong> Pristine initial state with zero lingering bindings or starved queues (<code>WAITING 0</code>). Context and Usage correctly render as <code>--</code> (never coerced to 0% or idle). Hardware canvas status plate scales at integer ratio with 1px hard bevels.
+        </div>
+      </div>
+      <div class="photo-container">
+        <div class="photo-label">
+          <span class="pass">LIVE TERMINAL PROMPT</span>
+          <span>fresh-dev-terminal.png</span>
+        </div>
+        <img class="img-preview" src="evidence/fresh-dev-terminal.png" alt="Fresh Dev Live Terminal">
+        <div class="resolution-expl">
+          <strong>Interactive PTY Connection:</strong> WebSocket upgrade and protocol negotiation completed with status <code>ready</code> and daemon epoch registered. Shell attached directly to Linux user session with active prompt and full MOTD.
+        </div>
+      </div>
+    </div>
+
+    <div class="photo-container" style="margin-top: 16px;">
+      <div class="photo-label">
+        <span class="pass">BIDIRECTIONAL COMMAND EXECUTION</span>
+        <span>fresh-dev-executed.png</span>
+      </div>
+      <img class="img-preview" src="evidence/fresh-dev-executed.png" alt="Fresh Dev Command Execution">
+      <div class="resolution-expl">
+        <strong>Real-Time Input/Output Proof:</strong> Typed and executed <code>uname -a && echo 'STATUS: CLEAN REATTACH & READY'</code>. Keystrokes echoed and executed with zero input refusal, zero drops, and immediate status plate telemetry increment (<code>CMD 2</code>, <code>BUF 24</code>, <code>SES 1</code>, <code>BAD 0</code>).
+      </div>
     </div>
   </div>
 
