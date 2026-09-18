@@ -13,6 +13,12 @@ where it is not.
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-09-18
+
+Ownership that could not be established stopped meaning ownership lost: a
+frozen terminal, a tab that could not be closed, and scrollback that never
+came back.
+
 ### Fixed
 
 - **A slow tmux is no longer mistaken for a stolen pane.** Every tmux operation
@@ -363,7 +369,8 @@ Published for Linux (AppImage, deb, rpm), macOS (Apple Silicon and Intel) and
 Windows (MSI and NSIS) — the Windows build being a terminal only, which is what
 0.2.0 addresses.
 
-[Unreleased]: https://github.com/CMLeadmon/Doom-Term/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/CMLeadmon/Doom-Term/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/CMLeadmon/Doom-Term/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/CMLeadmon/Doom-Term/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/CMLeadmon/Doom-Term/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/CMLeadmon/Doom-Term/compare/v0.3.0...v0.3.1
