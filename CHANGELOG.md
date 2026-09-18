@@ -13,6 +13,11 @@ where it is not.
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-09-18
+
+A daemon that another process had quietly replaced, and a second window
+that took the first one's terminals down with it.
+
 ### Fixed
 
 - **A stranger on the daemon port no longer silently becomes the daemon.** The
@@ -327,7 +332,8 @@ Published for Linux (AppImage, deb, rpm), macOS (Apple Silicon and Intel) and
 Windows (MSI and NSIS) — the Windows build being a terminal only, which is what
 0.2.0 addresses.
 
-[Unreleased]: https://github.com/CMLeadmon/Doom-Term/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/CMLeadmon/Doom-Term/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/CMLeadmon/Doom-Term/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/CMLeadmon/Doom-Term/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/CMLeadmon/Doom-Term/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/CMLeadmon/Doom-Term/compare/v0.2.0...v0.3.0
