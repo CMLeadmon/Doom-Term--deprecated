@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { applyScreenToNode, advanceReportedTuiState } from './usePtyEvents';
+import { applyScreenToNode, advanceReportedTuiState, resolveTuiState } from './usePtyEvents';
 import type { StreamRecord } from '../core/streamProtocol';
 import type { SessionNode } from '../types/sessionTree';
 import type { AnsiLine } from '../types/terminal';
@@ -67,5 +67,40 @@ describe('daemon TUI state lifetime', () => {
     expect(old.active).toBe(true);
     const rebuilt = advanceReportedTuiState(old, record('3'.repeat(32)));
     expect(rebuilt).toEqual({ stream: '1'.repeat(32) + '/' + '3'.repeat(32) });
+  });
+
+  // The daemon stops being able to see the alternate screen when tmux stops
+  // answering. Holding the last report left a pane that had been full-screen
+  // flagged that way for the life of the stream: no scrollback, and a wheel
+  // with nowhere to go. Forgetting is what lets resolveTuiState fall back to
+  // the emulator.
+  it('forgets a stale TUI observation when the daemon says it can no longer see', () => {
+    const epoch = '2'.repeat(32);
+    const seen = advanceReportedTuiState(undefined, record(epoch, true));
+    expect(seen.active).toBe(true);
+
+    const unknown: StreamRecord = {
+      session_id: 'n', incarnation: '1'.repeat(32), stream_epoch: epoch,
+      sequence: '2', observed_micros: 2,
+      payload: { type: 'Event', payload: { type: 'TuiModeUnknown' } },
+    };
+    const forgotten = advanceReportedTuiState(seen, unknown);
+    expect(forgotten.active).toBeUndefined();
+    expect(forgotten.stream).toBe(seen.stream);
+    // Unknown must defer to the emulator rather than assert a state of its own.
+    expect(resolveTuiState(false, forgotten.active)).toBe(false);
+    expect(resolveTuiState(true, forgotten.active)).toBe(true);
+  });
+
+  it('keeps reporting after an unknown, so recovery is not one-way', () => {
+    const epoch = '2'.repeat(32);
+    const seen = advanceReportedTuiState(undefined, record(epoch, true));
+    const forgotten = advanceReportedTuiState(seen, {
+      session_id: 'n', incarnation: '1'.repeat(32), stream_epoch: epoch,
+      sequence: '2', observed_micros: 2,
+      payload: { type: 'Event', payload: { type: 'TuiModeUnknown' } },
+    });
+    const regained = advanceReportedTuiState(forgotten, record(epoch, false));
+    expect(regained.active).toBe(false);
   });
 });

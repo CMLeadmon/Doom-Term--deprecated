@@ -2,6 +2,20 @@ use super::*;
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 
+/// A program that exits immediately, wherever this platform keeps it.
+///
+/// `/bin/false` is a Linux path. macOS ships it at `/usr/bin/false` and has
+/// nothing at `/bin/false`, so the hardcoded path failed to spawn and took the
+/// test with it on every Mac.
+#[cfg(unix)]
+fn exits_immediately() -> String {
+    ["/bin/false", "/usr/bin/false"]
+        .into_iter()
+        .find(|path| std::path::Path::new(path).exists())
+        .expect("no false(1) on this system")
+        .to_string()
+}
+
 // Drives a real PTY through a POSIX fixture (/bin/cat, /bin/false, a #!/bin/sh
 // script). The behaviour is platform-independent; the fixture is not.
 #[cfg(unix)]
@@ -156,7 +170,7 @@ fn a_reaped_direct_handle_cannot_signal_a_reused_numeric_pid() {
         return;
     }
     let mut old =
-        PtySession::create("old".into(), 80, 24, None, Some("/bin/false".into())).unwrap();
+        PtySession::create("old".into(), 80, 24, None, Some(exits_immediately())).unwrap();
     let deadline = Instant::now() + Duration::from_secs(3);
     while !old.stream().snapshot().ended && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(5));

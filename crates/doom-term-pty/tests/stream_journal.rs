@@ -22,6 +22,18 @@ fn isolated(test: &str) -> bool {
     true
 }
 
+/// A program that exits immediately, wherever this platform keeps it.
+///
+/// `/bin/false` is a Linux path; macOS ships it only at `/usr/bin/false`, so
+/// the hardcoded path failed to spawn and took this test with it on every Mac.
+fn exits_immediately() -> String {
+    ["/bin/false", "/usr/bin/false"]
+        .into_iter()
+        .find(|path| std::path::Path::new(path).exists())
+        .expect("no false(1) on this system")
+        .to_string()
+}
+
 fn metadata(id: &str) -> StreamMetadata {
     StreamMetadata::new(id.into(), Identity::random().unwrap(), 80, 24, false).unwrap()
 }
@@ -123,7 +135,7 @@ fn process_exit_is_not_a_fabricated_semantic_command_completion() {
         80,
         24,
         None,
-        Some("/bin/false".into()),
+        Some(exits_immediately()),
     )
     .unwrap();
     let journal = session.stream();

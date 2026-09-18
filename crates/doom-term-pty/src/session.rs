@@ -13,6 +13,12 @@ use crate::stream::{
 };
 use crate::tmux::{self, TmuxHandle};
 
+/// How many extra attempts an unsettled kill gets before it is reported as
+/// unconfirmed. Small on purpose: this runs while the user waits for a tab to
+/// close.
+const KILL_RETRIES: u32 = 2;
+const KILL_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(150);
+
 /**
  * Move off a working directory that can be taken away, once, at startup.
  *
@@ -591,22 +597,45 @@ impl PtySession {
             let poll_observations = observations.clone();
             threads.push(thread::spawn(move || {
                 let mut last: Option<bool> = None;
+                // Silence used to be indistinguishable from "no change".
+                //
+                // `alternate_on` answers None when tmux does not reply — a
+                // timed-out helper, or a pane whose identity can no longer be
+                // evaluated — and the old loop simply skipped those ticks. The
+                // client kept the last report forever, so a pane that had been
+                // full-screen stayed flagged full-screen: no scrollback was
+                // rendered and the wheel had nowhere to go. Count the silence
+                // and, past the threshold, say we no longer know.
+                let mut misses: u32 = 0;
                 while running_poll.load(Ordering::Relaxed) {
-                    if let Some(active) = handle.alternate_on() {
-                        if !running_poll.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        if last != Some(active) {
-                            last = Some(active);
-                            {
-                                let _order = poll_observations.lock();
-                                if poll_journal
-                                    .append(StreamPayload::Event(DemuxEvent::TuiMode { active }))
-                                    .is_err()
-                                {
-                                    break;
-                                }
+                    let observed = handle.alternate_on();
+                    if !running_poll.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let event = match observed {
+                        Some(active) => {
+                            misses = 0;
+                            if last == Some(active) {
+                                None
+                            } else {
+                                last = Some(active);
+                                Some(DemuxEvent::TuiMode { active })
                             }
+                        }
+                        None => {
+                            misses = misses.saturating_add(1);
+                            if misses >= tmux::ALT_STALE_AFTER && last.is_some() {
+                                last = None;
+                                Some(DemuxEvent::TuiModeUnknown)
+                            } else {
+                                None
+                            }
+                        }
+                    };
+                    if let Some(event) = event {
+                        let _order = poll_observations.lock();
+                        if poll_journal.append(StreamPayload::Event(event)).is_err() {
+                            break;
                         }
                     }
                     thread::sleep(tmux::ALT_POLL);
@@ -970,10 +999,41 @@ impl PtySession {
         // shell keeps running with nothing attached to it — a leak the user
         // cannot see or reach. Closing a tab has to close the session.
         if let Some(handle) = &self.tmux {
-            anyhow::ensure!(
-                handle.kill_session(),
-                "Durable pane is missing or replaced; kill refused"
-            );
+            // Closing a tab must always be possible.
+            //
+            // This refused the kill unless the identity-checked path came back
+            // Confirmed, and a bounded helper that timed out was reported the
+            // same way as a pane that is no longer ours. The session then could
+            // not be closed by any means the UI offered: the tab was permanent
+            // and the only way out was quitting the app.
+            //
+            // An unknown is retried, because a slow tmux settles into a real
+            // answer given another moment. What is NOT done is forcing the kill
+            // by session name: a replacement legitimately owns that name, and
+            // killing it would turn a stale tab into a weapon against a live
+            // session. A pane that is not ours is therefore not killed — there
+            // is nothing of ours left to kill — and the adapter is retired so
+            // the ghost tab goes away regardless.
+            let mut verdict = handle.kill_session();
+            for _ in 0..KILL_RETRIES {
+                if verdict != tmux::Verdict::Unknown {
+                    break;
+                }
+                std::thread::sleep(KILL_RETRY_BACKOFF);
+                verdict = handle.kill_session();
+            }
+            match verdict {
+                tmux::Verdict::Confirmed => {}
+                // Reported, never silently swallowed: the tab closes either
+                // way, and the difference between a session we killed and one
+                // we never owned belongs in the log.
+                tmux::Verdict::Replaced => log::warn!(
+                    "pane is owned by a newer incarnation; closing this adapter without killing it"
+                ),
+                tmux::Verdict::Unknown => log::error!(
+                    "tmux did not answer; the session could not be confirmed killed, closing the pane regardless"
+                ),
+            }
             {
                 let _order = self.observations.lock();
                 self.journal.observe_process_exit(None);

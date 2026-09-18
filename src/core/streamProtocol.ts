@@ -6,6 +6,7 @@ export type StreamEvent =
   | { type: 'PromptStart' | 'CommandStart' | 'ExecutionStart' }
   | { type: 'ExecutionEnd'; payload: { exit_code: number | null } }
   | { type: 'TuiMode'; payload: { active: boolean } }
+  | { type: 'TuiModeUnknown' }
   | { type: 'BracketedPasteMode'; payload: { enabled: boolean } }
   | { type: 'AgentState'; payload: { state: string } }
   | { type: 'Cwd'; payload: { path: string } }
@@ -99,7 +100,7 @@ function remoteEnrichment(value: unknown): RemoteEnrichment {
 function parseEvent(value: unknown): StreamEvent {
   const event = object(value);
   switch (event.type) {
-    case 'PromptStart': case 'CommandStart': case 'ExecutionStart': return { type: event.type };
+    case 'PromptStart': case 'CommandStart': case 'ExecutionStart': case 'TuiModeUnknown': return { type: event.type };
     case 'Output': return { type: event.type, payload: { data: text(object(event.payload).data) } };
     case 'ExecutionEnd': return { type: event.type, payload: { exit_code: exitCode(object(event.payload).exit_code) } };
     case 'TuiMode': return { type: event.type, payload: { active: boolean(object(event.payload).active) } };

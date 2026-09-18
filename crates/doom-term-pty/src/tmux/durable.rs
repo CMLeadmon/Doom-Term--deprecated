@@ -301,8 +301,16 @@ impl TmuxHandle {
     ) -> Result<()> {
         use std::fmt::Write;
         let target = self.target.as_ref().context("Unidentified input target")?;
-        let deadline = Instant::now() + Duration::from_secs(2);
         for chunk in bytes.chunks(8192) {
+            // Per chunk, not per write.
+            //
+            // One two-second budget was shared by every chunk, so a large
+            // write against a slow tmux spent it on the first chunk and then
+            // `helper_timeout` failed the rest instantly — the deadline had
+            // already passed. What the user saw was a terminal that stopped
+            // accepting input. Each chunk now gets its own budget; a write is
+            // still bounded, just not by how much came before it.
+            let deadline = Instant::now() + Duration::from_secs(2);
             let mut command = format!("send-keys -H -t {}", target.pane);
             for byte in chunk {
                 write!(&mut command, " {byte:02x}").unwrap();
@@ -327,9 +335,17 @@ impl TmuxHandle {
                     output_bytes: 128,
                 },
             )?;
+            // Never retried: a resent chunk is a duplicated keystroke, and
+            // unknown delivery must be reported as unknown rather than fixed
+            // by guessing. What changes here is only that the two outcomes are
+            // told apart instead of both being reported as a replacement.
+            anyhow::ensure!(
+                reply != b"DOOM_REPLACED\n",
+                "Input target was replaced; the keystrokes were not delivered"
+            );
             anyhow::ensure!(
                 reply == b"DOOM_INPUT_OK\n",
-                "Input target changed; delivery may be incomplete"
+                "tmux did not confirm the write; delivery is unknown"
             );
         }
         Ok(())

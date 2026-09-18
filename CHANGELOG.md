@@ -13,6 +13,37 @@ where it is not.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A slow tmux is no longer mistaken for a stolen pane.** Every tmux operation
+  runs as a bounded two-second helper whose identity is checked by tmux itself,
+  and `Err(_) => false` made "tmux did not answer in time" indistinguishable
+  from "this pane is not ours any more". The caller took that single `false` as
+  a permanent verdict. `kill_session` now answers `Confirmed`, `Replaced` or
+  `Unknown`, and an unknown is retried rather than believed.
+- **A terminal can always be closed.** A close was refused outright unless the
+  identity-checked kill came back confirmed, so a pane whose ownership could not
+  be established became a tab that no action in the UI could remove — the only
+  way out was quitting the app. The adapter is now retired either way. A pane
+  that belongs to a newer incarnation is still never killed: there is nothing of
+  ours left in it, and the live session it now holds is not ours to take.
+- **Input is bounded per write, not per burst.** Every chunk of a single write
+  shared one two-second budget, so a large write against a slow tmux spent it on
+  the first chunk and failed the rest instantly — the terminal simply stopped
+  accepting keystrokes. Each chunk now carries its own deadline. Delivery is
+  still never retried, and an unconfirmed write is still reported as unknown
+  rather than guessed at.
+- **Scrollback comes back when tmux goes quiet.** `smcup@` keeps our client out
+  of the alternate buffer deliberately, so tmux is the only witness for
+  full-screen mode — and the poll emitted only on change, meaning silence read
+  as "no change". A pane that had been full-screen stayed flagged that way for
+  the life of the stream: no scrollback rendered, and scrolling up did nothing.
+  The poll now reports `TuiModeUnknown` after three seconds of silence and the
+  client falls back to its own screen model.
+- **`false(1)` is found where the platform keeps it.** Two test fixtures
+  hardcoded `/bin/false`, which does not exist on macOS, so `cargo test` could
+  not pass on a Mac at all.
+
 ## [0.4.1] — 2026-09-18
 
 A daemon that another process had quietly replaced, and a second window

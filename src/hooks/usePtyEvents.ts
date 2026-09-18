@@ -77,7 +77,12 @@ export function advanceReportedTuiState(
 ): ReportedTuiState {
   const stream = `${record.incarnation}/${record.stream_epoch}`;
   const current = previous?.stream === stream ? previous : { stream };
-  return record.payload.type === 'Event' && record.payload.payload.type === 'TuiMode'
+  if (record.payload.type !== 'Event') return current;
+  // Unknown is a report, not a gap. Dropping back to `undefined` is what lets
+  // resolveTuiState fall through to the emulator's own view of the screen
+  // instead of holding a stale full-screen flag that nothing can clear.
+  if (record.payload.payload.type === 'TuiModeUnknown') return { stream };
+  return record.payload.payload.type === 'TuiMode'
     ? { stream, active: record.payload.payload.payload.active }
     : current;
 }

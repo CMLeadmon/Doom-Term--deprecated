@@ -132,7 +132,12 @@ fn missing_prefix_targets_never_query_capture_or_kill_a_neighbor() {
         let survivor = full.has_session();
         assert_eq!(pid, None);
         assert!(history.is_none());
-        assert_eq!((found, killed, survivor), (false, false, true));
+        assert_ne!(
+            killed,
+            tmux::Verdict::Confirmed,
+            "a handle that owns nothing must not report a confirmed kill"
+        );
+        assert_eq!((found, survivor), (false, true));
     }));
     session.kill().unwrap();
     if let Err(panic) = result {
@@ -198,10 +203,18 @@ fn durable_create_conflicts_and_attach_reuses_only_the_original_pane() {
     assert!(PtySession::attach_durable("durable".into(), &incarnation, 80, 24).is_err());
     assert!(first.paste("stale").is_err());
     assert!(
-        first.kill().is_err(),
-        "an old handle cannot kill its replacement"
+        first.kill().is_ok(),
+        "a stale tab must still be closable; refusing left it impossible to remove"
     );
-    assert!(replacement.shell_pid().is_some());
+    assert!(
+        replacement.shell_pid().is_some(),
+        "an old handle closing itself must not kill its replacement"
+    );
+    assert_eq!(
+        tmux::list_sessions(&tmux::resolve_tmux(None).unwrap()).len(),
+        1,
+        "closing the stale tab must not have killed the live session"
+    );
     replacement.kill().unwrap();
 }
 
@@ -481,7 +494,11 @@ fn old_identity_refuses_respawned_pane_and_restarted_server_even_if_numeric_id_i
         .to_string()
         .contains("replaced"));
     assert!(old.capture_archive().is_err());
-    assert!(!old.kill_session());
+    assert_eq!(
+        old.kill_session(),
+        tmux::Verdict::Replaced,
+        "a live tmux that refuses on identity is a replacement, not an unknown"
+    );
     first.retire_adapter().unwrap();
     assert!(std::process::Command::new(&exe)
         .args(["-N", "-L", "doom-term", "kill-server"])
@@ -501,7 +518,11 @@ fn old_identity_refuses_respawned_pane_and_restarted_server_even_if_numeric_id_i
         "fixture must actually reuse the numeric pane id"
     );
     assert!(old.pane_pid().is_none());
-    assert!(!old.kill_session());
+    assert_eq!(
+        old.kill_session(),
+        tmux::Verdict::Replaced,
+        "a live server that reuses the numeric pane id still answers on identity"
+    );
     assert!(old.paste("must-not-reach-restarted-server").is_err());
     assert!(old.capture_archive().is_err());
     assert!(current.pane_pid().is_some());
@@ -546,7 +567,7 @@ fn legacy_pane_requires_explicit_identity_assignment_and_can_only_be_adopted_onc
     let owned = TmuxHandle::recover_legacy(exe.clone(), "legacy", &pane, pid).unwrap();
     assert_eq!(owned.pane_pid(), Some(pid));
     assert!(TmuxHandle::recover_legacy(exe, "legacy", &pane, pid).is_err());
-    assert!(owned.kill_session());
+    assert_eq!(owned.kill_session(), tmux::Verdict::Confirmed);
 }
 
 #[test]
@@ -582,7 +603,7 @@ fn stalled_display_bootstrap_reaps_its_client_and_keeps_the_created_root() {
         "timeout must not kill or replace the created pane"
     );
     assert_eq!(display_clients(), 0);
-    assert!(root.kill_session());
+    assert_eq!(root.kill_session(), tmux::Verdict::Confirmed);
 }
 
 #[test]

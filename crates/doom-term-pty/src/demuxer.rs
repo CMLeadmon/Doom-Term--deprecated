@@ -15,6 +15,15 @@ pub enum DemuxEvent {
     TuiMode {
         active: bool,
     },
+    /// The alternate-screen state stopped being observable.
+    ///
+    /// tmux is the only witness for it — `smcup@` keeps our own client out of
+    /// the alternate buffer deliberately — so when tmux stops answering, the
+    /// last `TuiMode` is a report about the past. Saying so lets the client
+    /// fall back to its own screen model; saying nothing left a pane that was
+    /// once full-screen flagged that way forever, and a pane flagged
+    /// full-screen renders no scrollback and cannot be scrolled.
+    TuiModeUnknown,
     BracketedPasteMode {
         enabled: bool,
     },

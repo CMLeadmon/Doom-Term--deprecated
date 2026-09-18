@@ -109,6 +109,7 @@ export class StreamApplication {
         if (event.type === 'Cwd') this.derived.cwd = event.payload.path;
         if (event.type === 'AgentState') this.derived.agentState = event.payload.state;
         if (event.type === 'TuiMode') this.derived.isTuiActive = event.payload.active;
+        if (event.type === 'TuiModeUnknown') this.derived.isTuiActive = null;
         if (event.type === 'ExecutionStart') {
           this.startedMicros = record.observed_micros;
           this.derived.atPrompt = false;

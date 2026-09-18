@@ -26,6 +26,24 @@ pub const MIN_MINOR: u32 = 7;
 /// this only paces vim, htop and their kind.
 pub const ALT_POLL: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// How many consecutive unanswered alternate-screen polls make the last answer
+/// stale. At `ALT_POLL` this is three seconds of silence before we stop
+/// claiming to know, which is long enough that ordinary tmux slowness does not
+/// flicker the pane out of full-screen mode.
+pub const ALT_STALE_AFTER: u32 = 6;
+
+/// The outcome of an operation tmux evaluates against our pane identity.
+///
+/// Three states, because there are three: it happened, it was refused because
+/// the pane is no longer ours, or tmux did not answer and we do not know.
+/// Collapsing the third into the second is what made a slow tmux permanent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    Confirmed,
+    Replaced,
+    Unknown,
+}
+
 /// Major and minor from `tmux -V`, which reports as `tmux 3.7b`, `tmux 3.2a`
 /// or `tmux next-3.4`. The suffix letter is a point release and is ignored.
 ///
@@ -592,10 +610,25 @@ impl TmuxHandle {
             .is_ok()
     }
 
-    pub fn kill_session(&self) -> bool {
+    /// Kill the pane we own, and say which of the three things happened.
+    ///
+    /// This returned a bool, and `Err(_) => false` made "tmux did not answer
+    /// within two seconds" indistinguishable from "this pane is not ours any
+    /// more". The caller treated that single false as a permanent verdict and
+    /// refused the kill, so a busy tmux — not a replaced pane — left a session
+    /// that could never be closed. An unknown is not a no.
+    pub fn kill_session(&self) -> Verdict {
         match self.run_query(&self.kill_args()) {
-            Ok(reply) => self.target.is_none() || reply == b"DOOM_KILLED\n",
-            Err(_) => false,
+            Ok(reply) => {
+                if self.target.is_none() || reply == b"DOOM_KILLED\n" {
+                    Verdict::Confirmed
+                } else if reply == b"DOOM_REPLACED\n" {
+                    Verdict::Replaced
+                } else {
+                    Verdict::Unknown
+                }
+            }
+            Err(_) => Verdict::Unknown,
         }
     }
 }
