@@ -9,9 +9,9 @@ mod worktree;
 
 // Public v2 transport; there is no legacy wire fallback.
 mod attachments;
+mod gateway;
 mod outbound;
 mod protocol;
-mod gateway;
 #[cfg(test)]
 mod recovery_tests;
 
