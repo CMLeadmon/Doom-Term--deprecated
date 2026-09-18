@@ -11,10 +11,9 @@ mod worktree;
 mod attachments;
 mod outbound;
 mod protocol;
-mod recovery;
+mod gateway;
 #[cfg(test)]
 mod recovery_tests;
-mod tombstones;
 
 #[cfg(test)]
 mod security_tests;
@@ -463,7 +462,7 @@ async fn main() -> Result<()> {
     );
     provision_cli_tools();
 
-    let server = Arc::new(recovery::RecoveryServer::new()?);
+    let server = Arc::new(gateway::Gateway::new()?);
     let sessions = server.sessions.clone();
     let usage = server.usage.clone();
     tokio::spawn(server.clone().maintain());
@@ -1034,7 +1033,7 @@ async fn serve_cli_hook_script(mut stream: TcpStream) {
 async fn handle_connection(
     stream: TcpStream,
     client_addr: SocketAddr,
-    server: Arc<recovery::RecoveryServer>,
+    server: Arc<gateway::Gateway>,
 ) {
     handle_connection_authenticated(
         stream,
@@ -1050,7 +1049,7 @@ async fn handle_connection(
 async fn handle_connection_authenticated(
     mut stream: TcpStream,
     client_addr: SocketAddr,
-    server: Arc<recovery::RecoveryServer>,
+    server: Arc<gateway::Gateway>,
     required_token: Option<String>,
 ) {
     let port = match stream.local_addr() {

@@ -1,6 +1,6 @@
 /** Negotiated v2 stream shapes. Numeric cursors are never JavaScript numbers. */
 import { parseGrid } from './terminalGeometry';
-export type StreamFault = 'RecordTooLarge' | 'SequenceExhausted' | 'ControlTooLong' | 'AdapterRetired' | 'AdapterLost';
+export type StreamFault = 'RecordTooLarge' | 'SequenceExhausted' | 'ControlTooLong' | 'AdapterRetired' | 'AdapterLost' | 'Unknown';
 export type StreamEvent =
   | { type: 'Output'; payload: { data: string } }
   | { type: 'PromptStart' | 'CommandStart' | 'ExecutionStart' }
@@ -10,7 +10,8 @@ export type StreamEvent =
   | { type: 'AgentState'; payload: { state: string } }
   | { type: 'Cwd'; payload: { path: string } }
   | { type: 'RemoteEnrichment'; payload: { data: RemoteEnrichment } }
-  | { type: 'StreamFault'; payload: { reason: StreamFault } };
+  | { type: 'StreamFault'; payload: { reason: StreamFault } }
+  | { type: 'Unknown'; payload?: { variant: string } };
 /** What a shell on the far end of a transport reported about itself. */
 export interface RemoteEnrichment {
   host: string | null; user: string | null; shell: string | null;
@@ -20,7 +21,8 @@ export type StreamPayload =
   | { type: 'Event'; payload: StreamEvent }
   | { type: 'Resize'; payload: { cols: number; rows: number } }
   | { type: 'Closed'; payload: { exit_code: number | null } }
-  | { type: 'Fault'; payload: { reason: StreamFault } };
+  | { type: 'Fault'; payload: { reason: StreamFault } }
+  | { type: 'Unknown'; payload?: { variant: string } };
 export interface StreamDescriptor {
   session_id: string;
   incarnation: string;
@@ -64,7 +66,7 @@ function exitCode(value: unknown): number | null {
 function fault(value: unknown): StreamFault {
   switch (value) {
     case 'RecordTooLarge': case 'SequenceExhausted': case 'ControlTooLong': case 'AdapterRetired': case 'AdapterLost': return value;
-    default: return invalid();
+    default: return 'Unknown';
   }
 }
 export function parseSequence(value: unknown): bigint {
@@ -106,7 +108,10 @@ function parseEvent(value: unknown): StreamEvent {
     case 'Cwd': return { type: event.type, payload: { path: text(object(event.payload).path) } };
     case 'RemoteEnrichment': return { type: event.type, payload: { data: remoteEnrichment(object(event.payload).data) } };
     case 'StreamFault': return { type: event.type, payload: { reason: fault(object(event.payload).reason) } };
-    default: return invalid();
+    default: {
+      const variant = typeof event.type === 'string' ? event.type : 'Unknown';
+      return { type: 'Unknown', payload: { variant } };
+    }
   }
 }
 function parsePayload(value: unknown): StreamPayload {
@@ -116,7 +121,10 @@ function parsePayload(value: unknown): StreamPayload {
     case 'Resize': return { type: input.type, payload: parseGrid(object(input.payload).cols, object(input.payload).rows) };
     case 'Closed': return { type: input.type, payload: { exit_code: exitCode(object(input.payload).exit_code) } };
     case 'Fault': return { type: input.type, payload: { reason: fault(object(input.payload).reason) } };
-    default: return invalid();
+    default: {
+      const variant = typeof input.type === 'string' ? input.type : 'Unknown';
+      return { type: 'Unknown', payload: { variant } };
+    }
   }
 }
 export function parseStreamRecord(value: unknown): StreamRecord {
@@ -130,8 +138,12 @@ export function parseStreamRecord(value: unknown): StreamRecord {
   if (encoder.encode(JSON.stringify(record)).length > 65536) return invalid();
   // Copy and freeze the validated shape: asynchronous application must not
   // observe a caller changing a queued record or an observer changing its ids.
-  if ('payload' in payload.payload) Object.freeze(payload.payload.payload);
-  Object.freeze(payload.payload);
+  if ('payload' in payload && payload.payload && typeof payload.payload === 'object') {
+    if ('payload' in payload.payload && payload.payload.payload && typeof payload.payload.payload === 'object') {
+      Object.freeze(payload.payload.payload);
+    }
+    Object.freeze(payload.payload);
+  }
   Object.freeze(payload);
   return Object.freeze(record);
 }

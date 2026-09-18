@@ -18,28 +18,12 @@ export type PaneTree =
       second: PaneTree;
     };
 
-export interface RecoveredHistoryPresentation {
-  status: 'unavailable' | 'receiving' | 'complete' | 'incomplete';
-  data: string | null;
-  reason: string | null;
-  captureId?: string;
-  historyAtLimit?: boolean;
-  potentiallyOverlapping: true;
-  potentiallyIncomplete: true;
-}
-
 export interface SessionNode {
   id: string;
   /** Exact process identity, never a socket lease or parser checkpoint. */
   incarnation?: string;
-  /** Local-only presentation of a displaced cache. Never a process binding. */
-  snapshotOf?: { sessionId: string; incarnation?: string };
   /** Retained whole-line cache is only a bounded suffix, never a checkpoint. */
   cacheTruncated?: boolean;
-  /** Saved cache and tmux capture remain outside the new live parser. */
-  recoveryCacheLines?: AnsiLine[];
-  recoveryCacheTruncated?: boolean;
-  recoveredHistory?: RecoveredHistoryPresentation;
   groupId: string;
   title: string;
   /**

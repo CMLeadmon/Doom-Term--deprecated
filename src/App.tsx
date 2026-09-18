@@ -3,6 +3,7 @@ import { SessionNode } from './types/sessionTree';
 import { ptyClient } from './core/ptyClient';
 import { audioEngine } from './core/audioEngine';
 import { RawTerminalView } from './components/RawTerminalView';
+import { PaneErrorBoundary } from './components/PaneErrorBoundary';
 import { StatusPlate } from './components/StatusPlate';
 import { SplitPaneGrid } from './components/SplitPaneGrid';
 import { SessionModeNotice } from './components/SessionModeNotice';
@@ -24,7 +25,6 @@ import { adjacentPane } from './core/paneTree';
 import { PaneSelectOverlay } from './components/PaneSelectOverlay';
 import { closeDisposition } from './core/sessionClose';
 import { CloseSessionPrompt } from './components/CloseSessionPrompt';
-import { SessionSnapshotNotice } from './components/SessionSnapshotNotice';
 import { TitleBar } from './components/TitleBar';
 import { PermissionModeModal, type PermissionMode } from './components/PermissionModeModal';
 import { RenameSessionModal } from './components/RenameSessionModal';
@@ -34,8 +34,7 @@ import type { ViewAction, ViewActionRequest } from './core/keymap';
 /** A stable empty list, so a closed palette does not hand out a new array. */
 const EMPTY_ACTIONS: CommandPaletteAction[] = [];
 
-const isSessionFailed = (n: SessionNode) =>
-  n.agentState === 'errored' || (n.lastExitCode != null && n.lastExitCode !== 0);
+const isSessionFailed = (n: SessionNode) => n.agentState === 'errored';
 
 export const App: React.FC = () => {
   const [authMessage, setAuthMessage] = useState(ptyClient.getAuthMessage());
@@ -56,9 +55,6 @@ export const App: React.FC = () => {
     setEventWorkspace,
     activeGroup,
     activeNode,
-    recoveryState,
-    bindingFor,
-    handleReviveNode,
     handleCreateNode,
     handleRenameNode,
     handleOpenWorkspaceFolder,
@@ -72,7 +68,6 @@ export const App: React.FC = () => {
     handleTogglePaneZoom,
     handleParkNode,
     handleKillNode,
-    handleRecoverSession,
     openOrUpdateArtifact,
   } = useWorkspaceSet();
   // Selection commits before the next daemon poll. Do not lend the old pane's
@@ -146,16 +141,14 @@ export const App: React.FC = () => {
   const activeViewSessionId = activeNode?.kind === 'scratchpad' || activeNode?.kind === 'artifact' ? null : activeNode?.id ?? null;
   const requestViewAction = useCallback((action: ViewAction) => {
     // A cached snapshot has no terminal view to acknowledge this request. If
-    // it were queued anyway, reviving the session later would replay an old
-    // palette action against the newly started shell.
-    if (!activeViewSessionId || bindingFor(activeViewSessionId) !== 'ready') return;
+    if (!activeViewSessionId) return;
     nextViewActionId.current += 1;
     setViewActionRequest({
       id: nextViewActionId.current,
       sessionId: activeViewSessionId,
       action,
     });
-  }, [activeViewSessionId, bindingFor]);
+  }, [activeViewSessionId]);
   const handleViewActionHandled = useCallback((requestId: number) => {
     setViewActionRequest((current) => current?.id === requestId ? null : current);
   }, []);
@@ -401,14 +394,12 @@ export const App: React.FC = () => {
     workspaceName: workspace.name,
     workspaceNames,
     nodes: workspaceNodes,
-    recoverableSessions: recoveryState.recoverable,
     setIsWorkspaceModalOpen,
     onCreateNode: handleCreateNode,
     onRenameNode: handleRenameNode,
     onSetGroupLayout: handleSetGroupLayout,
     onEqualizePanes: handleEqualizePanes,
     onSelectNode: handleSelectNode,
-    onRecoverSession: handleRecoverSession,
     onCloseSession: (nodeId) => setPendingCloseId(nodeId),
     onTogglePaneZoom: () => {
       if (activeGroup.paneTree) {
@@ -457,7 +448,7 @@ export const App: React.FC = () => {
     // while it is open the selection is tracked by id rather than by position,
     // so a rebuild no longer moves the cursor.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [isPaletteOpen, workspaceNodes, activeGroup, activeNode, recoveryState.recoverable, notificationsEnabled, notificationPermission],
+    [isPaletteOpen, workspaceNodes, activeGroup, activeNode, notificationsEnabled, notificationPermission],
   );
 
   /**
@@ -507,41 +498,22 @@ export const App: React.FC = () => {
       );
     }
 
-    // A restored session with no process behind it is not a terminal, and
-    // drawing one over its cached lines is what made a silently-respawned
-    // shell indistinguishable from a recovered one.
-    const binding = bindingFor(node.id);
-    if (binding !== 'ready') {
-      return (
-        <SessionSnapshotNotice
-          title={node.title}
-          cwd={node.cwd}
-          pending={binding === 'waiting'}
-          lines={node.tuiLines}
-          truncated={node.cacheTruncated}
-          snapshotOf={node.snapshotOf ?? { sessionId: node.id, incarnation: node.incarnation }}
-          onStart={() => handleReviveNode(node.id)}
-        />
-      );
-    }
-
     return (
-      <RawTerminalView
-        lines={node.tuiLines}
-        sessionId={node.id}
-        isActive={isActive}
-        agentKey={node.foregroundAgent ?? null}
-        cursor={node.cursor ?? null}
-        viewActionRequest={isActive ? viewActionRequest : null}
-        onViewActionHandled={handleViewActionHandled}
-        recoveredHistory={node.recoveredHistory}
-        recoveryCacheLines={node.recoveryCacheLines}
-        recoveryCacheTruncated={node.recoveryCacheTruncated}
-        onWrite={(data: string) => ptyClient.writeToSession(node.id, data)}
-        captureInputIdentity={() => ptyClient.captureInputIdentity(node.id)}
-        onPasteText={(text, expected) => ptyClient.pasteToSession(node.id, text, expected)}
-        onSendSignal={(sig: 'ctrl+c' | 'ctrl+d' | 'ctrl+z') => ptyClient.sendSignalToSession(node.id, sig)}
-      />
+      <PaneErrorBoundary sessionId={node.id}>
+        <RawTerminalView
+          lines={node.tuiLines}
+          sessionId={node.id}
+          isActive={isActive}
+          agentKey={node.foregroundAgent ?? null}
+          cursor={node.cursor ?? null}
+          viewActionRequest={isActive ? viewActionRequest : null}
+          onViewActionHandled={handleViewActionHandled}
+          onWrite={(data: string) => ptyClient.writeToSession(node.id, data)}
+          captureInputIdentity={() => ptyClient.captureInputIdentity(node.id)}
+          onPasteText={(text, expected) => ptyClient.pasteToSession(node.id, text, expected)}
+          onSendSignal={(sig: 'ctrl+c' | 'ctrl+d' | 'ctrl+z') => ptyClient.sendSignalToSession(node.id, sig)}
+        />
+      </PaneErrorBoundary>
     );
   };
 

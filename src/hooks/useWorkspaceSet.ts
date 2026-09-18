@@ -16,11 +16,7 @@ import { disposeActivity } from '../core/activityMonitor';
 import { attentionQueue } from '../core/attentionQueue';
 import { ptyClient, type ArtifactRecord } from '../core/ptyClient';
 import { audioEngine } from '../core/audioEngine';
-import { placeRecoveredSession } from '../core/recoveryPlacement';
-import { equalizeTree, paneLeaf, removeLeaf, replaceLeaf, splitLeaf, treeForSelection, treeFromLayout } from '../core/paneTree';
-import {
-  knownIncarnation, reconcileSessions, sessionBinding, type RecoverableSession, type RecoveryState,
-} from '../core/sessionRecovery';
+import { equalizeTree, paneLeaf, removeLeaf, splitLeaf, treeForSelection, treeFromLayout } from '../core/paneTree';
 
 /**
  * All open project folders, the one in focus, and everything that mutates
@@ -50,36 +46,7 @@ export function useWorkspaceSet() {
   const workspace = useMemo(() => activeWorkspace(workspaceSet), [workspaceSet]);
   const workspaceSetRef = useRef(workspaceSet);
   workspaceSetRef.current = workspaceSet;
-  const [recoveryState, setRecoveryState] = useState<RecoveryState>({
-    matched: [], recoverable: [], snapshots: [],
-  });
-  /**
-   * Whether the daemon has been asked what it actually holds, even once.
-   *
-   * Until it has, a restored id must not be handed to the attach-or-create
-   * Spawn path: that is what silently turned a stored snapshot into a fresh
-   * shell wearing its scrollback.
-   */
-  const [reconciled, setReconciled] = useState(false);
   const pendingClosures = useRef(new Set<string>());
-  const pendingRecoveries = useRef(new Set<string>());
-  /**
-   * The ids that came off disk at boot, captured before anything can add to
-   * them. A session created later in this run has no stored state to lose and
-   * must not be made to wait on recovery.
-   *
-   * Seeded from what was STORED, not from what is shown: a workspace this run
-   * synthesized never came off disk, and calling its placeholder session
-   * restored made a first launch wait for reconciliation and then draw its own
-   * brand-new session as a SNAPSHOT of something that never ran.
-   */
-  const restoredIds = useRef<Set<string>>(
-    new Set(
-      (boot.restored ? boot.set.workspaces : []).flatMap((candidate) =>
-        Object.keys(candidate.nodes)
-      ),
-    ),
-  );
 
   const setWorkspace = useCallback(
     (updater: (prev: ProjectWorkspace) => ProjectWorkspace) => {
@@ -124,69 +91,19 @@ export function useWorkspaceSet() {
     SessionStore.saveWorkspaceSet(workspaceSet);
   }, [workspaceSet, needsWorkspaceChoice]);
 
-  useEffect(() => {
-    let disposed = false;
-    let refreshing = false;
-    const refresh = async () => {
-      if (refreshing || !ptyClient.getIsConnected()) return;
-      refreshing = true;
-      try {
-        const listing = await ptyClient.listSessions();
-        if (disposed) return;
-        const nodes = workspaceSetRef.current.workspaces.flatMap(candidate => Object.values(candidate.nodes))
-          .filter(node => node.kind !== 'scratchpad' && node.kind !== 'artifact' && !node.snapshotOf);
-        const next = reconcileSessions(nodes, listing.sessions, !listing.discovery_error);
-        setRecoveryState((previous) =>
-          JSON.stringify(previous) === JSON.stringify(next) ? previous : next
-        );
-        // Routing is independent of focus and pane geometry: parked sessions
-        // are still known nodes and must keep receiving live events.
-        for (const node of nodes) {
-          if (next.matched.includes(node.id) && knownIncarnation(node.incarnation)) {
-            ptyClient.setCachedHistoryBudget(node.id, node.tuiLines);
-            ptyClient.bindExisting(node.id, node.incarnation);
-          }
-        }
-        // Only after a reply that actually described the daemon. A failed or
-        // timed-out request must keep restored ids waiting rather than release
-        // them to spawn — see the catch below.
-        setReconciled(true);
-      } catch {
-        // A daemon restart is normal. The next interval asks again; recovery
-        // never turns a missing reply into an automatic spawn.
-      } finally { refreshing = false; }
-    };
-    const unbindConnection = ptyClient.onConnection(state => {
-      if (state.status === 'ready') void refresh();
-      else setReconciled(false);
-    });
-    void refresh();
-    // Longer than the request's 5 s timeout, so an unresponsive daemon cannot
-    // accumulate overlapping recovery requests.
-    const timer = window.setInterval(() => void refresh(), 6000);
-    return () => {
-      disposed = true;
-      window.clearInterval(timer);
-      unbindConnection();
-    };
-  }, []);
-
   useEffect(() => ptyClient.onIncarnation((id, incarnation) => {
     setEventWorkspace(previous => {
       const node = previous.nodes[id];
-      if (!node || node.snapshotOf || node.incarnation === incarnation) return previous;
+      if (!node || node.incarnation === incarnation) return previous;
       return { ...previous, nodes: { ...previous.nodes, [id]: { ...node, incarnation } } };
     });
   }), [setEventWorkspace]);
 
   useEffect(() => {
     if (needsWorkspaceChoice) return;
-    // Only nodes introduced by this run can request creation. Restored nodes
-    // must pass exact-incarnation reconciliation above, even when selected.
     for (const candidate of workspaceSet.workspaces) {
       for (const node of Object.values(candidate.nodes)) {
-        if (node.kind !== 'scratchpad' && node.kind !== 'artifact' && !node.snapshotOf && !restoredIds.current.has(node.id)) {
-          ptyClient.setCachedHistoryBudget(node.id, node.tuiLines);
+        if (node.kind !== 'scratchpad' && node.kind !== 'artifact') {
           ptyClient.ensureSession(node.id, node.cwd, node.incarnation);
         }
       }
@@ -327,8 +244,7 @@ export function useWorkspaceSet() {
 
   const cachedOnly = (node: SessionNode): boolean => {
     const status = ptyClient.getAttachmentState(node.id)?.status;
-    return !!node.snapshotOf || node.kind === 'scratchpad' || node.kind === 'artifact' || status === 'closed' || status === 'missing' || status === 'replaced'
-      || (restoredIds.current.has(node.id) && reconciled && recoveryState.snapshots.includes(node.id));
+    return node.kind === 'scratchpad' || node.kind === 'artifact' || status === 'closed' || status === 'missing' || status === 'replaced';
   };
 
   const handleCloseWorkspace = async (id: string) => {
@@ -389,43 +305,6 @@ export function useWorkspaceSet() {
 
   /** Restoring is selecting: it re-enters geometry and takes keyboard focus. */
   const handleRestoreNode = (nodeId: string) => handleSelectNode(nodeId);
-
-  const handleRecoverSession = async (session: RecoverableSession) => {
-    if (pendingRecoveries.current.has(session.id) || pendingClosures.current.has(session.id)) return;
-    const workspaceId = workspace.id;
-    const groupId = activeGroup.id;
-    pendingRecoveries.current.add(session.id);
-    try {
-      const incarnation = session.identity_status === 'unidentified'
-        ? await ptyClient.recoverLegacy(session)
-        : session.identity_status !== 'replaced' && knownIncarnation(session.incarnation) ? session.incarnation : null;
-      if (!incarnation) return; // A partial or replaced metadata record is not permission to adopt it.
-      const current = workspaceSetRef.current;
-      const existing = current.workspaces.find(w => w.nodes[session.id])?.nodes[session.id];
-      if (existing?.incarnation === incarnation && !existing.snapshotOf) {
-        ptyClient.bindExisting(session.id, incarnation);
-        handleSelectNode(session.id); return;
-      }
-      const snapshotId = uniqueId('snapshot');
-      const now = Date.now();
-      if (placeRecoveredSession(current, workspaceId, groupId, session, incarnation, snapshotId, now) === current) return;
-      // Copy the old presentation before disposing its parser. Never kill the
-      // old root, run the reported command, or submit a creation request here.
-      ptyClient.forgetSession(session.id); disposeEmulator(session.id);
-      disposeActivity(session.id); attentionQueue.dispose(session.id);
-      restoredIds.current.delete(session.id);
-      setWorkspaceSet(previous => placeRecoveredSession(previous, workspaceId, groupId, session, incarnation, snapshotId, now));
-      ptyClient.bindExisting(session.id, incarnation);
-      setRecoveryState(previous => ({ ...previous,
-        matched: [...previous.matched.filter(id => id !== session.id), session.id],
-        snapshots: previous.snapshots.filter(id => id !== session.id),
-        recoverable: previous.recoverable.filter(candidate => candidate.id !== session.id || candidate.incarnation !== session.incarnation),
-      }));
-    } catch {
-      // Identity assignment may have completed. Discovery is read-only; neither
-      // this catch nor reconnect retries adoption or changes the saved cache.
-    } finally { pendingRecoveries.current.delete(session.id); }
-  };
 
   const handleSetGroupLayout = (groupId: string, layout: SplitLayoutMode) => {
     setWorkspace((prev) => ({
@@ -553,63 +432,6 @@ export function useWorkspaceSet() {
     } finally { pendingClosures.current.delete(nodeId); }
   };
 
-  /**
-   * What may be done with this node's id right now: bind it, wait, or present
-   * it as a snapshot. See `sessionBinding`.
-   */
-  const bindingFor = useCallback(
-    (nodeId: string) =>
-      workspaceSet.workspaces.some(w => w.nodes[nodeId]?.snapshotOf) ? 'snapshot'
-        : sessionBinding(nodeId, restoredIds.current.has(nodeId), reconciled, recoveryState),
-    [workspaceSet, reconciled, recoveryState],
-  );
-
-  /** Explicit fresh creation has a fresh logical id. Keep the original cache
-   * and layout until the daemon confirms it; unknown outcomes are discoverable
-   * processes, never a reason to retry or erase the old view. */
-  const handleReviveNode = useCallback(async (nodeId: string) => {
-    const owner = workspaceSetRef.current.workspaces.find(candidate => candidate.nodes[nodeId]);
-    const original = owner?.nodes[nodeId];
-    if (!owner || !original || original.kind === 'scratchpad' || original.kind === 'artifact' || pendingClosures.current.has(nodeId)) return;
-    const status = ptyClient.getAttachmentState(nodeId)?.status;
-    if (status && !['missing', 'closed', 'replaced', 'disconnected', 'failed', 'incompatible'].includes(status)) return;
-    pendingClosures.current.add(nodeId);
-    const freshId = uniqueId('node');
-    const createdAt = Date.now();
-    try {
-      const incarnation = await ptyClient.createSession(freshId, BOOTSTRAP_COLS, BOOTSTRAP_ROWS, original.cwd);
-      const latest = workspaceSetRef.current.workspaces.find(candidate => candidate.id === owner.id)?.nodes[nodeId];
-      if (!latest || latest.incarnation !== original.incarnation) return;
-      ptyClient.forgetSession(nodeId);
-      disposeEmulator(nodeId); disposeActivity(nodeId); attentionQueue.dispose(nodeId);
-      restoredIds.current.delete(nodeId);
-      setWorkspaceSet(previous => {
-        const workspace = previous.workspaces.find(candidate => candidate.id === owner.id);
-        const old = workspace?.nodes[nodeId];
-        if (!workspace || !old || old.incarnation !== original.incarnation) return previous;
-        const nodes = { ...workspace.nodes }; delete nodes[nodeId];
-        nodes[freshId] = {
-          id: freshId, incarnation, groupId: old.groupId, title: old.title, number: old.number,
-          kind: 'terminal', cwd: old.cwd, gitBranch: '', activeBlockId: null, isTuiActive: false,
-          agentState: 'unknown', tuiLines: [], commandHistory: [], createdAt, parked: old.parked,
-        };
-        return replaceWorkspace(previous, { ...workspace, nodes, groups: workspace.groups.map(group => ({
-          ...group, nodeIds: group.nodeIds.map(id => id === nodeId ? freshId : id),
-          activeNodeId: group.activeNodeId === nodeId ? freshId : group.activeNodeId,
-          paneTree: group.paneTree ? replaceLeaf(group.paneTree, nodeId, freshId) : undefined,
-          zoomedSessionId: group.zoomedSessionId === nodeId ? freshId : group.zoomedSessionId,
-        })) });
-      });
-      setRecoveryState(previous => ({ ...previous,
-        snapshots: previous.snapshots.filter(id => id !== nodeId),
-        matched: previous.matched.filter(id => id !== nodeId),
-      }));
-    } catch {
-      // PtyClient reports refusal/uncertainty on the existing transient surface.
-      // The cached node, history and selection remain exactly as they were.
-    } finally { pendingClosures.current.delete(nodeId); }
-  }, []);
-
   const openOrUpdateArtifact = useCallback((artifact: ArtifactRecord, openPane = true) => {
     setWorkspace((prev) => {
       const existingEntry = Object.entries(prev.nodes).find(
@@ -706,9 +528,6 @@ export function useWorkspaceSet() {
     setEventWorkspace,
     activeGroup,
     activeNode,
-    recoveryState,
-    bindingFor,
-    handleReviveNode,
     handleCreateNode,
     handleRenameNode,
     handleOpenWorkspaceFolder,
@@ -719,7 +538,6 @@ export function useWorkspaceSet() {
     handleCloseWorkspace,
     handleSelectNode,
     handleRestoreNode,
-    handleRecoverSession,
     handleSetGroupLayout,
     handleSetPaneTree,
     handleEqualizePanes,

@@ -27,13 +27,32 @@ describe('v2 stream validation', () => {
     for (const patch of [{ incarnation: 'invented' }, { initial_cols: 0 }, { initial_rows: 1.5 }, { durable: 1 }]) {
       expect(() => parseStreamDescriptor({ ...descriptor, ...patch })).toThrow();
     }
-    expect(parseStreamRecord(record()).payload).toEqual({ type: 'Event', payload: { type: 'Output', payload: { data: '三' } } });
     for (const bad of [record('0'), { ...record(), observed_micros: -1 }, { ...record(), incarnation: 'F'.repeat(32) },
       record('1', { type: 'Resize', payload: { cols: 0, rows: 24 } }),
       record('1', { type: 'Event', payload: { type: 'ExecutionEnd', payload: { exit_code: '0' } } }),
       record('1', { type: 'Event', payload: { type: 'Output', payload: { data: 'x'.repeat(65536) } } }),
-      record('1', { type: 'Invented' }),
+      record('1', { type: 'Event', payload: 'not-an-object' }),
     ]) expect(() => parseStreamRecord(bad)).toThrow();
+  });
+
+  it('gracefully handles unknown DemuxEvent variants and record payloads without throwing', () => {
+    const unknownEvent = record('1', { type: 'Event', payload: { type: 'FutureDemuxEvent', payload: { x: 1 } } });
+    expect(parseStreamRecord(unknownEvent).payload).toEqual({
+      type: 'Event',
+      payload: { type: 'Unknown', payload: { variant: 'FutureDemuxEvent' } },
+    });
+
+    const unknownPayload = record('1', { type: 'InventedPayload', payload: { foo: 'bar' } });
+    expect(parseStreamRecord(unknownPayload).payload).toEqual({
+      type: 'Unknown',
+      payload: { variant: 'InventedPayload' },
+    });
+
+    const unknownFault = record('1', { type: 'Fault', payload: { reason: 'NewFaultReason' } });
+    expect(parseStreamRecord(unknownFault).payload).toEqual({
+      type: 'Fault',
+      payload: { reason: 'Unknown' },
+    });
   });
 
   it('charges the complete serialized record, including its identity envelope, to the byte limit', () => {

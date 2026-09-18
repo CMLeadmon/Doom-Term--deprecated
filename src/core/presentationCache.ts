@@ -1,7 +1,7 @@
 import type { AnsiLine, AnsiSpan } from '../types/terminal';
 
-export const ARCHIVE_BYTE_LIMIT = 8 * 1024 * 1024;
-export const ARCHIVE_LINE_LIMIT = 5000;
+export const CACHE_BYTE_LIMIT = 8 * 1024 * 1024;
+export const CACHE_LINE_LIMIT = 5000;
 export interface PresentationCache { lines: AnsiLine[]; bytes: number; truncated: boolean }
 const encoder = new TextEncoder();
 const color = (value: unknown): value is string => typeof value === 'string' && /^#[0-9a-f]{3}(?:[0-9a-f]{3})?$/i.test(value);
@@ -16,7 +16,7 @@ function presentationLine(value: unknown): AnsiLine | null {
   for (const valueSpan of value.spans) {
     if (!object(valueSpan) || typeof valueSpan.text !== 'string' || /[\r\n]/.test(valueSpan.text)) return null;
     characters += valueSpan.text.length;
-    if (characters > ARCHIVE_BYTE_LIMIT) return null;
+    if (characters > CACHE_BYTE_LIMIT) return null;
     const span: AnsiSpan = { text: valueSpan.text };
     if (color(valueSpan.fg)) span.fg = valueSpan.fg;
     if (color(valueSpan.bg)) span.bg = valueSpan.bg;
@@ -38,11 +38,11 @@ export function boundCachedLines(value: unknown): PresentationCache {
   let bytes = 2;
   let truncated = false;
   for (let index = value.length - 1; index >= 0; index--) {
-    if (lines.length === ARCHIVE_LINE_LIMIT) { truncated = true; break; }
+    if (lines.length === CACHE_LINE_LIMIT) { truncated = true; break; }
     const line = presentationLine(value[index]);
     if (!line) { truncated = true; break; }
     const charge = encoder.encode(JSON.stringify(line)).length + (lines.length ? 1 : 0);
-    if (bytes + charge > ARCHIVE_BYTE_LIMIT) { truncated = true; break; }
+    if (bytes + charge > CACHE_BYTE_LIMIT) { truncated = true; break; }
     lines.push(line); bytes += charge;
   }
   lines.reverse();

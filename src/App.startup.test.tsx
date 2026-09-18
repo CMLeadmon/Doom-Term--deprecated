@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen } from '@testing-library/react';
 
 // The plate is a canvas the reference renderer draws into, and the terminal
 // view measures a real font grid; neither exists under jsdom and neither is
@@ -87,22 +87,5 @@ describe('startup', () => {
     const picker = screen.getByRole('combobox', { name: /workspace path or folder filter/i });
     await act(async () => { await new Promise((resolve) => window.setTimeout(resolve, 40)); });
     expect(document.activeElement).toBe(picker);
-  });
-
-  it('does not replay a palette view action after a snapshot is revived', async () => {
-    vi.spyOn(ptyClient, 'getIsConnected').mockReturnValue(true);
-    vi.spyOn(ptyClient, 'listSessions').mockResolvedValue({ request_id: 'test', sessions: [] });
-    vi.spyOn(ptyClient, 'ensureSession').mockImplementation(() => {});
-    vi.spyOn(ptyClient, 'createSession').mockResolvedValue('a'.repeat(32));
-    store.set('DOOM_TERM_WORKSPACES_V2', storedSet());
-    render(<App />);
-
-    const revive = await screen.findByRole('button', { name: /start a new shell here/i });
-    fireEvent.keyDown(window, { key: 'k', ctrlKey: true });
-    fireEvent.click(await screen.findByRole('option', { name: /quick select developer reference/i }));
-    fireEvent.click(revive);
-
-    await waitFor(() => expect(screen.getByTestId('raw-terminal')).toBeDefined());
-    expect(renderedTerminal.request).toBeNull();
   });
 });

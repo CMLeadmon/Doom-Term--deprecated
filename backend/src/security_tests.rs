@@ -12,7 +12,7 @@ async fn server_with_token(
     std::env::set_var("DOOM_TERM_NO_TMUX", "1");
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let server = Arc::new(recovery::RecoveryServer::new().unwrap());
+    let server = Arc::new(gateway::Gateway::new().unwrap());
     let retained = server.hooks.clone();
     let task = tokio::spawn(async move {
         let (stream, peer) = listener.accept().await.unwrap();
@@ -212,7 +212,7 @@ fn a_non_loopback_doom_host_is_refused_before_it_can_bind() {
 async fn artifact_post_and_get_endpoints_work() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let server = Arc::new(recovery::RecoveryServer::new().unwrap());
+    let server = Arc::new(gateway::Gateway::new().unwrap());
     let server_clone = server.clone();
     tokio::spawn(async move {
         while let Ok((stream, peer)) = listener.accept().await {
@@ -355,7 +355,7 @@ async fn concurrent_server() -> SocketAddr {
     std::env::set_var("DOOM_TERM_NO_TMUX", "1");
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let server = Arc::new(recovery::RecoveryServer::new().unwrap());
+    let server = Arc::new(gateway::Gateway::new().unwrap());
     tokio::spawn(async move {
         while let Ok((stream, peer)) = listener.accept().await {
             let server = server.clone();

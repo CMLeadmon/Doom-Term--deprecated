@@ -129,7 +129,6 @@ describe('Frontend Visual & Design Invariants', () => {
       activeNode: mockNodes[0],
       workspaceName: 'TestWorkspace',
       nodes: mockNodes,
-      recoverableSessions: [],
       attention: {
         isAcknowledged: (id) => id !== 'n3', // n3 has unread output
       },
@@ -139,7 +138,6 @@ describe('Frontend Visual & Design Invariants', () => {
       onSetGroupLayout: () => {},
       onEqualizePanes: () => {},
       onSelectNode: () => {},
-      onRecoverSession: () => {},
       onViewAction: () => {},
     });
 

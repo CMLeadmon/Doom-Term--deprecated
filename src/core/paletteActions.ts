@@ -8,7 +8,6 @@ import {
   attentionRank, previewSession, rankSessions, sessionSearchText,
   type SwitcherAttention,
 } from './sessionSwitcher';
-import type { RecoverableSession } from './sessionRecovery';
 
 export interface PaletteContext {
   activeGroup: SessionGroup;
@@ -17,7 +16,6 @@ export interface PaletteContext {
   /** Every session across open workspaces. */
   nodes: SessionNode[];
   workspaceNames?: Record<string, string>;
-  recoverableSessions: RecoverableSession[];
   /**
    * The same acknowledgement state the plate's waiting rows read.
    *
@@ -32,7 +30,6 @@ export interface PaletteContext {
   onSetGroupLayout: (groupId: string, layout: SplitLayoutMode) => void;
   onEqualizePanes: (groupId: string) => void;
   onSelectNode: (nodeId: string) => void;
-  onRecoverSession: (session: RecoverableSession) => void;
   onCloseSession?: (nodeId: string) => void;
   onTogglePaneZoom?: () => void;
   onFocusPane?: (direction: 'left' | 'right' | 'up' | 'down') => void;
@@ -78,7 +75,6 @@ export function buildPaletteActions(ctx: PaletteContext): CommandPaletteAction[]
     activeGroup,
     activeNode,
     nodes,
-    recoverableSessions,
     workspaceName,
     setIsWorkspaceModalOpen,
     onCreateNode,
@@ -86,7 +82,6 @@ export function buildPaletteActions(ctx: PaletteContext): CommandPaletteAction[]
     onSetGroupLayout,
     onEqualizePanes,
     onSelectNode,
-    onRecoverSession,
     onCloseSession,
     onTogglePaneZoom,
     onFocusPane,
@@ -128,18 +123,8 @@ export function buildPaletteActions(ctx: PaletteContext): CommandPaletteAction[]
       run: () => onSelectNode(node.id),
     }));
 
-  const recoveries: CommandPaletteAction[] = recoverableSessions.map((session) => ({
-    id: `recover-${session.id}`,
-    category: 'Recovery',
-    title: `Recover ${session.id} · ${session.command || 'shell'}`,
-    searchText: `${session.id}\n${session.cwd}\n${session.command}`.toLowerCase(),
-    preview: `${session.cwd}\n${session.durable ? 'DURABLE TMUX SESSION' : 'LIVE DAEMON SESSION'}`,
-    run: () => onRecoverSession(session),
-  }));
-
   return [
     ...sessions,
-    ...recoveries,
     {
       id: 'rename-session',
       category: 'Session',

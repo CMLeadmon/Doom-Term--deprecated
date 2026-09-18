@@ -3,9 +3,8 @@ import { parseSequence, parseStreamDescriptor, parseStreamRecord } from './strea
 import type { ResumeCursor, StreamDescriptor } from './streamProtocol';
 import { StreamApplication } from './streamApplication';
 import type { StreamObservers } from './streamApplication';
-import { RecoveredArchive } from './recoveredArchive';
-import type { ArchiveState } from './recoveredArchive';
 import { parseGrid } from './terminalGeometry';
+import { diagnostics } from './diagnostics';
 
 type AttachKind = 'resume' | 'replay-from-start' | 'rebuild';
 type Refusal = 'missing' | 'closed' | 'replaced' | 'busy' | 'incompatible' | 'failed';
@@ -23,9 +22,7 @@ interface Options extends StreamObservers {
   openScreen(descriptor: StreamDescriptor): TerminalScreen;
   /** Capture the old presentation before openScreen replaces its live parser. */
   beforeReconstruction?: (kind: Exclude<AttachKind, 'resume'>) => void;
-  cachedHistoryBudget?: () => { bytes: number; lines: number };
   onState?: (state: Readonly<AttachmentState>) => void;
-  onArchive?: (archive: Readonly<ArchiveState>) => void;
   /** The owning transport must close on a malformed or timed-out handshake. */
   onFailure?: (reason: string) => void;
 }
@@ -40,7 +37,6 @@ function sameDescriptor(a: Readonly<StreamDescriptor>, b: Readonly<StreamDescrip
 export class SessionAttachment {
   private current: Readonly<AttachmentState> = Object.freeze({ status: 'disconnected', descriptor: null, reason: null, exitCode: null });
   private application: StreamApplication | null = null;
-  private archive: RecoveredArchive | null = null;
   private generation = 0;
   private connected = false;
   private disposed = false;
@@ -62,7 +58,6 @@ export class SessionAttachment {
     this.identity = Object.freeze({ ...identity });
   }
   get state(): Readonly<AttachmentState> { return this.current; }
-  get history(): Readonly<ArchiveState> | null { return this.archive?.state ?? null; }
   private update(patch: Partial<AttachmentState>): void {
     this.current = Object.freeze({ ...this.current, ...patch });
     this.options.onState?.(this.current);
@@ -75,7 +70,6 @@ export class SessionAttachment {
     this.attachmentId = null;
     this.application?.dispose();
     this.application = null;
-    this.archive?.disconnect();
     this.update({ status: 'failed', reason });
     this.options.onFailure?.(reason);
   }
@@ -83,7 +77,6 @@ export class SessionAttachment {
     try {
       if (this.connected && this.options.send(action, payload)) return true;
     } catch { /* A thrown send is an unknown outcome, never a reason to replay. */ }
-    this.fail('Connection failed; operation delivery is unknown');
     return false;
   }
   async attach(requestId: string): Promise<void> {
@@ -129,14 +122,6 @@ export class SessionAttachment {
       if (event !== 'StreamRecord' && (input.session_id !== this.identity.session_id || input.incarnation !== this.identity.incarnation)) return false;
     }
     try {
-      if (event.startsWith('History')) {
-        if (!this.archive || this.kind !== 'rebuild' || this.cut === null) throw new Error('Unexpected history');
-        // History is a separate optional presentation. A refused/incomplete
-        // archive must not corrupt the parser or deny otherwise valid output.
-        try { return this.archive.accept(event, input); }
-        catch { return true; }
-        finally { this.options.onArchive?.(this.archive.state); }
-      }
       if (event === 'AttachResult') return this.acceptResult(input);
       if (event === 'StreamBegin') return this.begin(input);
       if (event === 'StreamRecord') return this.record(input);
@@ -208,11 +193,6 @@ export class SessionAttachment {
       this.application = application;
     }
     if (!this.application) throw new Error('Missing parser');
-    if (this.kind === 'rebuild') {
-      this.archive?.disconnect();
-      this.archive = new RecoveredArchive({ ...this.identity, attachment_id: this.attachmentId! }, this.options.cachedHistoryBudget?.());
-      this.options.onArchive?.(this.archive.state);
-    }
     this.cut = cut.toString();
     this.receivedSequence = this.kind === 'resume' ? parseSequence(this.requestedCursor!.after_sequence) : 0n;
     this.update({ status: 'catching-up', descriptor: this.offered });
@@ -236,6 +216,25 @@ export class SessionAttachment {
     if (ended || fault || gap) {
       this.clearTimer();
       this.update({ status: ended ? 'closed' : 'unreconstructable' });
+    }
+    if (record.payload.type === 'Unknown') {
+      diagnostics.count('unknownVariants');
+      diagnostics.record({
+        kind: 'event',
+        name: 'variant:unknown',
+        sessionId: record.session_id,
+        requestId: null,
+        reason: record.payload.payload?.variant ?? 'Unknown payload',
+      });
+    } else if (record.payload.type === 'Event' && record.payload.payload.type === 'Unknown') {
+      diagnostics.count('unknownVariants');
+      diagnostics.record({
+        kind: 'event',
+        name: 'variant:unknown',
+        sessionId: record.session_id,
+        requestId: null,
+        reason: record.payload.payload.payload?.variant ?? 'Unknown event',
+      });
     }
     void application.apply(record, phase).then(() => {
       if (this.generation !== generation || !this.connected || this.application !== application) return;
@@ -294,8 +293,6 @@ export class SessionAttachment {
     this.connected = false;
     this.attachmentId = null;
     this.clearTimer();
-    this.archive?.disconnect();
-    if (this.archive) this.options.onArchive?.(this.archive.state);
     this.update({ status: 'disconnected' });
   }
   dispose(): void {

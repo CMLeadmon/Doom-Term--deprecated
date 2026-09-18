@@ -34,14 +34,12 @@ function context(onViewAction: ReturnType<typeof vi.fn>): PaletteContext {
     activeNode: node,
     workspaceName: 'Workspace',
     nodes: [node],
-    recoverableSessions: [],
     setIsWorkspaceModalOpen: vi.fn(),
     onCreateNode: vi.fn(),
     onRenameNode: vi.fn(),
     onSetGroupLayout: vi.fn(),
     onEqualizePanes: vi.fn(),
     onSelectNode: vi.fn(),
-    onRecoverSession: vi.fn(),
     onViewAction,
   };
 }

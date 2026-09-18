@@ -132,7 +132,6 @@ describe('stored workspaces', () => {
       stream_epoch: 'b'.repeat(32), appliedSequence: '123', pendingWrites: ['NEVER REPLAY'], atPrompt: true,
       executionSerial: 12, lastLiveExecutionEventId: 'old', lastHookEventId: 'old-ask', blockedOnUser: true,
       agentState: 'running', tuiLines: [{ id: 'line', timestamp: 1, spans: [{ text: 'CACHED OUTPUT' }] }],
-      snapshotOf: { sessionId: 'source', incarnation: 'c'.repeat(32) },
     });
     withLocalStorage({}, () => {
       vi.useFakeTimers();
@@ -143,7 +142,7 @@ describe('stored workspaces', () => {
         expect(saved).not.toMatch(/attachment_id|secret-lease|stream_epoch|appliedSequence|pendingWrites|NEVER REPLAY|executionSerial|lastLiveExecutionEventId|lastHookEventId|blockedOnUser|atPrompt/);
         const restored = readStoredWorkspaceSet()!.workspaces[0].nodes['node-1'];
         expect(restored).toMatchObject({ incarnation: 'a'.repeat(32), agentState: 'unknown',
-          tuiLines: workspace.nodes['node-1'].tuiLines, snapshotOf: { sessionId: 'source', incarnation: 'c'.repeat(32) } });
+          tuiLines: workspace.nodes['node-1'].tuiLines });
         expect(workspace.nodes['node-1'].agentState).toBe('running');
       } finally { vi.useRealTimers(); }
     });

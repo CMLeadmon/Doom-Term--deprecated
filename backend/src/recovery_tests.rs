@@ -1,5 +1,5 @@
 //! Real loopback sockets. Process fixtures use private profiles/tmux roots only.
-use crate::recovery::RecoveryServer;
+use crate::gateway::Gateway;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::{sync::Arc, time::Duration};
@@ -9,7 +9,7 @@ use tokio_tungstenite::{tungstenite::Message, MaybeTlsStream, WebSocketStream};
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 struct Fixture {
     url: String,
-    server: Arc<RecoveryServer>,
+    server: Arc<Gateway>,
     task: tokio::task::JoinHandle<()>,
 }
 impl Drop for Fixture {
@@ -99,95 +99,6 @@ async fn connect(fixture: &Fixture) -> Socket {
     .await;
     assert_eq!(receive(&mut ws).await["event"], "Negotiated");
     ws
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn explicit_legacy_recovery_identifies_only_the_observed_root_without_creating_or_attaching()
-{
-    if isolated_durable(
-        "explicit_legacy_recovery_identifies_only_the_observed_root_without_creating_or_attaching",
-    ) {
-        return;
-    }
-    let exe = doom_term_pty::tmux::resolve_tmux(None).unwrap();
-    let config = doom_term_pty::tmux::write_config().unwrap();
-    let created = std::process::Command::new(&exe)
-        .args([
-            "-f",
-            config.to_str().unwrap(),
-            "-L",
-            "doom-term",
-            "new-session",
-            "-d",
-            "-s",
-            "doom-legacy",
-            "-x",
-            "80",
-            "-y",
-            "24",
-            "/bin/sh",
-        ])
-        .status()
-        .unwrap();
-    assert!(created.success());
-    let handle = doom_term_pty::tmux::TmuxHandle::named(exe.clone(), "doom-legacy".into());
-    let pane = handle.query("#{pane_id}").unwrap().trim().to_string();
-    let pid = handle.pane_pid().unwrap();
-    let fixture = fixture().await;
-    let mut ws = connect(&fixture).await;
-    let recover = |request: &str, id: &str, root: u32| {
-        json!({"action":"RecoverLegacy","payload":{
-        "request_id":request,"id":id,"pane":pane,"root_pid":root}})
-    };
-    for (request, id, root) in [("wrong-id", "lega", pid), ("wrong-root", "legacy", pid + 1)] {
-        send(&mut ws, recover(request, id, root)).await;
-        let reply = event(&mut ws, "RecoverLegacyResult").await;
-        assert_eq!(reply["request_id"], request);
-        assert_eq!(reply["session_id"], id);
-        assert!(!reply["error"].is_null());
-        assert_eq!(
-            handle.query("IDENTITY=#{@doom-incarnation}").unwrap(),
-            "IDENTITY="
-        );
-    }
-    send(&mut ws, recover("adopt", "legacy", pid)).await;
-    let adopted = event(&mut ws, "RecoverLegacyResult").await;
-    assert!(adopted["error"].is_null(), "{adopted}");
-    let identity = adopted["incarnation"].as_str().unwrap();
-    assert_eq!(
-        handle.query("#{@doom-incarnation}").unwrap().trim(),
-        identity
-    );
-    assert_eq!(handle.pane_pid(), Some(pid));
-    assert!(
-        fixture.server.sessions.read().is_empty(),
-        "identification does not create an adapter or input lease"
-    );
-    send(&mut ws, recover("repeat", "legacy", pid)).await;
-    assert!(!event(&mut ws, "RecoverLegacyResult").await["error"].is_null());
-    assert_eq!(
-        handle.query("#{@doom-incarnation}").unwrap().trim(),
-        identity
-    );
-    ws.close(None).await.unwrap();
-    let mut next = connect(&fixture).await;
-    send(
-        &mut next,
-        json!({"action":"ListSessions","payload":{"request_id":"discover"}}),
-    )
-    .await;
-    let listing = event(&mut next, "SessionListing").await;
-    let recovered = listing["sessions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["id"] == "legacy")
-        .unwrap();
-    assert_eq!(recovered["incarnation"], identity);
-    assert_eq!(recovered["root_pid"], pid);
-    assert_eq!(recovered["identity_status"], "owned");
-    assert_eq!(recovered["stream"], Value::Null);
 }
 
 async fn event(ws: &mut Socket, wanted: &str) -> Value {
@@ -300,7 +211,7 @@ async fn recovery_create_attach_and_exact_cut_fence_real_child_input_between_two
 async fn fixture() -> Fixture {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let server = Arc::new(RecoveryServer::new().unwrap());
+    let server = Arc::new(Gateway::new().unwrap());
     let shared = server.clone();
     let task = tokio::spawn(async move {
         let mut connections = tokio::task::JoinSet::new();
@@ -590,36 +501,15 @@ async fn recovery_cold_attach_rebuilds_only_the_surviving_durable_incarnation() 
     assert_eq!(result["descriptor"]["initial_cols"], 91);
     assert_eq!(result["descriptor"]["initial_rows"], 27);
     assert_eq!(receive(&mut ws).await["event"], "StreamBegin");
-    let mut archive = None;
-    let mut chunks = 0;
-    let mut completed = false;
     let cut = loop {
         let message = receive(&mut ws).await;
         let data = &message["data"];
         match message["event"].as_str().unwrap() {
-            "HistoryBegin" => {
-                archive = Some(data["capture_id"].clone());
-                assert_eq!(data["potentially_overlapping"], true);
-            }
-            "HistoryChunk" => {
-                assert_eq!(archive.as_ref(), Some(&data["capture_id"]));
-                assert_eq!(data["ordinal"], chunks);
-                chunks += 1;
-            }
-            "HistoryComplete" => {
-                assert_eq!(archive.as_ref(), Some(&data["capture_id"]));
-                assert_eq!(data["chunks"], chunks);
-                completed = true;
-            }
             "StreamRecord" => {}
             "StreamCaughtUp" => break data["sequence"].clone(),
             other => panic!("unexpected recovery event {other}: {message}"),
         }
     };
-    assert!(
-        completed,
-        "an empty archive still needs explicit transfer completion"
-    );
     let attached = fixture
         .server
         .sessions
@@ -871,162 +761,6 @@ async fn recovery_disconnect_releases_ownership_even_while_an_accepted_write_is_
         child.is_alive(),
         "disconnect must neither replay the queued kill nor kill the process"
     );
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn recovery_closed_outcome_is_retained_without_retaining_or_removing_a_replacement_pty() {
-    if isolated(
-        "recovery_closed_outcome_is_retained_without_retaining_or_removing_a_replacement_pty",
-    ) {
-        return;
-    }
-    let fixture = fixture().await;
-    let mut ws = connect(&fixture).await;
-    let create = |shell: &str| json!({"action":"Create","payload":{"request_id":"create","id":"reused","cols":80,"rows":24,"shell":shell,"cwd":null}});
-    send(&mut ws, create("/bin/false")).await;
-    let old = event(&mut ws, "CreateResult").await["incarnation"].clone();
-    assert!(old.is_string());
-    tokio::time::timeout(Duration::from_secs(3), async {
-        while fixture.server.sessions.read().contains_key("reused") {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("closed PTY resources must move to a bounded tombstone");
-    let attach = json!({"action":"Attach","payload":{"request_id":"old","id":"reused","incarnation":old,"resume":null}});
-    send(&mut ws, attach.clone()).await;
-    let closed = event(&mut ws, "AttachResult").await;
-    assert_eq!(closed["outcome"], "closed");
-    assert_eq!(closed["exit_code"], 1);
-    send(&mut ws, create("/bin/cat")).await;
-    let new = event(&mut ws, "CreateResult").await["incarnation"].clone();
-    assert_ne!(old, new);
-    send(&mut ws, attach).await;
-    assert_eq!(event(&mut ws, "AttachResult").await["outcome"], "replaced");
-    assert!(fixture
-        .server
-        .sessions
-        .read()
-        .get("reused")
-        .unwrap()
-        .is_alive());
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn recovery_retains_a_natural_durable_pane_exit_as_unknown_status() {
-    if isolated_durable("recovery_retains_a_natural_durable_pane_exit_as_unknown_status") {
-        return;
-    }
-    use std::os::unix::fs::PermissionsExt;
-    let fixture = fixture().await;
-    // The root must outlive its own bootstrap. A shell that dies during create
-    // races the display-client handshake, which is the adapter-loss case this
-    // test exists to stay distinct from.
-    let dir = tempfile::tempdir().unwrap();
-    let script = dir.path().join("exit-when-told.sh");
-    let finish = dir.path().join("finish");
-    std::fs::write(
-        &script,
-        format!(
-            "#!/bin/sh\nwhile ! test -e '{}'; do sleep 0.01; done\nexit 0\n",
-            finish.display()
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let mut ws = connect(&fixture).await;
-    send(
-        &mut ws,
-        json!({"action":"Create","payload":{
-            "request_id":"create","id":"durable-exit","cols":80,"rows":24,
-            "shell":script,"cwd":null
-        }}),
-    )
-    .await;
-    let created = event(&mut ws, "CreateResult").await;
-    assert!(
-        created["error"].is_null(),
-        "a durable root that survives bootstrap must be created: {created}"
-    );
-    let incarnation = created["incarnation"].clone();
-    std::fs::write(&finish, []).unwrap();
-    tokio::time::timeout(Duration::from_secs(4), async {
-        while fixture.server.sessions.read().contains_key("durable-exit") {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("natural durable exit must become a tombstone");
-    send(
-        &mut ws,
-        json!({"action":"Attach","payload":{
-            "request_id":"closed","id":"durable-exit","incarnation":incarnation,"resume":null
-        }}),
-    )
-    .await;
-    let closed = event(&mut ws, "AttachResult").await;
-    assert_eq!(closed["outcome"], "closed");
-    assert_eq!(
-        closed["exit_code"],
-        Value::Null,
-        "tmux cannot prove the removed root's exit code"
-    );
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn recovery_retains_a_real_exit_even_if_a_rendering_fault_preceded_it() {
-    if isolated("recovery_retains_a_real_exit_even_if_a_rendering_fault_preceded_it") {
-        return;
-    }
-    use std::os::unix::fs::PermissionsExt;
-    let fixture = fixture().await;
-    let dir = tempfile::tempdir().unwrap();
-    let script = dir.path().join("exit-after-fault.sh");
-    let finish = dir.path().join("finish");
-    std::fs::write(
-        &script,
-        format!(
-            "#!/bin/sh\nwhile ! test -e '{}'; do sleep 0.01; done\nexit 7\n",
-            finish.display()
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let mut ws = connect(&fixture).await;
-    send(&mut ws, json!({"action":"Create","payload":{"request_id":"create","id":"faulted","cols":80,"rows":24,"shell":script}})).await;
-    let incarnation = event(&mut ws, "CreateResult").await["incarnation"].clone();
-    let child = fixture
-        .server
-        .sessions
-        .read()
-        .get("faulted")
-        .unwrap()
-        .clone();
-    child
-        .stream()
-        .append(doom_term_pty::stream::StreamPayload::Fault {
-            reason: doom_term_pty::stream::StreamFault::ControlTooLong,
-        })
-        .unwrap();
-    assert!(
-        child.is_alive(),
-        "a rendering failure is not a process exit"
-    );
-    std::fs::write(&finish, []).unwrap();
-    tokio::time::timeout(Duration::from_secs(3), async {
-        while fixture.server.sessions.read().contains_key("faulted") {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("the later real exit must release the PTY despite the ended rendering stream");
-    send(&mut ws, json!({"action":"Attach","payload":{"request_id":"attach","id":"faulted","incarnation":incarnation}})).await;
-    let closed = event(&mut ws, "AttachResult").await;
-    assert_eq!(closed["outcome"], "closed");
-    assert_eq!(closed["exit_code"], 7);
 }
 
 #[cfg(unix)]

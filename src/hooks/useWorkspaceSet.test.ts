@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { act, renderHook, waitFor } from '@testing-library/react';
+import { act, renderHook } from '@testing-library/react';
 import { useWorkspaceSet } from './useWorkspaceSet';
 import { usePtyEvents } from './usePtyEvents';
 import { ptyClient, type DemuxEventHandler } from '../core/ptyClient';
@@ -7,7 +7,6 @@ import { useState } from 'react';
 import type { AppTelemetry } from '../hud/state';
 import { closeDisposition } from '../core/sessionClose';
 import { leafSessionIds } from '../core/paneTree';
-import { BOOTSTRAP_COLS, BOOTSTRAP_ROWS } from '../core/emulatorRegistry';
 
 /**
  * jsdom's `localStorage` is shadowed here by Node's own experimental global,
@@ -66,123 +65,6 @@ const storedSet = () => JSON.stringify({
 });
 
 describe('first-run workspace choice', () => {
-  it('recovers a daemon-only owned identity by attachment, never create or command replay', async () => {
-    store.set(V2, storedSet());
-    const bind = vi.spyOn(ptyClient, 'bindExisting').mockReturnValue(true);
-    const create = vi.spyOn(ptyClient, 'createSession');
-    const ensure = vi.spyOn(ptyClient, 'ensureSession').mockImplementation(() => {});
-    const { result } = renderHook(() => useWorkspaceSet());
-    await act(async () => { await result.current.handleRecoverSession({ id: 'orphan', incarnation: 'a'.repeat(32),
-      durable: true, identity_status: 'owned', command: 'never execute this', cwd: '/survivor' }); });
-    expect(result.current.activeNode).toMatchObject({ id: 'orphan', incarnation: 'a'.repeat(32), agentState: 'unknown', commandHistory: [] });
-    expect(bind).toHaveBeenCalledWith('orphan', 'a'.repeat(32));
-    expect(create).not.toHaveBeenCalled();
-    expect(ensure.mock.calls.every(call => call[2] === 'a'.repeat(32))).toBe(true);
-  });
-
-  it('preserves a conflicting cached pane as a separately addressable snapshot when recovering its replacement', async () => {
-    const data = JSON.parse(storedSet());
-    const old = data.workspaces[0].nodes.n1;
-    old.incarnation = '1'.repeat(32); old.title = 'My cached work'; old.titleLocked = true;
-    old.tuiLines = [{ id: 'cache', timestamp: 1, spans: [{ text: 'OLD TRANSCRIPT' }] }];
-    store.set(V2, JSON.stringify(data));
-    const bind = vi.spyOn(ptyClient, 'bindExisting').mockReturnValue(true);
-    vi.spyOn(ptyClient, 'ensureSession').mockImplementation(() => {});
-    const kill = vi.spyOn(ptyClient, 'killSession');
-    const { result } = renderHook(() => useWorkspaceSet());
-    await act(async () => { await result.current.handleRecoverSession({ id: 'n1', incarnation: 'a'.repeat(32), durable: true, identity_status: 'owned' }); });
-    const cache = Object.values(result.current.workspace.nodes).find(node => node.id !== 'n1')!;
-    expect(cache).toMatchObject({ title: 'My cached work', titleLocked: true, number: 1, tuiLines: old.tuiLines,
-      snapshotOf: { sessionId: 'n1', incarnation: old.incarnation } });
-    expect(result.current.bindingFor(cache.id)).toBe('snapshot');
-    expect(result.current.activeNode).toMatchObject({ id: 'n1', incarnation: 'a'.repeat(32), number: 2, tuiLines: [], agentState: 'unknown' });
-    expect(leafSessionIds(result.current.activeGroup.paneTree!)).toEqual([cache.id, 'n1']);
-    expect(bind).toHaveBeenCalledWith('n1', 'a'.repeat(32));
-    expect(kill).not.toHaveBeenCalled();
-  });
-
-  it('waits for legacy identity confirmation, retaining caches after an uncertain result', async () => {
-    store.set(V2, storedSet());
-    let reject!: (error: Error) => void;
-    const recover = vi.spyOn(ptyClient, 'recoverLegacy').mockReturnValue(new Promise((_, fail) => { reject = fail; }));
-    const bind = vi.spyOn(ptyClient, 'bindExisting').mockReturnValue(true);
-    vi.spyOn(ptyClient, 'ensureSession').mockImplementation(() => {});
-    const { result } = renderHook(() => useWorkspaceSet());
-    const before = result.current.workspace;
-    const target = { id: 'n1', durable: true, identity_status: 'unidentified' as const, pane: '%7', root_pid: 123 };
-    let pending!: Promise<void>;
-    act(() => { pending = Promise.resolve(result.current.handleRecoverSession(target)); });
-    expect(result.current.workspace).toBe(before);
-    act(() => { void result.current.handleRecoverSession(target); });
-    expect(recover).toHaveBeenCalledTimes(1);
-    await act(async () => { reject(new Error('Unknown')); await pending; });
-    expect(result.current.workspace).toBe(before);
-    expect(bind).not.toHaveBeenCalled();
-  });
-
-  it('keeps the original cached pane when explicit revival is refused or uncertain', async () => {
-    const stored = JSON.parse(storedSet());
-    stored.workspaces[0].nodes.n1.tuiLines = [{ id: 'cached', spans: [{ text: 'keep this transcript' }], timestamp: 0 }];
-    store.set(V2, JSON.stringify(stored));
-    const create = vi.spyOn(ptyClient, 'createSession').mockRejectedValue(new Error('Delivery unknown'));
-    const ensure = vi.spyOn(ptyClient, 'ensureSession').mockImplementation(() => {});
-    const { result } = renderHook(() => useWorkspaceSet());
-    const before = result.current.activeNode;
-    await act(async () => { await result.current.handleReviveNode('n1'); });
-    expect(result.current.activeNode).toEqual(before);
-    expect(create).toHaveBeenCalledExactlyOnceWith(expect.not.stringMatching(/^n1$/), BOOTSTRAP_COLS, BOOTSTRAP_ROWS, '/home/u/proj');
-    expect(ensure).not.toHaveBeenCalled();
-  });
-  it('replaces only the original cached pane after confirmed Create even if workspace focus moves', async () => {
-    store.set(V2, storedSet());
-    let confirm!: (incarnation: string) => void;
-    const create = vi.spyOn(ptyClient, 'createSession').mockReturnValue(new Promise(resolve => { confirm = resolve; }));
-    vi.spyOn(ptyClient, 'ensureSession').mockImplementation(() => {});
-    const { result } = renderHook(() => useWorkspaceSet());
-    const before = result.current.activeNode;
-    let pending!: Promise<void>;
-    act(() => { pending = Promise.resolve(result.current.handleReviveNode('n1')); });
-    expect(result.current.activeNode).toBe(before);
-    act(() => { result.current.handleReviveNode('n1'); result.current.handleOpenWorkspaceFolder('/visible'); });
-    const visible = result.current.workspaceSet.activeWorkspaceId;
-    expect(create).toHaveBeenCalledTimes(1);
-    await act(async () => { confirm('a'.repeat(32)); await pending; });
-    const originalWorkspace = result.current.workspaceSet.workspaces.find(w => w.id === 'w')!;
-    const id = create.mock.calls[0][0];
-    expect(id).not.toBe('n1');
-    expect(originalWorkspace.nodes.n1).toBeUndefined();
-    expect(originalWorkspace.nodes[id]).toMatchObject({ incarnation: 'a'.repeat(32), tuiLines: [], agentState: 'unknown', cwd: '/home/u/proj', number: 1 });
-    expect(leafSessionIds(originalWorkspace.groups[0].paneTree!)).toEqual([id]);
-    expect(result.current.workspaceSet.activeWorkspaceId).toBe(visible);
-  });
-  it('binds exact restored incarnations in background and parked workspaces before focus, never scratchpads or legacy ids', async () => {
-    const data = JSON.parse(storedSet());
-    data.workspaces[0].nodes.n1.incarnation = '1'.repeat(32);
-    const background = structuredClone(data.workspaces[0]);
-    background.id = 'background';
-    background.nodes = {
-      parked: { ...background.nodes.n1, id: 'parked', parked: true },
-      scratch: { ...background.nodes.n1, id: 'scratch', kind: 'scratchpad' },
-      legacy: { ...background.nodes.n1, id: 'legacy', incarnation: undefined },
-    };
-    background.groups[0].nodeIds = ['scratch']; background.groups[0].activeNodeId = 'scratch';
-    background.groups[0].paneTree = { type: 'leaf', sessionId: 'scratch' };
-    data.workspaces.push(background); store.set(V2, JSON.stringify(data));
-    const connected = vi.spyOn(ptyClient, 'getIsConnected').mockReturnValue(true);
-    const listing = vi.spyOn(ptyClient, 'listSessions').mockResolvedValue({ request_id: 'fixture', sessions:
-      ['n1', 'parked', 'scratch', 'legacy'].map(id => ({ id, incarnation: '1'.repeat(32), durable: true })) });
-    const bind = vi.spyOn(ptyClient, 'bindExisting').mockReturnValue(true);
-    const create = vi.spyOn(ptyClient, 'createSession');
-    try {
-      const { result, unmount } = renderHook(() => useWorkspaceSet());
-      await waitFor(() => expect(bind).toHaveBeenCalledWith('parked', '1'.repeat(32)));
-      expect(bind).toHaveBeenCalledWith('n1', '1'.repeat(32));
-      expect(bind.mock.calls.map(args => args[0])).not.toContain('scratch');
-      expect(bind.mock.calls.map(args => args[0])).not.toContain('legacy');
-      expect(result.current.activeNode.id).toBe('n1'); expect(create).not.toHaveBeenCalled();
-      expect(result.current.bindingFor('legacy')).toBe('snapshot'); unmount();
-    } finally { connected.mockRestore(); listing.mockRestore(); bind.mockRestore(); create.mockRestore(); }
-  });
   it('repairs duplicate restored numbers while preserving already unique slots', () => {
     const stored = JSON.parse(storedSet());
     const other = structuredClone(stored.workspaces[0]);
@@ -241,6 +123,7 @@ describe('first-run workspace choice', () => {
   it('keeps a node and its cached lines when an explicit Kill is refused or uncertain', async () => {
     store.set(V2, storedSet());
     vi.spyOn(ptyClient, 'killSession').mockResolvedValue(false);
+    vi.spyOn(ptyClient, 'ensureSession').mockImplementation(() => {});
     const create = vi.spyOn(ptyClient, 'createSession');
     const { result } = renderHook(() => useWorkspaceSet());
     await act(async () => { await result.current.handleKillNode('n1'); });
@@ -425,11 +308,11 @@ describe('first-run workspace choice', () => {
   });
 
   it('gives the chosen folder a session that may be bound', () => {
-    // Nothing about it came off disk, so it must not wait on recovery and must
-    // never be drawn as a snapshot of a session that never existed.
+    // Nothing about it came off disk, so it has an initialized session ready.
     const { result } = renderHook(() => useWorkspaceSet());
     act(() => result.current.chooseStartupWorkspace('/home/u/proj'));
-    expect(result.current.bindingFor(result.current.activeNode.id)).toBe('ready');
+    expect(result.current.activeNode.id).toBeDefined();
+    expect(result.current.activeNode.agentState).toBe('idle');
   });
 
   it('opens HOME with a live session when the picker is dismissed', () => {
@@ -438,7 +321,7 @@ describe('first-run workspace choice', () => {
     act(() => result.current.dismissStartupChoice());
     expect(result.current.needsWorkspaceChoice).toBe(false);
     expect(result.current.workspace.rootPath).toBe('~');
-    expect(result.current.bindingFor(result.current.activeNode.id)).toBe('ready');
+    expect(result.current.activeNode.id).toBeDefined();
   });
 
   it('remembers nothing while the choice is owed', () => {

@@ -68,8 +68,17 @@ describe('stream protocol contract', () => {
     }
   });
 
-  it('still rejects a type the daemon cannot emit', () => {
-    expect(() => parseStreamRecord(record({ type: 'NotARealEvent' }))).toThrow();
+  it('parses unknown event types as Unknown without throwing', () => {
+    const parsed = parseStreamRecord(record({ type: 'NotARealEvent' }));
+    expect(parsed.payload).toEqual({
+      type: 'Event',
+      payload: { type: 'Unknown', payload: { variant: 'NotARealEvent' } },
+    });
+  });
+
+  it('still rejects malformed event shapes', () => {
+    expect(() => parseStreamRecord(record({ type: 'Output', payload: { data: 123 } }))).toThrow();
+    expect(() => parseStreamRecord(record({ type: 'ExecutionEnd', payload: { exit_code: 'not-a-number' } }))).toThrow();
   });
 
   it('carries a remote enrichment payload through intact', () => {

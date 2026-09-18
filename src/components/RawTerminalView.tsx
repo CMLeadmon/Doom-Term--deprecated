@@ -22,8 +22,6 @@ import { findQuickTargets, labelTargets } from '../core/quickSelect';
 import { isModalKeyboardOwned } from '../core/modalKeyboard';
 import { QuickSelectOverlay } from './QuickSelectOverlay';
 import type { MutationIdentity } from '../core/sessionAttachment';
-import type { RecoveredHistoryPresentation } from '../types/sessionTree';
-import { RecoveredHistory } from './RecoveredHistory';
 
 interface RawTerminalViewProps {
   lines: AnsiLine[];
@@ -54,9 +52,6 @@ interface RawTerminalViewProps {
   viewActionRequest?: ViewActionRequest | null;
   /** Clear a request after this pane accepts it, before a later remount. */
   onViewActionHandled?: (requestId: number) => void;
-  recoveredHistory?: RecoveredHistoryPresentation;
-  recoveryCacheLines?: readonly AnsiLine[];
-  recoveryCacheTruncated?: boolean;
 }
 
 /** Gutter width. Reserved from the grid so the shell never wraps early. */
@@ -274,9 +269,6 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
   cursor = null,
   viewActionRequest = null,
   onViewActionHandled,
-  recoveredHistory,
-  recoveryCacheLines = [],
-  recoveryCacheTruncated,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -966,8 +958,6 @@ export const RawTerminalView: React.FC<RawTerminalViewProps> = ({
           overflowAnchor: 'none',
         }}
       >
-        {recoveredHistory && <RecoveredHistory cache={recoveryCacheLines}
-          cacheTruncated={recoveryCacheTruncated} history={recoveredHistory} />}
         {lines.map((line, i) => {
           const isCursorHere = isActive && cursor && cursor.visible !== false
             ? (line.row !== undefined ? cursor.row === line.row : cursor.row === i)

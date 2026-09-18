@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { looksLikeAbsolutePath, type PtyClient } from './ptyClient';
 import { getEmulator, resetAllEmulators } from './emulatorRegistry';
-import { recoveryFixture, TEST_INCARNATION } from '../test/recoveryFixture';
+import { daemonFixture, TEST_INCARNATION } from '../test/daemonFixture';
 
 const clients: PtyClient[] = [];
-function fixture() { const result = recoveryFixture(); clients.push(result.client); return result; }
+function fixture() { const result = daemonFixture(); clients.push(result.client); return result; }
 afterEach(() => { clients.splice(0).forEach(client => client.dispose()); resetAllEmulators(); vi.useRealTimers(); });
 
 describe('negotiated telemetry requests', () => {
@@ -125,15 +125,6 @@ describe('session inventory correlation', () => {
     const request = sockets[0].actions('BrowseDirectory')[0];
     sockets[0].receive('DirectoryListing', { request_id: request.payload.request_id, current_path: '/fixture', entries: [], error: 'Directory unavailable', truncated: true });
     await check;
-  });
-  it('correlates a listing by request id without executing its reported command', async () => {
-    const { client, sockets } = fixture(); sockets[0].open();
-    const pending = client.listSessions(); const request = sockets[0].actions('ListSessions')[0];
-    sockets[0].receive('SessionListing', { request_id: 'wrong', sessions: [] });
-    sockets[0].receive('SessionListing', { request_id: request.payload.request_id,
-      sessions: [{ id: 'orphan', incarnation: TEST_INCARNATION, cwd: '/repo', command: 'codex', durable: true }] });
-    await expect(pending).resolves.toMatchObject({ sessions: [{ id: 'orphan' }] });
-    expect(sockets[0].actions('Create')).toEqual([]); expect(sockets[0].actions('Attach')).toEqual([]);
   });
 });
 describe('explicit command submission', () => {

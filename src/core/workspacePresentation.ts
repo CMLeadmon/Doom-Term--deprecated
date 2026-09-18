@@ -1,6 +1,8 @@
 import type { PaneTree, SessionNode, WorkspaceSet } from '../types/sessionTree';
 import { boundCachedLines } from './presentationCache';
-import { knownIncarnation } from './sessionRecovery';
+
+const knownIncarnation = (value: unknown): value is string =>
+  typeof value === 'string' && /^[0-9a-f]{32}$/.test(value);
 
 function presentationTree(tree: PaneTree | undefined, depth = 0): PaneTree | undefined {
   if (!tree || depth > 64) return undefined;
@@ -14,14 +16,10 @@ function presentationTree(tree: PaneTree | undefined, depth = 0): PaneTree | und
 
 function presentationNode(node: SessionNode): SessionNode {
   const cache = boundCachedLines(node.tuiLines);
-  const snapshot = node.snapshotOf;
   return {
     id: node.id, groupId: node.groupId, title: node.title, titleLocked: node.titleLocked,
     number: node.number, kind: node.kind, cwd: node.cwd, gitBranch: node.gitBranch,
     ...(knownIncarnation(node.incarnation) ? { incarnation: node.incarnation } : {}),
-    ...(snapshot && typeof snapshot.sessionId === 'string' && /^[a-zA-Z0-9_-]{1,256}$/.test(snapshot.sessionId)
-      ? { snapshotOf: { sessionId: snapshot.sessionId,
-        ...(knownIncarnation(snapshot.incarnation) ? { incarnation: snapshot.incarnation } : {}) } } : {}),
     activeBlockId: null, isTuiActive: false, agentState: 'unknown',
     tuiLines: cache.lines, cacheTruncated: node.cacheTruncated === true || cache.truncated,
     commandHistory: Array.isArray(node.commandHistory) ? node.commandHistory.filter(command => typeof command === 'string') : [],

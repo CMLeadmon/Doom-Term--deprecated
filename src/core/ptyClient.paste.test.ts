@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { recoveryFixture, TEST_INCARNATION } from '../test/recoveryFixture';
+import { daemonFixture, TEST_INCARNATION } from '../test/daemonFixture';
 import { resetAllEmulators } from './emulatorRegistry';
 
-let fixture: ReturnType<typeof recoveryFixture>;
-beforeEach(() => { fixture = recoveryFixture(); fixture.client.bindExisting('pane', TEST_INCARNATION); });
+let fixture: ReturnType<typeof daemonFixture>;
+beforeEach(() => { fixture = daemonFixture(); fixture.client.bindExisting('pane', TEST_INCARNATION); });
 afterEach(() => { fixture.client.dispose(); resetAllEmulators(); vi.useRealTimers(); });
 async function connect() {
   fixture.sockets[0].open(); await fixture.sockets[0].ready('pane');

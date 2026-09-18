@@ -34,12 +34,6 @@ pub enum Client {
         incarnation: Identity,
         resume: Option<ResumeCursor>,
     },
-    RecoverLegacy {
-        request_id: String,
-        id: String,
-        pane: String,
-        root_pid: u32,
-    },
     StreamApplied {
         id: String,
         incarnation: Identity,
@@ -160,11 +154,6 @@ pub fn parse(text: &str) -> Result<Client, &'static str> {
         }
         Client::Attach { request_id, id, .. } | Client::Kill { request_id, id, .. } => {
             request(request_id) && valid_id(id)
-        }
-        Client::RecoverLegacy { request_id, id, pane, root_pid } => {
-            request(request_id) && valid_id(id) && *root_pid > 0
-                && pane.starts_with('%') && pane.len() > 1 && pane.len() <= 21
-                && pane[1..].bytes().all(|byte| byte.is_ascii_digit())
         }
         Client::StreamApplied { id, .. } => valid_id(id),
         Client::Write { id, data, .. } => valid_id(id) && data.len() <= 65536,

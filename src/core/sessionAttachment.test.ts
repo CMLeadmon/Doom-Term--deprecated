@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { SessionAttachment } from './sessionAttachment';
 import { XtermScreen } from './xtermScreen';
 import type { StreamDescriptor, StreamPayload } from './streamProtocol';
+import { diagnostics } from './diagnostics';
 
 const descriptor: StreamDescriptor = { session_id: 'pane', incarnation: '1'.repeat(32), stream_epoch: '2'.repeat(32),
   clock_epoch: '3'.repeat(32), initial_cols: 40, initial_rows: 10, durable: true };
@@ -181,22 +182,25 @@ describe('one exact session attachment', () => {
     expect(f.text()).toBe('');
   });
 
-  it('receives rebuilt history separately, with cached-budget accounting and no live parser side effects', async () => {
-    const f = fixture(); await f.attachment.attach('attach-1'); f.result('attach-1', 'rebuild'); f.begin('1', 'rebuild');
-    const capture = { ...bound, capture_id: '6'.repeat(32) };
-    f.accept('HistoryBegin', { ...capture, cols: 80, rows: 24, bytes: 8, lines: 1, chunks: 1,
-      history_at_limit: false, potentially_overlapping: true, potentially_incomplete: true });
-    f.accept('HistoryChunk', { ...capture, ordinal: 0, data: '\x1b[31mOLD' });
-    f.accept('HistoryComplete', { ...capture, bytes: 8, chunks: 1 });
-    expect(f.attachment.history).toMatchObject({ status: 'complete', data: '\x1b[31mOLD' });
-    expect(f.text()).toBe('');
-    f.record('1', output('LIVE')); f.caughtUp('1'); await f.ack(); f.ready('1');
-    expect(f.text()).toBe('LIVE');
-    expect(screens.at(-1)!.getLines()[0].spans[0].fg).not.toBe('#cd0000');
-  });
-
   it('does not authorize a generic input mutation through the read-only lifecycle path', async () => {
     const f = fixture(); await f.attachment.attach('attach-1'); f.result('attach-1', 'unreconstructable');
     expect(f.attachment.mutate('Write', { data: 'unsafe' }, false)).toBe(false);
+  });
+
+  it('gracefully skips unknown DemuxEvent variants and increments diagnostics without failing the attachment', async () => {
+    diagnostics.clear();
+    const f = fixture();
+    await f.attachment.attach('attach-1');
+    f.result('attach-1', 'replay-from-start');
+    f.begin('2');
+    f.record('1', { type: 'Event', payload: { type: 'FutureDemuxEvent', payload: { foo: 'bar' } } } as unknown as StreamPayload);
+    f.record('2', output('HELLO'));
+    f.caughtUp('2');
+    await f.ack();
+    f.ready('2');
+
+    expect(f.attachment.state.status).toBe('ready');
+    expect(f.text()).toBe('HELLO');
+    expect(diagnostics.snapshot().counters.unknownVariants).toBe(1);
   });
 });

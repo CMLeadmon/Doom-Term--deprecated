@@ -1,20 +1,17 @@
 import type { SystemTelemetryData } from '../types/terminal';
 import { BOOTSTRAP_COLS, BOOTSTRAP_ROWS, replaceEmulator } from './emulatorRegistry';
-import type { RecoverableSession } from './sessionRecovery';
 import { assertClipboardSize } from './terminalSelection';
-import { RecoveryConnection } from './recoveryConnection';
-import type { ConnectionState, RecoverySocket } from './recoveryConnection';
+import { DaemonConnection } from './daemonConnection';
+import type { ConnectionState, DaemonSocket } from './daemonConnection';
 import { SessionAttachment } from './sessionAttachment';
 import type { AttachmentState, MutationIdentity } from './sessionAttachment';
 import type { AppliedContext } from './streamApplication';
 import type { StreamRecord } from './streamProtocol';
-import type { ArchiveState } from './recoveredArchive';
 import { parseGrid } from './terminalGeometry';
-import { boundCachedLines } from './presentationCache';
+import { diagnostics } from './diagnostics';
 
 export interface DirectoryEntry { name: string; path: string; is_dir: boolean; is_git_repo: boolean }
 export interface DirectoryListing { request_id: string; current_path: string; parent_path?: string; entries: DirectoryEntry[]; truncated?: boolean }
-export interface SessionListing { request_id: string; sessions: RecoverableSession[]; discovery_error?: string | null }
 export interface AgentHookEvent {
   agent: string; event: 'PermissionRequest' | 'Stop'; cwd: string | null;
   doomSessionId: string; incarnation: string; eventId: string; phase: 'catch-up' | 'live';
@@ -70,7 +67,7 @@ function identity(value: unknown): value is string { return typeof value === 'st
  * attachment-scoped, and no input or accepted creation is queued for replay. */
 export class PtyClient {
   private static instance: PtyClient;
-  private readonly connection: RecoveryConnection;
+  private readonly connection: DaemonConnection;
   private readonly isTauri: boolean;
   private activeSessionId = '';
   private nextRequestId = 0;
@@ -88,20 +85,18 @@ export class PtyClient {
   private connectionHandlers = new Set<(state: Readonly<ConnectionState>) => void>();
   private attachmentHandlers = new Set<(id: string, state: Readonly<AttachmentState>) => void>();
   private incarnationHandlers = new Set<(id: string, incarnation: string) => void>();
-  private historyHandlers = new Set<(id: string, state: Readonly<ArchiveState>) => void>();
-  private cachedHistoryBudgets = new Map<string, { bytes: number; lines: number }>();
   private hooks = new Map<string, { event: AgentHookEvent; bytes: number }>();
   private hookBytes = 0;
   private sessionModeHandlers = new Set<(id: string, durable: boolean, detail: string | null) => void>();
   private artifactHandlers = new Set<(artifact: ArtifactRecord, openPane: boolean, phase: string) => void>();
 
-  constructor(options: { socket?: () => RecoverySocket } = {}) {
+  constructor(options: { socket?: () => DaemonSocket } = {}) {
     this.isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
-    this.connection = new RecoveryConnection({
+    this.connection = new DaemonConnection({
       socket: options.socket ?? (() => {
         const host = this.isTauri ? '127.0.0.1' : window.location.hostname || '127.0.0.1';
         // Callbacks installed below consume only message.data or no event fields.
-        return new WebSocket('ws://' + host + ':1421') as unknown as RecoverySocket;
+        return new WebSocket('ws://' + host + ':1421') as unknown as DaemonSocket;
       }),
       onMessage: (event, data) => this.handleServerMessage(event, data),
       onState: state => {
@@ -139,13 +134,6 @@ export class PtyClient {
   onIncarnation(handler: (id: string, incarnation: string) => void): () => void {
     this.incarnationHandlers.add(handler); return () => this.incarnationHandlers.delete(handler);
   }
-  onHistory(handler: (id: string, state: Readonly<ArchiveState>) => void): () => void {
-    this.historyHandlers.add(handler); return () => this.historyHandlers.delete(handler);
-  }
-  setCachedHistoryBudget(id: string, lines: unknown): void {
-    const cache = boundCachedLines(lines);
-    this.cachedHistoryBudgets.set(id, { bytes: cache.bytes, lines: cache.lines.length });
-  }
   registerHandler(handler: DemuxEventHandler): () => void {
     this.globalHandlers.add(handler); this.replayHooks(undefined, handler);
     return () => this.globalHandlers.delete(handler);
@@ -171,7 +159,6 @@ export class PtyClient {
     return descriptor ? { durable: descriptor.durable, detail: descriptor.durable ? null : 'Direct PTY; daemon restart cannot preserve this process' } : null;
   }
   getAttachmentState(id: string): Readonly<AttachmentState> | null { return this.bindings.get(id)?.attachment?.state ?? null; }
-  getHistory(id: string): Readonly<ArchiveState> | null { return this.bindings.get(id)?.attachment?.history ?? null; }
   private notify(id: string, callback: (handler: DemuxEventHandler) => void): void {
     this.sessionHandlers.get(id)?.forEach(callback); this.globalHandlers.forEach(callback);
   }
@@ -218,8 +205,6 @@ export class PtyClient {
     binding.attachment = new SessionAttachment({ session_id: id, incarnation: binding.incarnation! }, {
       send: (action, payload) => this.connection.send(action, payload) === 'sent',
       openScreen: descriptor => replaceEmulator(id, descriptor.initial_cols, descriptor.initial_rows),
-      cachedHistoryBudget: () => this.cachedHistoryBudgets.get(id) ?? { bytes: 0, lines: 0 },
-      onArchive: state => this.historyHandlers.forEach(handler => handler(id, state)),
       onRecord: (record, context) => {
         this.notify(id, handler => handler.onStreamRecord?.(record, context));
         if (record.payload.type === 'Closed') this.notify(id, handler => handler.onSessionClosed?.(id));
@@ -235,9 +220,15 @@ export class PtyClient {
         this.attachmentHandlers.forEach(handler => handler(id, state));
         if (state.descriptor) this.sessionModeHandlers.forEach(handler => handler(id, state.descriptor!.durable, this.getSessionMode(id)?.detail ?? null));
         if (state.status === 'closed') this.rejectRequests('Session closed', id, true);
+        if (state.status === 'ready') binding.reason = undefined;
         if (terminalStates.has(state.status)) { this.attaching.delete(id); this.pumpBindings(); }
       },
-      onFailure: reason => this.connection.restart(reason),
+      onFailure: reason => {
+        diagnostics.record({ kind: 'transition', name: 'attachment:failed', sessionId: id, requestId: null, reason });
+        diagnostics.count('attachmentsFaulted');
+        this.attaching.delete(id);
+        binding.attempted = false;
+      },
     });
     const size = this.sessionSizes.get(id);
     if (size) binding.attachment.resize(size.cols, size.rows);
@@ -263,7 +254,23 @@ export class PtyClient {
     if (!/^[a-zA-Z0-9_-]{1,256}$/.test(id)) return Promise.reject(new Error('Invalid session id'));
     try { parseGrid(cols, rows); } catch (error) { return Promise.reject(error); }
     const binding: Binding = { id, attempted: false };
-    const created = new Promise<string>((resolve, reject) => { binding.create = { cols, rows, cwd, shell, status: 'unsent', resolve, reject }; });
+    const created = new Promise<string>((resolve, reject) => {
+      const unsentTimer = setTimeout(() => {
+        if (binding.create && binding.create.status === 'unsent') {
+          binding.create.status = 'failed';
+          const reason = 'Session creation timed out; daemon not connected';
+          binding.reason = reason;
+          this.creating.delete(binding.create);
+          reject(new Error(reason));
+          this.refused(id, reason);
+        }
+      }, 5000);
+      binding.create = {
+        cols, rows, cwd, shell, status: 'unsent',
+        resolve: inc => { clearTimeout(unsentTimer); resolve(inc); },
+        reject: err => { clearTimeout(unsentTimer); reject(err); },
+      };
+    });
     // A caller can consume UI refusal state without awaiting a launch. Preserve
     // rejection for awaiting callers while observing it internally as well.
     void created.catch(() => undefined);
@@ -301,8 +308,26 @@ export class PtyClient {
         }).finally(() => { this.creating.delete(intent); this.pumpBindings(); });
       }
       if (binding.attachment && !binding.attempted && this.attaching.size < 4) {
-        binding.attempted = true; this.attaching.add(binding.id);
-        void binding.attachment.attach('attach-' + this.nextRequestId++).catch(() => this.connection.restart('Attachment failed; no input was replayed'));
+        binding.attempted = true;
+        this.attaching.add(binding.id);
+        const leaseTimer = setTimeout(() => {
+          if (this.attaching.has(binding.id)) {
+            this.attaching.delete(binding.id);
+            this.pumpBindings();
+          }
+        }, 10000);
+        void binding.attachment.attach('attach-' + this.nextRequestId++).catch(error => {
+          clearTimeout(leaseTimer);
+          diagnostics.record({
+            kind: 'refusal',
+            name: 'attach:rejected',
+            sessionId: binding.id,
+            requestId: null,
+            reason: (error as Error)?.message ?? 'Attach rejected',
+          });
+          this.attaching.delete(binding.id);
+          binding.attempted = false;
+        });
       }
     }
   }
@@ -370,7 +395,18 @@ export class PtyClient {
       return;
     }
     const id = event === 'StreamRecord' ? object(data.record).session_id : data.session_id;
-    if (typeof id === 'string') this.bindings.get(id)?.attachment?.accept(event, data);
+    if (typeof id === 'string') {
+      const accepted = this.bindings.get(id)?.attachment?.accept(event, data);
+      if (accepted) return;
+    }
+    diagnostics.count('unknownEvents');
+    diagnostics.record({
+      kind: 'event',
+      name: 'event:unknown',
+      sessionId: typeof id === 'string' ? id : null,
+      requestId: typeof data.request_id === 'string' ? data.request_id : null,
+      reason: event,
+    });
   }
   onArtifact(handler: (artifact: ArtifactRecord, openPane: boolean, phase: string) => void): () => void {
     this.artifactHandlers.add(handler);
@@ -378,11 +414,11 @@ export class PtyClient {
   }
   inputReadiness(id: string): string | null {
     const binding = this.bindings.get(id);
-    if (binding?.reason) return binding.reason;
     if (!this.getIsConnected()) return 'Connection disconnected or not negotiated; input was not sent';
-    if (!binding?.attachment) return 'Session is not ready; input was not sent';
+    if (!binding?.attachment) return binding?.reason ?? 'Session is not ready; input was not sent';
     const state = binding.attachment.state;
-    return state.status === 'ready' ? null : state.reason ?? 'Session ' + state.status + '; input was not sent';
+    if (state.status === 'ready') return null;
+    return state.reason ?? binding.reason ?? 'Session ' + state.status + '; input was not sent';
   }
   captureInputIdentity(id: string): Readonly<MutationIdentity> | null {
     return this.getIsConnected() ? this.bindings.get(id)?.attachment?.mutationIdentity() ?? null : null;
@@ -438,7 +474,6 @@ export class PtyClient {
       binding.create.reject(new Error('Session forgotten; creation was not sent'));
     }
     this.attaching.delete(id); this.sessionSizes.delete(id); this.rejectRequests('Session forgotten', id);
-    this.cachedHistoryBudgets.delete(id);
     for (const [key, hook] of this.hooks) {
       if (hook.event.doomSessionId === id) { this.hooks.delete(key); this.hookBytes -= hook.bytes; }
     }
@@ -455,22 +490,6 @@ export class PtyClient {
     if (typeof listing.current_path !== 'string' || !Array.isArray(listing.entries)) throw new Error('Invalid directory response');
     return listing as unknown as DirectoryListing;
   }
-  async listSessions(): Promise<SessionListing> { return await this.request('ListSessions', {}, 'SessionListing', false) as unknown as SessionListing; }
-  async recoverLegacy(session: RecoverableSession): Promise<string> {
-    if (!/^[a-zA-Z0-9_-]{1,256}$/.test(session.id) || !session.durable || session.identity_status !== 'unidentified'
-        || session.incarnation != null || typeof session.pane !== 'string' || !/^%[0-9]{1,20}$/.test(session.pane)
-        || !Number.isInteger(session.root_pid) || session.root_pid! <= 0 || session.root_pid! > 0xffffffff) {
-      throw new Error('An exact observed legacy pane and root pid are required');
-    }
-    try {
-      const result = await this.request('RecoverLegacy', { id: session.id, pane: session.pane, root_pid: session.root_pid },
-        'RecoverLegacyResult', true, session.id, 10000);
-      if (result.error !== null || !identity(result.incarnation)) throw new Error('Legacy recovery refused or outcome unknown; discover before trying again');
-      return result.incarnation;
-    } catch (error) {
-      this.refused(session.id, (error as Error).message); throw error;
-    }
-  }
   async createWorktree(cwd: string, branch: string): Promise<{ path: string; branch: string }> {
     const result = await this.request('CreateWorktree', { cwd, branch }, 'WorktreeCreated', true, undefined, 30000);
     if (result.error || typeof result.path !== 'string' || typeof result.branch !== 'string') throw new Error('Worktree failed or outcome unknown; check git worktree list before retrying');
@@ -480,13 +499,26 @@ export class PtyClient {
     this.connection.send('GetTelemetry', { cwd: cwd ?? null, session_id: this.activeSessionId || null,
       incarnation: this.bindings.get(this.activeSessionId)?.incarnation ?? null });
   }
+  diagnosticsSnapshot() {
+    return {
+      connected: this.getIsConnected(),
+      connectionState: this.connection.state,
+      bindings: Array.from(this.bindings.entries()).map(([id, binding]) => ({
+        id,
+        ready: this.inputReadiness(id) === null,
+        reason: this.inputReadiness(id),
+        status: binding.attachment?.state.status ?? null,
+      })),
+      diagnostics: diagnostics.snapshot(),
+    };
+  }
   dispose(): void {
     this.disposed = true; this.connection.dispose();
     for (const binding of this.bindings.values()) {
       binding.attachment?.dispose();
       if (binding.create?.status === 'unsent') binding.create.reject(new Error('Client disposed; creation was not sent'));
     }
-    this.bindings.clear(); this.cachedHistoryBudgets.clear(); this.hooks.clear(); this.hookBytes = 0;
+    this.bindings.clear(); this.hooks.clear(); this.hookBytes = 0;
   }
 }
 

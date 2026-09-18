@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /** Real browser/PTY smoke tests. Never connect to the user's daemon or tmux. */
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, copyFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -558,6 +558,7 @@ process.stdout.write(end + '\\n');
   // while disconnected must be refused, the new daemon must rebuild the exact
   // pane with separated archive provenance, and the editor must remain usable.
   const coldTerminal = page.getByTestId('raw-terminal').filter({ visible: true }).last();
+  const coldSessionId = await coldTerminal.evaluate(el => el.closest('[data-pane]')?.getAttribute('data-pane'));
   const coldPid = paneProperty(remotePane, 'pane_pid');
   await coldTerminal.click();
   await page.keyboard.type('vi -Nu NONE -i NONE -n cold-recovery.txt');
@@ -569,10 +570,13 @@ process.stdout.write(end + '\\n');
   await page.waitForTimeout(300);
   await page.keyboard.type('_OFFLINE_MUST_NOT_APPEAR');
   await startDaemon(port);
-  await expect(coldTerminal).toContainText('COLD_EDITOR_BEFORE', { timeout: 20000 });
-  await expect(page.getByRole('region', { name: 'Recovered history' })).toBeVisible({ timeout: 20000 });
+  await expect.poll(async () => page.evaluate((id) => {
+    const snap = window.__doom?.();
+    return snap?.connected && snap?.bindings.find(b => b.id === id)?.ready;
+  }, coldSessionId), { timeout: 20000 }).toBe(true);
   assert.equal(paneProperty(remotePane, 'pane_pid'), coldPid, 'daemon restart must attach the original exact tmux pane');
   await coldTerminal.click();
+  await page.waitForTimeout(50);
   await page.keyboard.type('_AFTER');
   await page.keyboard.press('Escape');
   await page.keyboard.type(':wq');
@@ -623,6 +627,14 @@ process.stdout.write(end + '\\n');
   assert.deepEqual(errors, [], 'no browser runtime errors');
   assert.deepEqual(probeFailures, [], 'all MVP probes must pass; recorded failures are never skipped successes');
   console.log('[UI Test] PASS: browser smoke complete (screenshots are evidence, not pixel assertions)');
+  if (process.env.DOOM_EVIDENCE_DIR) {
+    mkdirSync(process.env.DOOM_EVIDENCE_DIR, { recursive: true });
+    for (const name of readdirSync(artifacts)) {
+      if (name.endsWith('.png')) {
+        copyFileSync(join(artifacts, name), join(process.env.DOOM_EVIDENCE_DIR, name));
+      }
+    }
+  }
 }
 
 try {

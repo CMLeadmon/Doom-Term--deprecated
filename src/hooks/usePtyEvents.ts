@@ -9,7 +9,6 @@ import { projectStreamRecord } from '../core/streamProjection';
 import type { StreamRecord } from '../core/streamProtocol';
 import { ptyClient } from '../core/ptyClient';
 import { audioEngine } from '../core/audioEngine';
-import { boundCachedLines } from '../core/presentationCache';
 import { type AppTelemetry } from '../hud/state';
 
 type WorkspaceUpdater = (updater: (prev: ProjectWorkspace) => ProjectWorkspace) => void;
@@ -234,31 +233,6 @@ export function usePtyEvents(setWorkspace: WorkspaceUpdater, setTelemetry: Telem
           };
         });
       },
-
-    });
-
-    const unbindHistory = ptyClient.onHistory((sessionId, history) => {
-      setWorkspace(previous => {
-        const target = previous.nodes[sessionId];
-        if (!target) return previous;
-        const cache = target.recoveryCacheLines
-          ? { lines: target.recoveryCacheLines, truncated: target.recoveryCacheTruncated === true }
-          : boundCachedLines(target.tuiLines);
-        // Once a rebuild exists, its original cached screen remains the first
-        // half of the combined 8 MiB / 5,000-line budget. Later live frames
-        // must not silently enlarge that historical half before another rebuild.
-        ptyClient.setCachedHistoryBudget(sessionId, cache.lines);
-        const metadata = history.metadata;
-        const recoveredHistory = {
-          status: history.status, data: history.data, reason: history.reason,
-          ...(metadata ? { captureId: metadata.capture_id, historyAtLimit: metadata.history_at_limit } : {}),
-          potentiallyOverlapping: true as const, potentiallyIncomplete: true as const,
-        };
-        return { ...previous, nodes: { ...previous.nodes, [sessionId]: { ...target,
-          recoveryCacheLines: cache.lines, recoveryCacheTruncated: cache.truncated,
-          recoveredHistory,
-        } } };
-      });
     });
 
     // One render per frame per session, however many chunks arrived in it. The
@@ -267,7 +241,6 @@ export function usePtyEvents(setWorkspace: WorkspaceUpdater, setTelemetry: Telem
     const unbindParsed = onScreenParsed((sessionId) => {
       const emu = getEmulator(sessionId);
       const lines = emu.getLines();
-      if (ptyClient.getHistory(sessionId) === null) ptyClient.setCachedHistoryBudget(sessionId, lines);
       const inAltScreen = resolveTuiState(emu.isAltScreen(), reportedTuiState.get(sessionId)?.active);
       // Read WITH the lines, not inside the updater below.
       //
@@ -335,7 +308,6 @@ export function usePtyEvents(setWorkspace: WorkspaceUpdater, setTelemetry: Telem
 
     return () => {
       unbindPty();
-      unbindHistory();
       unbindParsed();
       unbindTele();
       unbindTeleUnavailable();
