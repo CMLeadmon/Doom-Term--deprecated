@@ -8,7 +8,7 @@ doom-term-pty = { path = "../crates/doom-term-pty" }
 portable-pty = "0.8"
 vte = "0.14"
 tokio = { version = "1.40", features = ["full"] }
-tokio-tungstenite = "0.26"
+tokio-tungstenite = "0.30"
 futures-util = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
