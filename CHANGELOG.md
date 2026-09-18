@@ -13,6 +13,26 @@ where it is not.
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-09-17
+
+Failure containment, forward-compatible stream validation, and excision of fragile legacy screen recovery.
+
+### Added
+
+- **Forward-compatible wire protocol (Track C).** An unrecognized daemon event or record variant is no longer treated as a protocol violation. Unknown variants are counted in a diagnostics ledger (`window.__doom`) and safely skipped without severing the shared WebSocket or unmounting terminal panes.
+- **Per-pane React error boundaries.** A rendering exception within a terminal pane is caught and isolated to that pane's recessed area with a retry affordance, keeping sibling panes and the status plate fully interactive.
+- **Attachment concurrency leases and de-starvation.** A 10-second lease prevents stalled attachments (`catching-up` or `awaiting-ready`) from locking the attachment queue, resolving input lockout across all panes.
+- **Attributable input refusal and diagnostics.** Refusals specify their originating unit, reason, and correlation ID, queryable via `window.__doom().diagnostics`.
+
+### Changed
+
+- **Transport renamed to `DaemonConnection` and `Gateway`.** To prevent architectural confusion with legacy reconstruction, the public transport substrate is permanently renamed from `RecoveryConnection` to `DaemonConnection` (frontend) and `Gateway` (backend).
+- **Decoupled process exit codes from daemon health.** Non-zero exit codes from child commands (`grep`, test failures) no longer hijack the status plate health chip.
+
+### Removed
+
+- **Fragile recovery Tiers 1 & 2 excised (Track D).** Removed fragile screen reconstruction, journal replay, discovery/adoption, tombstones, and history transfer (`RecoveredHistory`, `SessionSnapshotNotice`, `sessionRecovery.ts`, `recoveredArchive.ts`, `recoveryPlacement.ts`, `archivePresentation.ts`, `backend/src/gateway/legacy.rs`, `backend/src/tombstones.rs`). Durable Tier 3 tmux substrate is retained.
+
 ## [0.3.1] — 2026-09-17
 
 A fix for the feature 0.3.0 shipped. Remote enrichment tore down the session
@@ -283,6 +303,9 @@ Published for Linux (AppImage, deb, rpm), macOS (Apple Silicon and Intel) and
 Windows (MSI and NSIS) — the Windows build being a terminal only, which is what
 0.2.0 addresses.
 
-[Unreleased]: https://github.com/CMLeadmon/Doom-Term/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/CMLeadmon/Doom-Term/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/CMLeadmon/Doom-Term/compare/v0.3.1...v0.4.0
+[0.3.1]: https://github.com/CMLeadmon/Doom-Term/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/CMLeadmon/Doom-Term/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/CMLeadmon/Doom-Term/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/CMLeadmon/Doom-Term/releases/tag/v0.1.0
