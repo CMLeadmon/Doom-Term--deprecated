@@ -168,7 +168,7 @@ jobs:
       # Before SHA256SUMS exists, so the attestation covers the installers
       # themselves rather than a manifest describing them.
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: 'assets/*'
 
