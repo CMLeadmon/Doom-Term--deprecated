@@ -110,7 +110,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Build and bundle the desktop app
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # linuxdeploy cannot mount its own AppImage inside a container-ish
